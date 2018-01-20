@@ -361,13 +361,13 @@ fn test_slice_fail() {
 #[test]
 #[should_panic]
 fn test_str_slice_rangetoinclusive_max_panics() {
-    &"hello"[...usize::max_value()];
+    &"hello"[..=usize::max_value()];
 }
 
 #[test]
 #[should_panic]
 fn test_str_slice_rangeinclusive_max_panics() {
-    &"hello"[1...usize::max_value()];
+    &"hello"[1..=usize::max_value()];
 }
 
 #[test]
@@ -375,7 +375,7 @@ fn test_str_slice_rangeinclusive_max_panics() {
 fn test_str_slicemut_rangetoinclusive_max_panics() {
     let mut s = "hello".to_owned();
     let s: &mut str = &mut s;
-    &mut s[...usize::max_value()];
+    &mut s[..=usize::max_value()];
 }
 
 #[test]
@@ -383,7 +383,7 @@ fn test_str_slicemut_rangetoinclusive_max_panics() {
 fn test_str_slicemut_rangeinclusive_max_panics() {
     let mut s = "hello".to_owned();
     let s: &mut str = &mut s;
-    &mut s[1...usize::max_value()];
+    &mut s[1..=usize::max_value()];
 }
 
 #[test]
@@ -391,13 +391,13 @@ fn test_str_get_maxinclusive() {
     let mut s = "hello".to_owned();
     {
         let s: &str = &s;
-        assert_eq!(s.get(...usize::max_value()), None);
-        assert_eq!(s.get(1...usize::max_value()), None);
+        assert_eq!(s.get(..=usize::max_value()), None);
+        assert_eq!(s.get(1..=usize::max_value()), None);
     }
     {
         let s: &mut str = &mut s;
-        assert_eq!(s.get(...usize::max_value()), None);
-        assert_eq!(s.get(1...usize::max_value()), None);
+        assert_eq!(s.get(..=usize::max_value()), None);
+        assert_eq!(s.get(1..=usize::max_value()), None);
     }
 }
 
@@ -706,7 +706,6 @@ fn test_split_at() {
 
 #[test]
 fn test_split_at_mut() {
-    use std::ascii::AsciiExt;
     let mut s = "Hello World".to_string();
     {
         let (a, b) = s.split_at_mut(5);
@@ -1428,12 +1427,12 @@ mod pattern {
         Reject(6, 7),
         Match (7, 7),
     ]);
-    make_test!(str_searcher_mulibyte_haystack, " ", "├──", [
+    make_test!(str_searcher_multibyte_haystack, " ", "├──", [
         Reject(0, 3),
         Reject(3, 6),
         Reject(6, 9),
     ]);
-    make_test!(str_searcher_empty_needle_mulibyte_haystack, "", "├──", [
+    make_test!(str_searcher_empty_needle_multibyte_haystack, "", "├──", [
         Match (0, 0),
         Reject(0, 3),
         Match (3, 3),
@@ -1456,7 +1455,7 @@ mod pattern {
         Match (5, 6),
         Reject(6, 7),
     ]);
-    make_test!(char_searcher_mulibyte_haystack, ' ', "├──", [
+    make_test!(char_searcher_multibyte_haystack, ' ', "├──", [
         Reject(0, 3),
         Reject(3, 6),
         Reject(6, 9),

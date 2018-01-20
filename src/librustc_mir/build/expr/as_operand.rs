@@ -32,7 +32,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
     }
 
     /// Compile `expr` into a value that can be used as an operand.
-    /// If `expr` is an lvalue like `x`, this will introduce a
+    /// If `expr` is a place like `x`, this will introduce a
     /// temporary `tmp = x`, so that we capture the value of `x` at
     /// this time.
     ///
@@ -55,10 +55,10 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         debug!("expr_as_operand(block={:?}, expr={:?})", block, expr);
         let this = self;
 
-        if let ExprKind::Scope { region_scope, value } = expr.kind {
+        if let ExprKind::Scope { region_scope, lint_level, value } = expr.kind {
             let source_info = this.source_info(expr.span);
             let region_scope = (region_scope, source_info);
-            return this.in_scope(region_scope, block, |this| {
+            return this.in_scope(region_scope, lint_level, block, |this| {
                 this.as_operand(block, scope, value)
             });
         }
@@ -70,11 +70,11 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 let constant = this.as_constant(expr);
                 block.and(Operand::Constant(box constant))
             }
-            Category::Lvalue |
+            Category::Place |
             Category::Rvalue(..) => {
                 let operand =
                     unpack!(block = this.as_temp(block, scope, expr));
-                block.and(Operand::Consume(Lvalue::Local(operand)))
+                block.and(Operand::Move(Place::Local(operand)))
             }
         }
     }

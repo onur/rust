@@ -39,14 +39,10 @@ use hash::Hasher;
 /// [arc]: ../../std/sync/struct.Arc.html
 /// [ub]: ../../reference/behavior-considered-undefined.html
 #[stable(feature = "rust1", since = "1.0.0")]
-#[lang = "send"]
 #[rustc_on_unimplemented = "`{Self}` cannot be sent between threads safely"]
-pub unsafe trait Send {
+pub unsafe auto trait Send {
     // empty.
 }
-
-#[stable(feature = "rust1", since = "1.0.0")]
-unsafe impl Send for .. { }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> !Send for *const T { }
@@ -122,7 +118,7 @@ pub trait Sized {
 /// [RFC982]: https://github.com/rust-lang/rfcs/blob/master/text/0982-dst-coercion.md
 /// [nomicon-coerce]: ../../nomicon/coercions.html
 #[unstable(feature = "unsize", issue = "27732")]
-#[lang="unsize"]
+#[lang = "unsize"]
 pub trait Unsize<T: ?Sized> {
     // Empty.
 }
@@ -312,7 +308,7 @@ pub trait Copy : Clone {
 ///
 /// For cases when one does need thread-safe interior mutability,
 /// Rust provides [atomic data types], as well as explicit locking via
-/// [`sync::Mutex`][mutex] and [`sync::RWLock`][rwlock]. These types
+/// [`sync::Mutex`][mutex] and [`sync::RwLock`][rwlock]. These types
 /// ensure that any mutation cannot cause data races, hence the types
 /// are `Sync`. Likewise, [`sync::Arc`][arc] provides a thread-safe
 /// analogue of [`Rc`][rc].
@@ -344,12 +340,9 @@ pub trait Copy : Clone {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[lang = "sync"]
 #[rustc_on_unimplemented = "`{Self}` cannot be shared between threads safely"]
-pub unsafe trait Sync {
+pub unsafe auto trait Sync {
     // Empty
 }
-
-#[stable(feature = "rust1", since = "1.0.0")]
-unsafe impl Sync for .. { }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> !Sync for *const T { }
@@ -560,9 +553,7 @@ mod impls {
 /// This affects, for example, whether a `static` of that type is
 /// placed in read-only static memory or writable static memory.
 #[lang = "freeze"]
-unsafe trait Freeze {}
-
-unsafe impl Freeze for .. {}
+unsafe auto trait Freeze {}
 
 impl<T: ?Sized> !Freeze for UnsafeCell<T> {}
 unsafe impl<T: ?Sized> Freeze for PhantomData<T> {}

@@ -55,44 +55,44 @@ use rustc::hir::intravisit::{self, NestedVisitorMap, Visitor};
 use rustc::ich::{ATTR_IF_THIS_CHANGED, ATTR_THEN_THIS_WOULD_NEED};
 use graphviz::IntoCow;
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use syntax::ast;
 use syntax_pos::Span;
 
 pub fn assert_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    let _ignore = tcx.dep_graph.in_ignore();
+    tcx.dep_graph.with_ignore(|| {
+        if tcx.sess.opts.debugging_opts.dump_dep_graph {
+            dump_graph(tcx);
+        }
 
-    if tcx.sess.opts.debugging_opts.dump_dep_graph {
-        dump_graph(tcx);
-    }
+        // if the `rustc_attrs` feature is not enabled, then the
+        // attributes we are interested in cannot be present anyway, so
+        // skip the walk.
+        if !tcx.sess.features.borrow().rustc_attrs {
+            return;
+        }
 
-    // if the `rustc_attrs` feature is not enabled, then the
-    // attributes we are interested in cannot be present anyway, so
-    // skip the walk.
-    if !tcx.sess.features.borrow().rustc_attrs {
-        return;
-    }
+        // Find annotations supplied by user (if any).
+        let (if_this_changed, then_this_would_need) = {
+            let mut visitor = IfThisChanged { tcx,
+                                            if_this_changed: vec![],
+                                            then_this_would_need: vec![] };
+            visitor.process_attrs(ast::CRATE_NODE_ID, &tcx.hir.krate().attrs);
+            tcx.hir.krate().visit_all_item_likes(&mut visitor.as_deep_visitor());
+            (visitor.if_this_changed, visitor.then_this_would_need)
+        };
 
-    // Find annotations supplied by user (if any).
-    let (if_this_changed, then_this_would_need) = {
-        let mut visitor = IfThisChanged { tcx,
-                                          if_this_changed: vec![],
-                                          then_this_would_need: vec![] };
-        visitor.process_attrs(ast::CRATE_NODE_ID, &tcx.hir.krate().attrs);
-        tcx.hir.krate().visit_all_item_likes(&mut visitor.as_deep_visitor());
-        (visitor.if_this_changed, visitor.then_this_would_need)
-    };
+        if !if_this_changed.is_empty() || !then_this_would_need.is_empty() {
+            assert!(tcx.sess.opts.debugging_opts.query_dep_graph,
+                    "cannot use the `#[{}]` or `#[{}]` annotations \
+                    without supplying `-Z query-dep-graph`",
+                    ATTR_IF_THIS_CHANGED, ATTR_THEN_THIS_WOULD_NEED);
+        }
 
-    if !if_this_changed.is_empty() || !then_this_would_need.is_empty() {
-        assert!(tcx.sess.opts.debugging_opts.query_dep_graph,
-                "cannot use the `#[{}]` or `#[{}]` annotations \
-                 without supplying `-Z query-dep-graph`",
-                ATTR_IF_THIS_CHANGED, ATTR_THEN_THIS_WOULD_NEED);
-    }
-
-    // Check paths.
-    check_paths(tcx, &if_this_changed, &then_this_would_need);
+        // Check paths.
+        check_paths(tcx, &if_this_changed, &then_this_would_need);
+    })
 }
 
 type Sources = Vec<(Span, DefId, DepNode)>;
@@ -209,7 +209,7 @@ fn check_paths<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     }
     let query = tcx.dep_graph.query();
     for &(_, source_def_id, ref source_dep_node) in if_this_changed {
-        let dependents = query.transitive_successors(source_dep_node);
+        let dependents = query.transitive_predecessors(source_dep_node);
         for &(target_span, ref target_pass, _, ref target_dep_node) in then_this_would_need {
             if !dependents.contains(&target_dep_node) {
                 tcx.sess.span_err(
@@ -260,7 +260,7 @@ fn dump_graph(tcx: TyCtxt) {
         let dot_path = format!("{}.dot", path);
         let mut v = Vec::new();
         dot::render(&GraphvizDepGraph(nodes, edges), &mut v).unwrap();
-        File::create(&dot_path).and_then(|mut f| f.write_all(&v)).unwrap();
+        fs::write(dot_path, v).unwrap();
     }
 }
 

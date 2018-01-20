@@ -162,8 +162,8 @@ pub trait PartialEq<Rhs: ?Sized = Self> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait Eq: PartialEq<Self> {
-    // FIXME #13101: this method is used solely by #[deriving] to
-    // assert that every component of a type implements #[deriving]
+    // this method is used solely by #[deriving] to assert
+    // that every component of a type implements #[deriving]
     // itself, the current deriving infrastructure means doing this
     // assertion without using a method on this trait is nearly
     // impossible.
@@ -456,7 +456,7 @@ pub trait Ord: Eq + PartialOrd<Self> {
     /// assert_eq!(2, 1.max(2));
     /// assert_eq!(2, 2.max(2));
     /// ```
-    #[stable(feature = "ord_max_min", since = "1.22.0")]
+    #[stable(feature = "ord_max_min", since = "1.21.0")]
     fn max(self, other: Self) -> Self
     where Self: Sized {
         if other >= self { other } else { self }
@@ -472,7 +472,7 @@ pub trait Ord: Eq + PartialOrd<Self> {
     /// assert_eq!(1, 1.min(2));
     /// assert_eq!(2, 2.min(2));
     /// ```
-    #[stable(feature = "ord_max_min", since = "1.22.0")]
+    #[stable(feature = "ord_max_min", since = "1.21.0")]
     fn min(self, other: Self) -> Self
     where Self: Sized {
         if self <= other { self } else { other }
@@ -880,24 +880,24 @@ mod impls {
 
     ord_impl! { char usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 
-    #[unstable(feature = "never_type_impls", issue = "35121")]
+    #[unstable(feature = "never_type", issue = "35121")]
     impl PartialEq for ! {
         fn eq(&self, _: &!) -> bool {
             *self
         }
     }
 
-    #[unstable(feature = "never_type_impls", issue = "35121")]
+    #[unstable(feature = "never_type", issue = "35121")]
     impl Eq for ! {}
 
-    #[unstable(feature = "never_type_impls", issue = "35121")]
+    #[unstable(feature = "never_type", issue = "35121")]
     impl PartialOrd for ! {
         fn partial_cmp(&self, _: &!) -> Option<Ordering> {
             *self
         }
     }
 
-    #[unstable(feature = "never_type_impls", issue = "35121")]
+    #[unstable(feature = "never_type", issue = "35121")]
     impl Ord for ! {
         fn cmp(&self, _: &!) -> Ordering {
             *self

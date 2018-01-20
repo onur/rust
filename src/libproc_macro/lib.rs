@@ -50,6 +50,7 @@ mod diagnostic;
 pub use diagnostic::{Diagnostic, Level};
 
 use std::{ascii, fmt, iter};
+use std::rc::Rc;
 use std::str::FromStr;
 
 use syntax::ast;
@@ -58,7 +59,7 @@ use syntax::parse::{self, token};
 use syntax::symbol::Symbol;
 use syntax::tokenstream;
 use syntax_pos::DUMMY_SP;
-use syntax_pos::SyntaxContext;
+use syntax_pos::{FileMap, Pos, SyntaxContext, FileName};
 use syntax_pos::hygiene::Mark;
 
 /// The main type provided by this crate, representing an abstract stream of
@@ -88,7 +89,7 @@ impl FromStr for TokenStream {
     fn from_str(src: &str) -> Result<TokenStream, LexError> {
         __internal::with_sess(|(sess, mark)| {
             let src = src.to_string();
-            let name = "<proc-macro source code>".to_string();
+            let name = FileName::ProcMacroSourceCode;
             let expn_info = mark.expn_info().unwrap();
             let call_site = expn_info.call_site;
             // notify the expansion info that it is unhygienic
@@ -173,12 +174,13 @@ impl TokenStream {
 
 /// A region of source code, along with macro expansion information.
 #[unstable(feature = "proc_macro", issue = "38356")]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Span(syntax_pos::Span);
 
-#[unstable(feature = "proc_macro", issue = "38356")]
-impl Default for Span {
-    fn default() -> Span {
+impl Span {
+    /// A span that resolves at the macro definition site.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn def_site() -> Span {
         ::__internal::with_sess(|(_, mark)| {
             let call_site = mark.expn_info().unwrap().call_site;
             Span(call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark)))
@@ -190,7 +192,7 @@ impl Default for Span {
 /// This is needed to implement a custom quoter.
 #[unstable(feature = "proc_macro", issue = "38356")]
 pub fn quote_span(span: Span) -> TokenStream {
-    TokenStream(quote::Quote::quote(&span.0))
+    quote::Quote::quote(span)
 }
 
 macro_rules! diagnostic_method {
@@ -211,10 +213,161 @@ impl Span {
         ::__internal::with_sess(|(_, mark)| Span(mark.expn_info().unwrap().call_site))
     }
 
+    /// The original source file into which this span points.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn source_file(&self) -> SourceFile {
+        SourceFile {
+            filemap: __internal::lookup_char_pos(self.0.lo()).file,
+        }
+    }
+
+    /// The `Span` for the tokens in the previous macro expansion from which
+    /// `self` was generated from, if any.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn parent(&self) -> Option<Span> {
+        self.0.ctxt().outer().expn_info().map(|i| Span(i.call_site))
+    }
+
+    /// The span for the origin source code that `self` was generated from. If
+    /// this `Span` wasn't generated from other macro expansions then the return
+    /// value is the same as `*self`.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn source(&self) -> Span {
+        Span(self.0.source_callsite())
+    }
+
+    /// Get the starting line/column in the source file for this span.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn start(&self) -> LineColumn {
+        let loc = __internal::lookup_char_pos(self.0.lo());
+        LineColumn {
+            line: loc.line,
+            column: loc.col.to_usize()
+        }
+    }
+
+    /// Get the ending line/column in the source file for this span.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn end(&self) -> LineColumn {
+        let loc = __internal::lookup_char_pos(self.0.hi());
+        LineColumn {
+            line: loc.line,
+            column: loc.col.to_usize()
+        }
+    }
+
+    /// Create a new span encompassing `self` and `other`.
+    ///
+    /// Returns `None` if `self` and `other` are from different files.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn join(&self, other: Span) -> Option<Span> {
+        let self_loc = __internal::lookup_char_pos(self.0.lo());
+        let other_loc = __internal::lookup_char_pos(other.0.lo());
+
+        if self_loc.file.name != other_loc.file.name { return None }
+
+        Some(Span(self.0.to(other.0)))
+    }
+
+    /// Creates a new span with the same line/column information as `self` but
+    /// that resolves symbols as though it were at `other`.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn resolved_at(&self, other: Span) -> Span {
+        Span(self.0.with_ctxt(other.0.ctxt()))
+    }
+
+    /// Creates a new span with the same name resolution behavior as `self` but
+    /// with the line/column information of `other`.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn located_at(&self, other: Span) -> Span {
+        other.resolved_at(*self)
+    }
+
     diagnostic_method!(error, Level::Error);
     diagnostic_method!(warning, Level::Warning);
     diagnostic_method!(note, Level::Note);
     diagnostic_method!(help, Level::Help);
+}
+
+/// A line-column pair representing the start or end of a `Span`.
+#[unstable(feature = "proc_macro", issue = "38356")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LineColumn {
+    /// The 1-indexed line in the source file on which the span starts or ends (inclusive).
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub line: usize,
+    /// The 0-indexed column (in UTF-8 characters) in the source file on which
+    /// the span starts or ends (inclusive).
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub column: usize
+}
+
+/// The source file of a given `Span`.
+#[unstable(feature = "proc_macro", issue = "38356")]
+#[derive(Clone)]
+pub struct SourceFile {
+    filemap: Rc<FileMap>,
+}
+
+impl SourceFile {
+    /// Get the path to this source file.
+    ///
+    /// ### Note
+    /// If the code span associated with this `SourceFile` was generated by an external macro, this
+    /// may not be an actual path on the filesystem. Use [`is_real`] to check.
+    ///
+    /// Also note that even if `is_real` returns `true`, if `-Z remap-path-prefix-*` was passed on
+    /// the command line, the path as given may not actually be valid.
+    ///
+    /// [`is_real`]: #method.is_real
+    # [unstable(feature = "proc_macro", issue = "38356")]
+    pub fn path(&self) -> &FileName {
+        &self.filemap.name
+    }
+
+    /// Returns `true` if this source file is a real source file, and not generated by an external
+    /// macro's expansion.
+    # [unstable(feature = "proc_macro", issue = "38356")]
+    pub fn is_real(&self) -> bool {
+        // This is a hack until intercrate spans are implemented and we can have real source files
+        // for spans generated in external macros.
+        // https://github.com/rust-lang/rust/pull/43604#issuecomment-333334368
+        self.filemap.is_real_file()
+    }
+}
+
+#[unstable(feature = "proc_macro", issue = "38356")]
+impl AsRef<FileName> for SourceFile {
+    fn as_ref(&self) -> &FileName {
+        self.path()
+    }
+}
+
+#[unstable(feature = "proc_macro", issue = "38356")]
+impl fmt::Debug for SourceFile {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("SourceFile")
+            .field("path", self.path())
+            .field("is_real", &self.is_real())
+            .finish()
+    }
+}
+
+#[unstable(feature = "proc_macro", issue = "38356")]
+impl PartialEq for SourceFile {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.filemap, &other.filemap)
+    }
+}
+
+#[unstable(feature = "proc_macro", issue = "38356")]
+impl Eq for SourceFile {}
+
+#[unstable(feature = "proc_macro", issue = "38356")]
+impl PartialEq<FileName> for SourceFile {
+    fn eq(&self, other: &FileName) -> bool {
+        self.as_ref() == other
+    }
 }
 
 /// A single token or a delimited sequence of token trees (e.g. `[1, (), ..]`).
@@ -230,7 +383,7 @@ pub struct TokenTree {
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl From<TokenNode> for TokenTree {
     fn from(kind: TokenNode) -> TokenTree {
-        TokenTree { span: Span::default(), kind: kind }
+        TokenTree { span: Span::def_site(), kind: kind }
     }
 }
 
@@ -367,7 +520,7 @@ impl Literal {
     pub fn string(string: &str) -> Literal {
         let mut escaped = String::new();
         for ch in string.chars() {
-            escaped.extend(ch.escape_unicode());
+            escaped.extend(ch.escape_debug());
         }
         Literal(token::Literal(token::Lit::Str_(Symbol::intern(&escaped)), None))
     }
@@ -509,6 +662,7 @@ impl TokenTree {
             Dot => op!('.'),
             DotDot => joint!('.', Dot),
             DotDotDot => joint!('.', DotDot),
+            DotDotEq => joint!('.', DotEq),
             Comma => op!(','),
             Semi => op!(';'),
             Colon => op!(':'),
@@ -531,6 +685,7 @@ impl TokenTree {
                 })
             }
 
+            DotEq => unreachable!(),
             OpenDelim(..) | CloseDelim(..) => unreachable!(),
             Whitespace | Comment | Shebang(..) | Eof => unreachable!(),
         };
@@ -605,7 +760,7 @@ impl TokenTree {
 #[unstable(feature = "proc_macro_internals", issue = "27812")]
 #[doc(hidden)]
 pub mod __internal {
-    pub use quote::{Quoter, __rt};
+    pub use quote::{LiteralKind, Quoter, unquote};
 
     use std::cell::Cell;
 
@@ -616,9 +771,13 @@ pub mod __internal {
     use syntax::parse::{self, ParseSess};
     use syntax::parse::token::{self, Token};
     use syntax::tokenstream;
-    use syntax_pos::DUMMY_SP;
+    use syntax_pos::{BytePos, Loc, DUMMY_SP};
 
     use super::{TokenStream, LexError};
+
+    pub fn lookup_char_pos(pos: BytePos) -> Loc {
+        with_sess(|(sess, _)| sess.codemap().lookup_char_pos(pos))
+    }
 
     pub fn new_token_stream(item: P<ast::Item>) -> TokenStream {
         let token = Token::interpolated(token::NtItem(item));

@@ -28,8 +28,13 @@
 #![feature(fn_traits)]
 #![feature(unsize)]
 #![feature(i128_type)]
+#![feature(i128)]
 #![feature(conservative_impl_trait)]
 #![feature(specialization)]
+#![feature(optin_builtin_traits)]
+#![feature(underscore_lifetimes)]
+#![feature(macro_vis_matcher)]
+#![feature(allow_internal_unstable)]
 
 #![cfg_attr(unix, feature(libc))]
 #![cfg_attr(test, feature(test))]
@@ -40,6 +45,10 @@ extern crate log;
 extern crate serialize as rustc_serialize; // used by deriving
 #[cfg(unix)]
 extern crate libc;
+extern crate parking_lot;
+#[macro_use]
+extern crate cfg_if;
+extern crate stable_deref_trait;
 
 pub use rustc_serialize::hex::ToHex;
 
@@ -54,6 +63,7 @@ pub mod graph;
 pub mod indexed_set;
 pub mod indexed_vec;
 pub mod obligation_forest;
+pub mod sip128;
 pub mod snapshot_map;
 pub mod snapshot_vec;
 pub mod stable_hasher;
@@ -64,6 +74,8 @@ pub mod tuple_slice;
 pub mod veccell;
 pub mod control_flow_graph;
 pub mod flock;
+pub mod sync;
+pub mod owning_ref;
 
 // See comments in src/librustc/lib.rs
 #[doc(hidden)]

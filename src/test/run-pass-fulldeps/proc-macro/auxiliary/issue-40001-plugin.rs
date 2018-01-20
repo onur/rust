@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 #![feature(box_syntax, plugin, plugin_registrar, rustc_private)]
+#![feature(macro_vis_matcher)]
 #![crate_type = "dylib"]
 
 #[macro_use]
@@ -16,6 +17,7 @@ extern crate rustc_plugin;
 extern crate syntax;
 
 use rustc_plugin::Registry;
+use syntax::attr;
 use syntax::ext::base::*;
 use syntax::feature_gate::AttributeType::Whitelisted;
 use syntax::symbol::Symbol;
@@ -58,9 +60,9 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MissingWhitelistedAttrPass {
             _ => cx.tcx.hir.expect_item(cx.tcx.hir.get_parent(id)),
         };
 
-        if !item.attrs.iter().any(|a| a.check_name("whitelisted_attr")) {
+        if !attr::contains_name(&item.attrs, "whitelisted_attr") {
             cx.span_lint(MISSING_WHITELISTED_ATTR, span,
-                         "Missing 'whitelited_attr' attribute");
+                         "Missing 'whitelisted_attr' attribute");
         }
     }
 }

@@ -43,7 +43,7 @@ parameter if so.
 "##,
 
 E0154: r##"
-## Note: this error code is no longer emitted by the compiler.
+#### Note: this error code is no longer emitted by the compiler.
 
 Imports (`use` statements) are not allowed after non-item statements, such as
 variable declarations and expression statements.
@@ -79,7 +79,7 @@ https://doc.rust-lang.org/reference.html#statements
 "##,
 
 E0251: r##"
-## Note: this error code is no longer emitted by the compiler.
+#### Note: this error code is no longer emitted by the compiler.
 
 Two items of the same name cannot be imported without rebinding one of the
 items under a new local name.
@@ -268,7 +268,7 @@ fn main() {
 "##,
 
 E0256: r##"
-## Note: this error code is no longer emitted by the compiler.
+#### Note: this error code is no longer emitted by the compiler.
 
 You can't import a type or module when the name of the item being imported is
 the same as another type or submodule defined in the module.
@@ -1374,7 +1374,7 @@ arguments.
 "##,
 
 E0467: r##"
-Macro reexport declarations were empty or malformed.
+Macro re-export declarations were empty or malformed.
 
 Erroneous code examples:
 
@@ -1389,12 +1389,12 @@ extern crate core as other_macros_for_good;
 This is a syntax error at the level of attribute declarations.
 
 Currently, `macro_reexport` requires at least one macro name to be listed.
-Unlike `macro_use`, listing no names does not reexport all macros from the
+Unlike `macro_use`, listing no names does not re-export all macros from the
 given crate.
 
 Decide which macros you would like to export and list them properly.
 
-These are proper reexport declarations:
+These are proper re-export declarations:
 
 ```ignore (cannot-doctest-multicrate-project)
 #[macro_reexport(some_macro, another_macro)]
@@ -1475,7 +1475,7 @@ extern crate some_crate; //ok!
 "##,
 
 E0470: r##"
-A macro listed for reexport was not found.
+A macro listed for re-export was not found.
 
 Erroneous code example:
 
@@ -1493,7 +1493,7 @@ exported from the given crate.
 
 This could be caused by a typo. Did you misspell the macro's name?
 
-Double-check the names of the macros listed for reexport, and that the crate
+Double-check the names of the macros listed for re-export, and that the crate
 in question exports them.
 
 A working version:

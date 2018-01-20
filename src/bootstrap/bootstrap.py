@@ -8,7 +8,7 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
 import argparse
 import contextlib
 import datetime
@@ -294,13 +294,14 @@ def default_build_triple():
             raise ValueError('unknown byteorder: {}'.format(sys.byteorder))
         # only the n64 ABI is supported, indicate it
         ostype += 'abi64'
-    elif cputype == 'sparcv9':
+    elif cputype == 'sparcv9' or cputype == 'sparc64':
         pass
     else:
         err = "unknown cpu type: {}".format(cputype)
         sys.exit(err)
 
     return "{}-{}".format(cputype, ostype)
+
 
 class RustBuild(object):
     """Provide all the methods required to build Rust"""
@@ -349,11 +350,6 @@ class RustBuild(object):
             self.fix_executable("{}/bin/rustdoc".format(self.bin_root()))
             with open(self.rustc_stamp(), 'w') as rust_stamp:
                 rust_stamp.write(self.date)
-
-            if "pc-windows-gnu" in self.build:
-                filename = "rust-mingw-{}-{}.tar.gz".format(
-                    rustc_channel, self.build)
-                self._download_stage0_helper(filename, "rust-mingw")
 
         if self.cargo().startswith(self.bin_root()) and \
                 (not os.path.exists(self.cargo()) or
@@ -498,7 +494,7 @@ class RustBuild(object):
 
         If the key does not exists, the result is None:
 
-        >>> rb.get_toml("key3") == None
+        >>> rb.get_toml("key3") is None
         True
         """
         for line in self.config_toml.splitlines():
@@ -531,7 +527,7 @@ class RustBuild(object):
         """
         config = self.get_toml(program)
         if config:
-            return config
+            return os.path.expanduser(config)
         return os.path.join(self.bin_root(), "bin", "{}{}".format(
             program, self.exe_suffix()))
 
@@ -647,7 +643,8 @@ class RustBuild(object):
                       if not ((module.endswith("llvm") and
                                self.get_toml('llvm-config')) or
                               (module.endswith("jemalloc") and
-                               self.get_toml('jemalloc')))]
+                               (self.get_toml('use-jemalloc') == "false" or
+                                self.get_toml('jemalloc'))))]
         run(["git", "submodule", "update",
              "--init", "--recursive"] + submodules,
             cwd=self.rust_root, verbose=self.verbose)
@@ -682,7 +679,7 @@ def bootstrap():
     try:
         with open(args.config or 'config.toml') as config:
             build.config_toml = config.read()
-    except OSError:
+    except (OSError, IOError):
         pass
 
     if '\nverbose = 2' in build.config_toml:

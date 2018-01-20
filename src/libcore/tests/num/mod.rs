@@ -8,10 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use core::convert::TryFrom;
+use core::convert::{TryFrom, TryInto};
 use core::cmp::PartialEq;
 use core::fmt::Debug;
 use core::marker::Copy;
+use core::num::TryFromIntError;
 use core::ops::{Add, Sub, Mul, Div, Rem};
 use core::option::Option;
 use core::option::Option::{Some, None};
@@ -134,6 +135,13 @@ fn test_empty() {
     assert_eq!("".parse::<u8>().ok(), None);
 }
 
+#[test]
+fn test_infallible_try_from_int_error() {
+    let func = |x: i8| -> Result<i32, TryFromIntError> { Ok(x.try_into()?) };
+
+    assert!(func(0).is_ok());
+}
+
 macro_rules! test_impl_from {
     ($fn_name: ident, $Small: ty, $Large: ty) => {
         #[test]
@@ -189,7 +197,6 @@ test_impl_from! { test_u16f64, u16, f64 }
 test_impl_from! { test_u32f64, u32, f64 }
 
 // Float -> Float
-#[cfg_attr(all(target_arch = "wasm32", target_os = "emscripten"), ignore)] // issue 42630
 #[test]
 fn test_f32f64() {
     use core::f32;

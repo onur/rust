@@ -146,7 +146,7 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use iter::{FromIterator, FusedIterator, TrustedLen};
-use mem;
+use {mem, ops};
 
 // Note that this is not a lang item per se, but it has a hidden dependency on
 // `Iterator`, which is one. The compiler assumes that the `next` method of
@@ -338,6 +338,12 @@ impl<T> Option<T> {
 
     /// Returns the contained value or a default.
     ///
+    /// Arguments passed to `unwrap_or` are eagerly evaluated; if you are passing
+    /// the result of a function call, it is recommended to use [`unwrap_or_else`],
+    /// which is lazily evaluated.
+    ///
+    /// [`unwrap_or_else`]: #method.unwrap_or_else
+    ///
     /// # Examples
     ///
     /// ```
@@ -401,9 +407,7 @@ impl<T> Option<T> {
     }
 
     /// Applies a function to the contained value (if any),
-    /// or returns a [`default`][] (if not).
-    ///
-    /// [`default`]: ../default/trait.Default.html#tymethod.default
+    /// or returns the provided default (if not).
     ///
     /// # Examples
     ///
@@ -424,9 +428,7 @@ impl<T> Option<T> {
     }
 
     /// Applies a function to the contained value (if any),
-    /// or computes a [`default`][] (if not).
-    ///
-    /// [`default`]: ../default/trait.Default.html#tymethod.default
+    /// or computes a default (if not).
     ///
     /// # Examples
     ///
@@ -451,11 +453,16 @@ impl<T> Option<T> {
     /// Transforms the `Option<T>` into a [`Result<T, E>`], mapping [`Some(v)`] to
     /// [`Ok(v)`] and [`None`] to [`Err(err)`].
     ///
+    /// Arguments passed to `ok_or` are eagerly evaluated; if you are passing the
+    /// result of a function call, it is recommended to use [`ok_or_else`], which is
+    /// lazily evaluated.
+    ///
     /// [`Result<T, E>`]: ../../std/result/enum.Result.html
     /// [`Ok(v)`]: ../../std/result/enum.Result.html#variant.Ok
     /// [`Err(err)`]: ../../std/result/enum.Result.html#variant.Err
     /// [`None`]: #variant.None
     /// [`Some(v)`]: #variant.Some
+    /// [`ok_or_else`]: #method.ok_or_else
     ///
     /// # Examples
     ///
@@ -607,7 +614,48 @@ impl<T> Option<T> {
         }
     }
 
+    /// Returns `None` if the option is `None`, otherwise calls `predicate`
+    /// with the wrapped value and returns:
+    ///
+    /// - `Some(t)` if `predicate` returns `true` (where `t` is the wrapped
+    ///   value), and
+    /// - `None` if `predicate` returns `false`.
+    ///
+    /// This function works similar to `Iterator::filter()`. You can imagine
+    /// the `Option<T>` being an iterator over one or zero elements. `filter()`
+    /// lets you decide which elements to keep.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(option_filter)]
+    ///
+    /// fn is_even(n: &i32) -> bool {
+    ///     n % 2 == 0
+    /// }
+    ///
+    /// assert_eq!(None.filter(is_even), None);
+    /// assert_eq!(Some(3).filter(is_even), None);
+    /// assert_eq!(Some(4).filter(is_even), Some(4));
+    /// ```
+    #[inline]
+    #[unstable(feature = "option_filter", issue = "45860")]
+    pub fn filter<P: FnOnce(&T) -> bool>(self, predicate: P) -> Self {
+        if let Some(x) = self {
+            if predicate(&x) {
+                return Some(x)
+            }
+        }
+        None
+    }
+
     /// Returns the option if it contains a value, otherwise returns `optb`.
+    ///
+    /// Arguments passed to `or` are eagerly evaluated; if you are passing the
+    /// result of a function call, it is recommended to use [`or_else`], which is
+    /// lazily evaluated.
+    ///
+    /// [`or_else`]: #method.or_else
     ///
     /// # Examples
     ///
@@ -798,7 +846,7 @@ impl<T: Default> Option<T> {
     /// Returns the contained value or a default
     ///
     /// Consumes the `self` argument then, if [`Some`], returns the contained
-    /// value, otherwise if [`None`], returns the default value for that
+    /// value, otherwise if [`None`], returns the [default value] for that
     /// type.
     ///
     /// # Examples
@@ -820,6 +868,7 @@ impl<T: Default> Option<T> {
     ///
     /// [`Some`]: #variant.Some
     /// [`None`]: #variant.None
+    /// [default value]: ../default/trait.Default.html#tymethod.default
     /// [`parse`]: ../../std/primitive.str.html#method.parse
     /// [`FromStr`]: ../../std/str/trait.FromStr.html
     #[inline]
@@ -1121,5 +1170,31 @@ impl<A, V: FromIterator<A>> FromIterator<Option<A>> for Option<V> {
         } else {
             Some(v)
         }
+    }
+}
+
+/// The error type that results from applying the try operator (`?`) to a `None` value. If you wish
+/// to allow `x?` (where `x` is an `Option<T>`) to be converted into your error type, you can
+/// implement `impl From<NoneError>` for `YourErrorType`. In that case, `x?` within a function that
+/// returns `Result<_, YourErrorType>` will translate a `None` value into an `Err` result.
+#[unstable(feature = "try_trait", issue = "42327")]
+#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
+pub struct NoneError;
+
+#[unstable(feature = "try_trait", issue = "42327")]
+impl<T> ops::Try for Option<T> {
+    type Ok = T;
+    type Error = NoneError;
+
+    fn into_result(self) -> Result<T, NoneError> {
+        self.ok_or(NoneError)
+    }
+
+    fn from_ok(v: T) -> Self {
+        Some(v)
+    }
+
+    fn from_error(_: NoneError) -> Self {
+        None
     }
 }

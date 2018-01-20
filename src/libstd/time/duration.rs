@@ -13,7 +13,9 @@ use ops::{Add, Sub, Mul, Div, AddAssign, SubAssign, MulAssign, DivAssign};
 
 const NANOS_PER_SEC: u32 = 1_000_000_000;
 const NANOS_PER_MILLI: u32 = 1_000_000;
+const NANOS_PER_MICRO: u32 = 1_000;
 const MILLIS_PER_SEC: u64 = 1_000;
+const MICROS_PER_SEC: u64 = 1_000_000;
 
 /// A `Duration` type to represent a span of time, typically used for system
 /// timeouts.
@@ -106,13 +108,55 @@ impl Duration {
     /// let duration = Duration::from_millis(2569);
     ///
     /// assert_eq!(2, duration.as_secs());
-    /// assert_eq!(569000000, duration.subsec_nanos());
+    /// assert_eq!(569_000_000, duration.subsec_nanos());
     /// ```
     #[stable(feature = "duration", since = "1.3.0")]
     #[inline]
     pub fn from_millis(millis: u64) -> Duration {
         let secs = millis / MILLIS_PER_SEC;
         let nanos = ((millis % MILLIS_PER_SEC) as u32) * NANOS_PER_MILLI;
+        Duration { secs: secs, nanos: nanos }
+    }
+
+    /// Creates a new `Duration` from the specified number of microseconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_from_micros)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_micros(1_000_002);
+    ///
+    /// assert_eq!(1, duration.as_secs());
+    /// assert_eq!(2000, duration.subsec_nanos());
+    /// ```
+    #[unstable(feature = "duration_from_micros", issue = "44400")]
+    #[inline]
+    pub fn from_micros(micros: u64) -> Duration {
+        let secs = micros / MICROS_PER_SEC;
+        let nanos = ((micros % MICROS_PER_SEC) as u32) * NANOS_PER_MICRO;
+        Duration { secs: secs, nanos: nanos }
+    }
+
+    /// Creates a new `Duration` from the specified number of nanoseconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_extras)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_nanos(1_000_000_123);
+    ///
+    /// assert_eq!(1, duration.as_secs());
+    /// assert_eq!(123, duration.subsec_nanos());
+    /// ```
+    #[unstable(feature = "duration_extras", issue = "46507")]
+    #[inline]
+    pub fn from_nanos(nanos: u64) -> Duration {
+        let secs = nanos / (NANOS_PER_SEC as u64);
+        let nanos = (nanos % (NANOS_PER_SEC as u64)) as u32;
         Duration { secs: secs, nanos: nanos }
     }
 
@@ -147,6 +191,46 @@ impl Duration {
     #[stable(feature = "duration", since = "1.3.0")]
     #[inline]
     pub fn as_secs(&self) -> u64 { self.secs }
+
+    /// Returns the fractional part of this `Duration`, in milliseconds.
+    ///
+    /// This method does **not** return the length of the duration when
+    /// represented by milliseconds. The returned number always represents a
+    /// fractional portion of a second (i.e. it is less than one thousand).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_extras)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_millis(5432);
+    /// assert_eq!(duration.as_secs(), 5);
+    /// assert_eq!(duration.subsec_millis(), 432);
+    /// ```
+    #[unstable(feature = "duration_extras", issue = "46507")]
+    #[inline]
+    pub fn subsec_millis(&self) -> u32 { self.nanos / NANOS_PER_MILLI }
+
+    /// Returns the fractional part of this `Duration`, in microseconds.
+    ///
+    /// This method does **not** return the length of the duration when
+    /// represented by microseconds. The returned number always represents a
+    /// fractional portion of a second (i.e. it is less than one million).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_extras, duration_from_micros)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_micros(1_234_567);
+    /// assert_eq!(duration.as_secs(), 1);
+    /// assert_eq!(duration.subsec_micros(), 234_567);
+    /// ```
+    #[unstable(feature = "duration_extras", issue = "46507")]
+    #[inline]
+    pub fn subsec_micros(&self) -> u32 { self.nanos / NANOS_PER_MICRO }
 
     /// Returns the fractional part of this `Duration`, in nanoseconds.
     ///
@@ -206,7 +290,7 @@ impl Duration {
     }
 
     /// Checked `Duration` subtraction. Computes `self - other`, returning [`None`]
-    /// if the result would be negative or if underflow occurred.
+    /// if the result would be negative or if overflow occurred.
     ///
     /// [`None`]: ../../std/option/enum.Option.html#variant.None
     ///

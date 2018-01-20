@@ -65,6 +65,7 @@ r##"<!DOCTYPE html>
     {before_content}
 
     <nav class="sidebar">
+        <div class="sidebar-menu">&#9776;</div>
         {logo}
         {sidebar}
     </nav>
@@ -97,13 +98,15 @@ r##"<!DOCTYPE html>
                     <dd>Show this help dialog</dd>
                     <dt>S</dt>
                     <dd>Focus the search field</dd>
-                    <dt>&larrb;</dt>
+                    <dt>↑</dt>
                     <dd>Move up in search results</dd>
-                    <dt>&rarrb;</dt>
+                    <dt>↓</dt>
                     <dd>Move down in search results</dd>
+                    <dt>↹</dt>
+                    <dd>Switch tab</dd>
                     <dt>&#9166;</dt>
                     <dd>Go to active search result</dd>
-                    <dt>+</dt>
+                    <dt style="width:31px;">+ / -</dt>
                     <dd>Collapse/expand all sections</dd>
                 </dl>
             </div>

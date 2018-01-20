@@ -26,7 +26,7 @@ use core::mem::{self, align_of_val, size_of_val, uninitialized};
 use core::ops::Deref;
 use core::ops::CoerceUnsized;
 use core::ptr::{self, Shared};
-use core::marker::Unsize;
+use core::marker::{Unsize, PhantomData};
 use core::hash::{Hash, Hasher};
 use core::{isize, usize};
 use core::convert::From;
@@ -52,8 +52,10 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// also destroyed.
 ///
 /// Shared references in Rust disallow mutation by default, and `Arc` is no
-/// exception. If you need to mutate through an `Arc`, use [`Mutex`][mutex],
-/// [`RwLock`][rwlock], or one of the [`Atomic`][atomic] types.
+/// exception: you cannot generally obtain a mutable reference to something
+/// inside an `Arc`. If you need to mutate through an `Arc`, use
+/// [`Mutex`][mutex], [`RwLock`][rwlock], or one of the [`Atomic`][atomic]
+/// types.
 ///
 /// ## Thread Safety
 ///
@@ -72,13 +74,13 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// first: after all, isn't the point of `Arc<T>` thread safety? The key is
 /// this: `Arc<T>` makes it thread safe to have multiple ownership of the same
 /// data, but it  doesn't add thread safety to its data. Consider
-/// `Arc<RefCell<T>>`. `RefCell<T>` isn't [`Sync`], and if `Arc<T>` was always
-/// [`Send`], `Arc<RefCell<T>>` would be as well. But then we'd have a problem:
-/// `RefCell<T>` is not thread safe; it keeps track of the borrowing count using
+/// `Arc<`[`RefCell<T>`]`>`. [`RefCell<T>`] isn't [`Sync`], and if `Arc<T>` was always
+/// [`Send`], `Arc<`[`RefCell<T>`]`>` would be as well. But then we'd have a problem:
+/// [`RefCell<T>`] is not thread safe; it keeps track of the borrowing count using
 /// non-atomic operations.
 ///
 /// In the end, this means that you may need to pair `Arc<T>` with some sort of
-/// `std::sync` type, usually `Mutex<T>`.
+/// [`std::sync`] type, usually [`Mutex<T>`][mutex].
 ///
 /// ## Breaking cycles with `Weak`
 ///
@@ -106,7 +108,7 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// // a and b both point to the same memory location as foo.
 /// ```
 ///
-/// The `Arc::clone(&from)` syntax is the most idiomatic because it conveys more explicitly
+/// The [`Arc::clone(&from)`] syntax is the most idiomatic because it conveys more explicitly
 /// the meaning of the code. In the example above, this syntax makes it easier to see that
 /// this code is creating a new reference rather than copying the whole content of foo.
 ///
@@ -141,6 +143,9 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// [upgrade]: struct.Weak.html#method.upgrade
 /// [`None`]: ../../std/option/enum.Option.html#variant.None
 /// [assoc]: ../../book/first-edition/method-syntax.html#associated-functions
+/// [`RefCell<T>`]: ../../std/cell/struct.RefCell.html
+/// [`std::sync`]: ../../std/sync/index.html
+/// [`Arc::clone(&from)`]: #method.clone
 ///
 /// # Examples
 ///
@@ -193,6 +198,7 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Arc<T: ?Sized> {
     ptr: Shared<ArcInner<T>>,
+    phantom: PhantomData<T>,
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -280,7 +286,7 @@ impl<T> Arc<T> {
             weak: atomic::AtomicUsize::new(1),
             data,
         };
-        Arc { ptr: Shared::from(Box::into_unique(x)) }
+        Arc { ptr: Shared::from(Box::into_unique(x)), phantom: PhantomData }
     }
 
     /// Returns the contained value, if the `Arc` has exactly one strong reference.
@@ -392,6 +398,7 @@ impl<T: ?Sized> Arc<T> {
 
         Arc {
             ptr: Shared::new_unchecked(arc_ptr),
+            phantom: PhantomData,
         }
     }
 
@@ -575,7 +582,7 @@ impl<T: ?Sized> Arc<T> {
             // Free the allocation without dropping its contents
             box_free(bptr);
 
-            Arc { ptr: Shared::new_unchecked(ptr) }
+            Arc { ptr: Shared::new_unchecked(ptr), phantom: PhantomData }
         }
     }
 }
@@ -602,7 +609,7 @@ impl<T> Arc<[T]> {
             &mut (*ptr).data as *mut [T] as *mut T,
             v.len());
 
-        Arc { ptr: Shared::new_unchecked(ptr) }
+        Arc { ptr: Shared::new_unchecked(ptr), phantom: PhantomData }
     }
 }
 
@@ -662,7 +669,7 @@ impl<T: Clone> ArcFromSlice<T> for Arc<[T]> {
             // All clear. Forget the guard so it doesn't free the new ArcInner.
             mem::forget(guard);
 
-            Arc { ptr: Shared::new_unchecked(ptr) }
+            Arc { ptr: Shared::new_unchecked(ptr), phantom: PhantomData }
         }
     }
 }
@@ -720,7 +727,7 @@ impl<T: ?Sized> Clone for Arc<T> {
             }
         }
 
-        Arc { ptr: self.ptr }
+        Arc { ptr: self.ptr, phantom: PhantomData }
     }
 }
 
@@ -1047,7 +1054,7 @@ impl<T: ?Sized> Weak<T> {
 
             // Relaxed is valid for the same reason it is on Arc's Clone impl
             match inner.strong.compare_exchange_weak(n, n + 1, Relaxed, Relaxed) {
-                Ok(_) => return Some(Arc { ptr: self.ptr }),
+                Ok(_) => return Some(Arc { ptr: self.ptr, phantom: PhantomData }),
                 Err(old) => n = old,
             }
         }
@@ -1323,7 +1330,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Arc<T> {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> fmt::Pointer for Arc<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Pointer::fmt(&self.ptr, f)
+        fmt::Pointer::fmt(&(&**self as *const T), f)
     }
 }
 
@@ -1370,7 +1377,8 @@ impl<'a, T: Clone> From<&'a [T]> for Arc<[T]> {
 impl<'a> From<&'a str> for Arc<str> {
     #[inline]
     fn from(v: &str) -> Arc<str> {
-        unsafe { mem::transmute(<Arc<[u8]>>::from(v.as_bytes())) }
+        let arc = Arc::<[u8]>::from(v.as_bytes());
+        unsafe { Arc::from_raw(Arc::into_raw(arc) as *const str) }
     }
 }
 

@@ -211,6 +211,125 @@ pub struct DirBuilder {
     recursive: bool,
 }
 
+/// How large a buffer to pre-allocate before reading the entire file.
+fn initial_buffer_size(file: &File) -> usize {
+    // Allocate one extra byte so the buffer doesn't need to grow before the
+    // final `read` call at the end of the file.  Don't worry about `usize`
+    // overflow because reading will fail regardless in that case.
+    file.metadata().map(|m| m.len() as usize + 1).unwrap_or(0)
+}
+
+/// Read the entire contents of a file into a bytes vector.
+///
+/// This is a convenience function for using [`File::open`] and [`read_to_end`]
+/// with fewer imports and without an intermediate variable.
+///
+/// [`File::open`]: struct.File.html#method.open
+/// [`read_to_end`]: ../io/trait.Read.html#method.read_to_end
+///
+/// # Errors
+///
+/// This function will return an error if `path` does not already exist.
+/// Other errors may also be returned according to [`OpenOptions::open`].
+///
+/// [`OpenOptions::open`]: struct.OpenOptions.html#method.open
+///
+/// It will also return an error if it encounters while reading an error
+/// of a kind other than [`ErrorKind::Interrupted`].
+///
+/// [`ErrorKind::Interrupted`]: ../../std/io/enum.ErrorKind.html#variant.Interrupted
+///
+/// # Examples
+///
+/// ```no_run
+/// #![feature(fs_read_write)]
+///
+/// use std::fs;
+/// use std::net::SocketAddr;
+///
+/// # fn foo() -> Result<(), Box<std::error::Error + 'static>> {
+/// let foo: SocketAddr = String::from_utf8_lossy(&fs::read("address.txt")?).parse()?;
+/// # Ok(())
+/// # }
+/// ```
+#[unstable(feature = "fs_read_write", issue = "46588")]
+pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(initial_buffer_size(&file));
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Read the entire contents of a file into a string.
+///
+/// This is a convenience function for using [`File::open`] and [`read_to_string`]
+/// with fewer imports and without an intermediate variable.
+///
+/// [`File::open`]: struct.File.html#method.open
+/// [`read_to_string`]: ../io/trait.Read.html#method.read_to_string
+///
+/// # Errors
+///
+/// This function will return an error if `path` does not already exist.
+/// Other errors may also be returned according to [`OpenOptions::open`].
+///
+/// [`OpenOptions::open`]: struct.OpenOptions.html#method.open
+///
+/// It will also return an error if it encounters while reading an error
+/// of a kind other than [`ErrorKind::Interrupted`],
+/// or if the contents of the file are not valid UTF-8.
+///
+/// [`ErrorKind::Interrupted`]: ../../std/io/enum.ErrorKind.html#variant.Interrupted
+///
+/// # Examples
+///
+/// ```no_run
+/// #![feature(fs_read_write)]
+///
+/// use std::fs;
+/// use std::net::SocketAddr;
+///
+/// # fn foo() -> Result<(), Box<std::error::Error + 'static>> {
+/// let foo: SocketAddr = fs::read_string("address.txt")?.parse()?;
+/// # Ok(())
+/// # }
+/// ```
+#[unstable(feature = "fs_read_write", issue = "46588")]
+pub fn read_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut string = String::with_capacity(initial_buffer_size(&file));
+    file.read_to_string(&mut string)?;
+    Ok(string)
+}
+
+/// Write a slice as the entire contents of a file.
+///
+/// This function will create a file if it does not exist,
+/// and will entirely replace its contents if it does.
+///
+/// This is a convenience function for using [`File::create`] and [`write_all`]
+/// with fewer imports.
+///
+/// [`File::create`]: struct.File.html#method.create
+/// [`write_all`]: ../io/trait.Write.html#method.write_all
+///
+/// # Examples
+///
+/// ```no_run
+/// #![feature(fs_read_write)]
+///
+/// use std::fs;
+///
+/// # fn foo() -> std::io::Result<()> {
+/// fs::write("foo.txt", b"Lorem ipsum")?;
+/// # Ok(())
+/// # }
+/// ```
+#[unstable(feature = "fs_read_write", issue = "46588")]
+pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
+    File::create(path)?.write_all(contents.as_ref())
+}
+
 impl File {
     /// Attempts to open a file in read-only mode.
     ///
@@ -1374,14 +1493,17 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
 /// Note that if `from` and `to` both point to the same file, then the file
 /// will likely get truncated by this operation.
 ///
-/// On success, the total number of bytes copied is returned.
+/// On success, the total number of bytes copied is returned and it is equal to
+/// the length of the `to` file as reported by `metadata`.
 ///
 /// # Platform-specific behavior
 ///
 /// This function currently corresponds to the `open` function in Unix
 /// with `O_RDONLY` for `from` and `O_WRONLY`, `O_CREAT`, and `O_TRUNC` for `to`.
 /// `O_CLOEXEC` is set for returned file descriptors.
-/// On Windows, this function currently corresponds to `CopyFileEx`.
+/// On Windows, this function currently corresponds to `CopyFileEx`. Alternate
+/// NTFS streams are copied but only the size of the main stream is returned by
+/// this function.
 /// Note that, this [may change in the future][changes].
 ///
 /// [changes]: ../io/index.html#platform-specific-behavior
@@ -1595,9 +1717,9 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// Notable exception is made for situations where any of the directories
 /// specified in the `path` could not be created as it was being created concurrently.
-/// Such cases are considered success. In other words: calling `create_dir_all`
-/// concurrently from multiple threads or processes is guaranteed to not fail
-/// due to race itself.
+/// Such cases are considered to be successful. That is, calling `create_dir_all`
+/// concurrently from multiple threads or processes is guaranteed not to fail
+/// due to a race condition with itself.
 ///
 /// # Examples
 ///
@@ -1869,7 +1991,7 @@ impl AsInnerMut<fs_imp::DirBuilder> for DirBuilder {
     }
 }
 
-#[cfg(all(test, not(target_os = "emscripten")))]
+#[cfg(all(test, not(any(target_os = "cloudabi", target_os = "emscripten"))))]
 mod tests {
     use io::prelude::*;
 
@@ -1909,7 +2031,9 @@ mod tests {
     ) }
 
     #[cfg(unix)]
-    macro_rules! error { ($e:expr, $s:expr) => (
+    macro_rules! error { ($e:expr, $s:expr) => ( error_contains!($e, $s) ) }
+
+    macro_rules! error_contains { ($e:expr, $s:expr) => (
         match $e {
             Ok(_) => panic!("Unexpected success. Should've been: {:?}", $s),
             Err(ref err) => assert!(err.to_string().contains($s),
@@ -2158,6 +2282,27 @@ mod tests {
             assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
         }
         check!(fs::remove_file(&filename));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_get_unix_permissions() {
+        use os::unix::fs::PermissionsExt;
+
+        let tmpdir = tmpdir();
+        let filename = &tmpdir.join("set_get_unix_permissions");
+        check!(fs::create_dir(filename));
+        let mask = 0o7777;
+
+        check!(fs::set_permissions(filename,
+                                   fs::Permissions::from_mode(0)));
+        let metadata0 = check!(fs::metadata(filename));
+        assert_eq!(mask & metadata0.permissions().mode(), 0);
+
+        check!(fs::set_permissions(filename,
+                                   fs::Permissions::from_mode(0o1777)));
+        let metadata1 = check!(fs::metadata(filename));
+        assert_eq!(mask & metadata1.permissions().mode(), 0o1777);
     }
 
     #[test]
@@ -2568,11 +2713,23 @@ mod tests {
     fn copy_file_preserves_streams() {
         let tmp = tmpdir();
         check!(check!(File::create(tmp.join("in.txt:bunny"))).write("carrot".as_bytes()));
-        assert_eq!(check!(fs::copy(tmp.join("in.txt"), tmp.join("out.txt"))), 6);
+        assert_eq!(check!(fs::copy(tmp.join("in.txt"), tmp.join("out.txt"))), 0);
         assert_eq!(check!(tmp.join("out.txt").metadata()).len(), 0);
         let mut v = Vec::new();
         check!(check!(File::open(tmp.join("out.txt:bunny"))).read_to_end(&mut v));
         assert_eq!(v, b"carrot".to_vec());
+    }
+
+    #[test]
+    fn copy_file_returns_metadata_len() {
+        let tmp = tmpdir();
+        let in_path = tmp.join("in.txt");
+        let out_path = tmp.join("out.txt");
+        check!(check!(File::create(&in_path)).write(b"lettuce"));
+        #[cfg(windows)]
+        check!(check!(File::create(tmp.join("in.txt:bunny"))).write(b"carrot"));
+        let copied_len = check!(fs::copy(&in_path, &out_path));
+        assert_eq!(check!(out_path.metadata()).len(), copied_len);
     }
 
     #[test]
@@ -2883,6 +3040,27 @@ mod tests {
         let mut v = Vec::new();
         check!(check!(File::open(&tmpdir.join("test"))).read_to_end(&mut v));
         assert!(v == &bytes[..]);
+    }
+
+    #[test]
+    fn write_then_read() {
+        let mut bytes = [0; 1024];
+        StdRng::new().unwrap().fill_bytes(&mut bytes);
+
+        let tmpdir = tmpdir();
+
+        check!(fs::write(&tmpdir.join("test"), &bytes[..]));
+        let v = check!(fs::read(&tmpdir.join("test")));
+        assert!(v == &bytes[..]);
+
+        check!(fs::write(&tmpdir.join("not-utf8"), &[0xFF]));
+        error_contains!(fs::read_string(&tmpdir.join("not-utf8")),
+                        "stream did not contain valid UTF-8");
+
+        let s = "𐁁𐀓𐀠𐀴𐀍";
+        check!(fs::write(&tmpdir.join("utf8"), s.as_bytes()));
+        let string = check!(fs::read_string(&tmpdir.join("utf8")));
+        assert_eq!(string, s);
     }
 
     #[test]

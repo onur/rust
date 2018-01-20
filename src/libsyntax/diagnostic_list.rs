@@ -291,7 +291,7 @@ Erroneous code example:
 
 fn main() {
     let tmp = vec![0, 1, 2, 3, 4, 4, 3, 3, 2, 1];
-    let x = &tmp[1...]; // error: inclusive range was used with no end
+    let x = &tmp[1..=]; // error: inclusive range was used with no end
 }
 ```
 
@@ -312,7 +312,32 @@ Or put an end to your inclusive range:
 
 fn main() {
     let tmp = vec![0, 1, 2, 3, 4, 4, 3, 3, 2, 1];
-    let x = &tmp[1...3]; // ok!
+    let x = &tmp[1..=3]; // ok!
+}
+```
+"##,
+
+E0658: r##"
+An unstable feature was used.
+
+Erroneous code example:
+
+```compile_fail,E658
+let x = ::std::u128::MAX; // error: use of unstable library feature 'i128'
+```
+
+If you're using a stable or a beta version of rustc, you won't be able to use
+any unstable features. In order to do so, please switch to a nightly version of
+rustc (by using rustup).
+
+If you're using a nightly version of rustc, just add the corresponding feature
+to be able to use it:
+
+```
+#![feature(i128)]
+
+fn main() {
+    let x = ::std::u128::MAX; // ok!
 }
 ```
 "##,

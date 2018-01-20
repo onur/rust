@@ -9,6 +9,7 @@
 // except according to those terms.
 
 use Diagnostic;
+use DiagnosticId;
 use DiagnosticStyledString;
 
 use Level;
@@ -22,7 +23,7 @@ use syntax_pos::{MultiSpan, Span};
 #[must_use]
 #[derive(Clone)]
 pub struct DiagnosticBuilder<'a> {
-    handler: &'a Handler,
+    pub handler: &'a Handler,
     diagnostic: Diagnostic,
 }
 
@@ -82,7 +83,12 @@ impl<'a> DiagnosticBuilder<'a> {
             return;
         }
 
-        let is_error = match self.level {
+        self.handler.emit_db(&self);
+        self.cancel();
+    }
+
+    pub fn is_error(&self) -> bool {
+        match self.level {
             Level::Bug |
             Level::Fatal |
             Level::PhaseFatal |
@@ -96,18 +102,7 @@ impl<'a> DiagnosticBuilder<'a> {
             Level::Cancelled => {
                 false
             }
-        };
-
-        self.handler.emit_db(&self);
-        self.cancel();
-
-        if is_error {
-            self.handler.bump_err_count();
         }
-
-        // if self.is_fatal() {
-        //     panic!(FatalError);
-        // }
     }
 
     /// Convenience function for internal use, clients should use one of the
@@ -192,7 +187,7 @@ impl<'a> DiagnosticBuilder<'a> {
                                      suggestions: Vec<String>)
                                      -> &mut Self);
     forward!(pub fn set_span<S: Into<MultiSpan>>(&mut self, sp: S) -> &mut Self);
-    forward!(pub fn code(&mut self, s: String) -> &mut Self);
+    forward!(pub fn code(&mut self, s: DiagnosticId) -> &mut Self);
 
     /// Convenience function for internal use, clients should use one of the
     /// struct_* methods on Handler.
@@ -204,7 +199,7 @@ impl<'a> DiagnosticBuilder<'a> {
     /// struct_* methods on Handler.
     pub fn new_with_code(handler: &'a Handler,
                          level: Level,
-                         code: Option<String>,
+                         code: Option<DiagnosticId>,
                          message: &str)
                          -> DiagnosticBuilder<'a> {
         let diagnostic = Diagnostic::new_with_code(level, code, message);

@@ -14,16 +14,17 @@
        html_playground_url = "https://play.rust-lang.org/")]
 #![deny(warnings)]
 
+#![feature(ascii_ctype)]
 #![feature(rustc_private)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
+#![feature(fs_read_write)]
 #![feature(libc)]
 #![feature(set_stdio)]
 #![feature(slice_patterns)]
 #![feature(test)]
 #![feature(unicode)]
 #![feature(vec_remove_item)]
-#![feature(ascii_ctype)]
 
 extern crate arena;
 extern crate getopts;
@@ -48,6 +49,7 @@ extern crate std_unicode;
 #[macro_use] extern crate log;
 extern crate rustc_errors as errors;
 extern crate pulldown_cmark;
+extern crate tempdir;
 
 extern crate serialize as rustc_serialize; // used by deriving
 
@@ -57,7 +59,7 @@ use std::env;
 use std::fmt::Display;
 use std::io;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::mpsc::channel;
 
@@ -173,6 +175,9 @@ pub fn opts() -> Vec<RustcOptGroup> {
         stable("no-default", |o| {
             o.optflag("", "no-defaults", "don't run the default passes")
         }),
+        stable("document-private-items", |o| {
+            o.optflag("", "document-private-items", "document private items")
+        }),
         stable("test", |o| o.optflag("", "test", "run code examples as tests")),
         stable("test-args", |o| {
             o.optmulti("", "test-args", "arguments to pass to the test runner",
@@ -240,11 +245,25 @@ pub fn opts() -> Vec<RustcOptGroup> {
                       or `#![doc(html_playground_url=...)]`",
                      "URL")
         }),
-        unstable("enable-commonmark", |o| {
-            o.optflag("", "enable-commonmark", "to enable commonmark doc rendering/testing")
+        unstable("disable-commonmark", |o| {
+            o.optflag("", "disable-commonmark", "to disable commonmark doc rendering/testing")
         }),
         unstable("display-warnings", |o| {
             o.optflag("", "display-warnings", "to print code warnings when testing doc")
+        }),
+        unstable("crate-version", |o| {
+            o.optopt("", "crate-version", "crate version to print into documentation", "VERSION")
+        }),
+        unstable("linker", |o| {
+            o.optopt("", "linker", "linker used for building executable test code", "PATH")
+        }),
+        unstable("sort-modules-by-appearance", |o| {
+            o.optflag("", "sort-modules-by-appearance", "sort modules by where they appear in the \
+                                                         program, rather than alphabetically")
+        }),
+        unstable("deny-render-differences", |o| {
+            o.optflag("", "deny-render-differences", "abort doc runs when markdown rendering \
+                                                      differences are found")
         }),
     ]
 }
@@ -271,6 +290,9 @@ pub fn main_args(args: &[String]) -> isize {
     };
     // Check for unstable options.
     nightly_options::check_nightly_options(&matches, &opts());
+
+    // check for deprecated options
+    check_deprecated_options(&matches);
 
     if matches.opt_present("h") || matches.opt_present("help") {
         usage("rustdoc");
@@ -329,16 +351,17 @@ pub fn main_args(args: &[String]) -> isize {
                                           .collect();
 
     let should_test = matches.opt_present("test");
-    let markdown_input = input.ends_with(".md") || input.ends_with(".markdown");
+    let markdown_input = Path::new(input).extension()
+        .map_or(false, |e| e == "md" || e == "markdown");
 
     let output = matches.opt_str("o").map(|s| PathBuf::from(&s));
     let css_file_extension = matches.opt_str("e").map(|s| PathBuf::from(&s));
     let cfgs = matches.opt_strs("cfg");
 
-    let render_type = if matches.opt_present("enable-commonmark") {
-        RenderType::Pulldown
-    } else {
+    let render_type = if matches.opt_present("disable-commonmark") {
         RenderType::Hoedown
+    } else {
+        RenderType::Pulldown
     };
 
     if let Some(ref p) = css_file_extension {
@@ -365,17 +388,19 @@ pub fn main_args(args: &[String]) -> isize {
     let playground_url = matches.opt_str("playground-url");
     let maybe_sysroot = matches.opt_str("sysroot").map(PathBuf::from);
     let display_warnings = matches.opt_present("display-warnings");
+    let linker = matches.opt_str("linker").map(PathBuf::from);
+    let sort_modules_alphabetically = !matches.opt_present("sort-modules-by-appearance");
 
     match (should_test, markdown_input) {
         (true, true) => {
-            return markdown::test(input, cfgs, libs, externs, test_args, maybe_sysroot, render_type,
-                                  display_warnings)
+            return markdown::test(input, cfgs, libs, externs, test_args, maybe_sysroot,
+                                  render_type, display_warnings, linker)
         }
         (true, false) => {
-            return test::run(input, cfgs, libs, externs, test_args, crate_name, maybe_sysroot,
-                             render_type, display_warnings)
+            return test::run(Path::new(input), cfgs, libs, externs, test_args, crate_name,
+                             maybe_sysroot, render_type, display_warnings, linker)
         }
-        (false, true) => return markdown::render(input,
+        (false, true) => return markdown::render(Path::new(input),
                                                  output.unwrap_or(PathBuf::from("doc")),
                                                  &matches, &external_html,
                                                  !matches.opt_present("markdown-no-toc"),
@@ -384,7 +409,8 @@ pub fn main_args(args: &[String]) -> isize {
     }
 
     let output_format = matches.opt_str("w");
-    let res = acquire_input(input, externs, &matches, move |out| {
+    let deny_render_differences = matches.opt_present("deny-render-differences");
+    let res = acquire_input(PathBuf::from(input), externs, &matches, move |out| {
         let Output { krate, passes, renderinfo } = out;
         info!("going to format");
         match output_format.as_ref().map(|s| &**s) {
@@ -394,7 +420,9 @@ pub fn main_args(args: &[String]) -> isize {
                                   passes.into_iter().collect(),
                                   css_file_extension,
                                   renderinfo,
-                                  render_type)
+                                  render_type,
+                                  sort_modules_alphabetically,
+                                  deny_render_differences)
                     .expect("failed to generate documentation");
                 0
             }
@@ -421,7 +449,7 @@ fn print_error<T>(error_message: T) where T: Display {
 
 /// Looks inside the command line arguments to extract the relevant input format
 /// and files and then generates the necessary rustdoc output for formatting.
-fn acquire_input<R, F>(input: &str,
+fn acquire_input<R, F>(input: PathBuf,
                        externs: Externs,
                        matches: &getopts::Matches,
                        f: F)
@@ -473,11 +501,22 @@ fn parse_extern_versions(matches: &getopts::Matches) -> Result<Externs, String> 
 /// generated from the cleaned AST of the crate.
 ///
 /// This form of input will run all of the plug/cleaning passes
-fn rust_input<R, F>(cratefile: &str, externs: Externs, matches: &getopts::Matches, f: F) -> R
+fn rust_input<R, F>(cratefile: PathBuf, externs: Externs, matches: &getopts::Matches, f: F) -> R
 where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
     let mut default_passes = !matches.opt_present("no-defaults");
     let mut passes = matches.opt_strs("passes");
     let mut plugins = matches.opt_strs("plugins");
+
+    // We hardcode in the passes here, as this is a new flag and we
+    // are generally deprecating passes.
+    if matches.opt_present("document-private-items") {
+        default_passes = false;
+
+        passes = vec![
+            String::from("collapse-docs"),
+            String::from("unindent-comments"),
+        ];
+    }
 
     // First, parse the crate and extract all relevant information.
     let mut paths = SearchPaths::new();
@@ -488,9 +527,9 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
     let triple = matches.opt_str("target");
     let maybe_sysroot = matches.opt_str("sysroot").map(PathBuf::from);
     let crate_name = matches.opt_str("crate-name");
+    let crate_version = matches.opt_str("crate-version");
     let plugin_path = matches.opt_str("plugin-path");
 
-    let cr = PathBuf::from(cratefile);
     info!("starting to run rustc");
     let display_warnings = matches.opt_present("display-warnings");
 
@@ -503,7 +542,7 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
         use rustc::session::config::Input;
 
         let (mut krate, renderinfo) =
-            core::run_core(paths, cfgs, externs, Input::File(cr), triple, maybe_sysroot,
+            core::run_core(paths, cfgs, externs, Input::File(cratefile), triple, maybe_sysroot,
                            display_warnings, force_unstable_if_unmarked);
 
         info!("finished with rustc");
@@ -511,6 +550,8 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
         if let Some(name) = crate_name {
             krate.name = name
         }
+
+        krate.version = crate_version;
 
         // Process all of the crate attributes, extracting plugin metadata along
         // with the passes which we are supposed to run.
@@ -567,4 +608,27 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
         tx.send(f(Output { krate: krate, renderinfo: renderinfo, passes: passes })).unwrap();
     });
     rx.recv().unwrap()
+}
+
+/// Prints deprecation warnings for deprecated options
+fn check_deprecated_options(matches: &getopts::Matches) {
+    let deprecated_flags = [
+       "input-format",
+       "output-format",
+       "plugin-path",
+       "plugins",
+       "no-defaults",
+       "passes",
+    ];
+
+    for flag in deprecated_flags.into_iter() {
+        if matches.opt_present(flag) {
+            eprintln!("WARNING: the '{}' flag is considered deprecated", flag);
+            eprintln!("WARNING: please see https://github.com/rust-lang/rust/issues/44136");
+        }
+    }
+
+    if matches.opt_present("no-defaults") {
+        eprintln!("WARNING: (you may want to use --document-private-items)");
+    }
 }

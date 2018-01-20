@@ -126,7 +126,7 @@ extern crate lazy_static;
 extern crate serde_json;
 extern crate cmake;
 extern crate filetime;
-extern crate gcc;
+extern crate cc;
 extern crate getopts;
 extern crate num_cpus;
 extern crate toml;
@@ -143,12 +143,11 @@ use std::path::{PathBuf, Path};
 use std::process::{self, Command};
 use std::slice;
 
-use build_helper::{run_silent, run_suppressed, try_run_silent, try_run_suppressed, output, mtime,
-                   BuildExpectation};
+use build_helper::{run_silent, run_suppressed, try_run_silent, try_run_suppressed, output, mtime};
 
 use util::{exe, libdir, OutputFolder, CiEnv};
 
-mod cc;
+mod cc_detect;
 mod channel;
 mod check;
 mod clean;
@@ -190,6 +189,7 @@ mod job {
 pub use config::Config;
 use flags::Subcommand;
 use cache::{Interned, INTERNER};
+use toolstate::ToolState;
 
 /// A structure representing a Rust compiler.
 ///
@@ -222,6 +222,7 @@ pub struct Build {
     rust_info: channel::GitInfo,
     cargo_info: channel::GitInfo,
     rls_info: channel::GitInfo,
+    rustfmt_info: channel::GitInfo,
     local_rebuild: bool,
     fail_fast: bool,
     verbosity: usize,
@@ -240,10 +241,11 @@ pub struct Build {
     lldb_python_dir: Option<String>,
 
     // Runtime state filled in later on
-    // target -> (cc, ar)
-    cc: HashMap<Interned<String>, (gcc::Tool, Option<PathBuf>)>,
-    // host -> (cc, ar)
-    cxx: HashMap<Interned<String>, gcc::Tool>,
+    // C/C++ compilers and archiver for all targets
+    cc: HashMap<Interned<String>, cc::Tool>,
+    cxx: HashMap<Interned<String>, cc::Tool>,
+    ar: HashMap<Interned<String>, PathBuf>,
+    // Misc
     crates: HashMap<Interned<String>, Crate>,
     is_sudo: bool,
     ci_env: CiEnv,
@@ -303,6 +305,7 @@ impl Build {
         let rust_info = channel::GitInfo::new(&config, &src);
         let cargo_info = channel::GitInfo::new(&config, &src.join("src/tools/cargo"));
         let rls_info = channel::GitInfo::new(&config, &src.join("src/tools/rls"));
+        let rustfmt_info = channel::GitInfo::new(&config, &src.join("src/tools/rustfmt"));
 
         Build {
             initial_rustc: config.initial_rustc.clone(),
@@ -322,8 +325,10 @@ impl Build {
             rust_info,
             cargo_info,
             rls_info,
+            rustfmt_info,
             cc: HashMap::new(),
             cxx: HashMap::new(),
+            ar: HashMap::new(),
             crates: HashMap::new(),
             lldb_version: None,
             lldb_python_dir: None,
@@ -345,12 +350,12 @@ impl Build {
             job::setup(self);
         }
 
-        if let Subcommand::Clean = self.config.cmd {
-            return clean::clean(self);
+        if let Subcommand::Clean { all } = self.config.cmd {
+            return clean::clean(self, all);
         }
 
         self.verbose("finding compilers");
-        cc::find(self);
+        cc_detect::find(self);
         self.verbose("running sanity check");
         sanity::check(self);
         // If local-rust is the same major.minor as the current version, then force a local-rebuild
@@ -383,16 +388,19 @@ impl Build {
     /// Clear out `dir` if `input` is newer.
     ///
     /// After this executes, it will also ensure that `dir` exists.
-    fn clear_if_dirty(&self, dir: &Path, input: &Path) {
+    fn clear_if_dirty(&self, dir: &Path, input: &Path) -> bool {
         let stamp = dir.join(".stamp");
+        let mut cleared = false;
         if mtime(&stamp) < mtime(input) {
             self.verbose(&format!("Dirty - {}", dir.display()));
             let _ = fs::remove_dir_all(dir);
+            cleared = true;
         } else if stamp.exists() {
-            return
+            return cleared;
         }
         t!(fs::create_dir_all(dir));
         t!(File::create(stamp));
+        cleared
     }
 
     /// Get the space-separated set of activated features for the standard
@@ -431,6 +439,12 @@ impl Build {
     /// release/debug)
     fn cargo_dir(&self) -> &'static str {
         if self.config.rust_optimize {"release"} else {"debug"}
+    }
+
+    fn tools_dir(&self, compiler: Compiler) -> PathBuf {
+        let out = self.out.join(&*compiler.host).join(format!("stage{}-tools-bin", compiler.stage));
+        t!(fs::create_dir_all(&out));
+        out
     }
 
     /// Get the directory for incremental by-products when using the
@@ -554,31 +568,24 @@ impl Build {
             .join(libdir(&self.config.build))
     }
 
-    /// Runs a command, printing out nice contextual information if its build
-    /// status is not the expected one
-    fn run_expecting(&self, cmd: &mut Command, expect: BuildExpectation) {
-        self.verbose(&format!("running: {:?}", cmd));
-        run_silent(cmd, expect)
-    }
-
     /// Runs a command, printing out nice contextual information if it fails.
     fn run(&self, cmd: &mut Command) {
-        self.run_expecting(cmd, BuildExpectation::None)
+        self.verbose(&format!("running: {:?}", cmd));
+        run_silent(cmd)
     }
 
     /// Runs a command, printing out nice contextual information if it fails.
     fn run_quiet(&self, cmd: &mut Command) {
         self.verbose(&format!("running: {:?}", cmd));
-        run_suppressed(cmd, BuildExpectation::None)
+        run_suppressed(cmd)
     }
 
-    /// Runs a command, printing out nice contextual information if its build
-    /// status is not the expected one.
-    /// Exits if the command failed to execute at all, otherwise returns whether
-    /// the expectation was met
-    fn try_run(&self, cmd: &mut Command, expect: BuildExpectation) -> bool {
+    /// Runs a command, printing out nice contextual information if it fails.
+    /// Exits if the command failed to execute at all, otherwise returns its
+    /// `status.success()`.
+    fn try_run(&self, cmd: &mut Command) -> bool {
         self.verbose(&format!("running: {:?}", cmd));
-        try_run_silent(cmd, expect)
+        try_run_silent(cmd)
     }
 
     /// Runs a command, printing out nice contextual information if it fails.
@@ -586,7 +593,7 @@ impl Build {
     /// `status.success()`.
     fn try_run_quiet(&self, cmd: &mut Command) -> bool {
         self.verbose(&format!("running: {:?}", cmd));
-        try_run_suppressed(cmd, BuildExpectation::None)
+        try_run_suppressed(cmd)
     }
 
     pub fn is_verbose(&self) -> bool {
@@ -612,15 +619,15 @@ impl Build {
 
     /// Returns the path to the C compiler for the target specified.
     fn cc(&self, target: Interned<String>) -> &Path {
-        self.cc[&target].0.path()
+        self.cc[&target].path()
     }
 
     /// Returns a list of flags to pass to the C compiler for the target
     /// specified.
     fn cflags(&self, target: Interned<String>) -> Vec<String> {
         // Filter out -O and /O (the optimization flags) that we picked up from
-        // gcc-rs because the build scripts will determine that for themselves.
-        let mut base = self.cc[&target].0.args().iter()
+        // cc-rs because the build scripts will determine that for themselves.
+        let mut base = self.cc[&target].args().iter()
                            .map(|s| s.to_string_lossy().into_owned())
                            .filter(|s| !s.starts_with("-O") && !s.starts_with("/O"))
                            .collect::<Vec<_>>();
@@ -644,7 +651,7 @@ impl Build {
 
     /// Returns the path to the `ar` archive utility for the target specified.
     fn ar(&self, target: Interned<String>) -> Option<&Path> {
-        self.cc[&target].1.as_ref().map(|p| &**p)
+        self.ar.get(&target).map(|p| &**p)
     }
 
     /// Returns the path to the C++ compiler for the target specified.
@@ -657,21 +664,17 @@ impl Build {
         }
     }
 
-    /// Returns flags to pass to the compiler to generate code for `target`.
-    fn rustc_flags(&self, target: Interned<String>) -> Vec<String> {
-        // New flags should be added here with great caution!
-        //
-        // It's quite unfortunate to **require** flags to generate code for a
-        // target, so it should only be passed here if absolutely necessary!
-        // Most default configuration should be done through target specs rather
-        // than an entry here.
-
-        let mut base = Vec::new();
-        if target != self.config.build && !target.contains("msvc") &&
-            !target.contains("emscripten") {
-            base.push(format!("-Clinker={}", self.cc(target).display()));
+    /// Returns the path to the linker for the given target if it needs to be overriden.
+    fn linker(&self, target: Interned<String>) -> Option<&Path> {
+        if let Some(linker) = self.config.target_config.get(&target)
+                                                       .and_then(|c| c.linker.as_ref()) {
+            Some(linker)
+        } else if target != self.config.build &&
+                  !target.contains("msvc") && !target.contains("emscripten") {
+            Some(self.cc(target))
+        } else {
+            None
         }
-        base
     }
 
     /// Returns if this target should statically link the C runtime, if specified
@@ -713,6 +716,11 @@ impl Build {
     /// Path to the python interpreter to use
     fn python(&self) -> &Path {
         self.config.python.as_ref().unwrap()
+    }
+
+    /// Temporary directory that extended error information is emitted to.
+    fn extended_error_dir(&self) -> PathBuf {
+        self.out.join("tmp/extended-error-metadata")
     }
 
     /// Tests whether the `compiler` compiling for `target` should be forced to
@@ -807,6 +815,11 @@ impl Build {
         self.package_vers(&self.release_num("rls"))
     }
 
+    /// Returns the value of `package_vers` above for rustfmt
+    fn rustfmt_package_vers(&self) -> String {
+        self.package_vers(&self.release_num("rustfmt"))
+    }
+
     /// Returns the `version` string associated with this compiler for Rust
     /// itself.
     ///
@@ -856,6 +869,30 @@ impl Build {
             Some(OutputFolder::new(name().into()))
         } else {
             None
+        }
+    }
+
+    /// Updates the actual toolstate of a tool.
+    ///
+    /// The toolstates are saved to the file specified by the key
+    /// `rust.save-toolstates` in `config.toml`. If unspecified, nothing will be
+    /// done. The file is updated immediately after this function completes.
+    pub fn save_toolstate(&self, tool: &str, state: ToolState) {
+        use std::io::{Seek, SeekFrom};
+
+        if let Some(ref path) = self.config.save_toolstates {
+            let mut file = t!(fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(path));
+
+            let mut current_toolstates: HashMap<Box<str>, ToolState> =
+                serde_json::from_reader(&mut file).unwrap_or_default();
+            current_toolstates.insert(tool.into(), state);
+            t!(file.seek(SeekFrom::Start(0)));
+            t!(file.set_len(0));
+            t!(serde_json::to_writer(file, &current_toolstates));
         }
     }
 

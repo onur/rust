@@ -12,14 +12,14 @@
 //!
 //! See the build.rs for libcompiler_builtins crate for details.
 
-extern crate gcc;
+extern crate cc;
 
 use std::env;
 use std::path::Path;
 
 fn main() {
     let target = env::var("TARGET").expect("TARGET was not set");
-    let cfg = &mut gcc::Build::new();
+    let cfg = &mut cc::Build::new();
 
     let mut profile_sources = vec!["GCDAProfiling.c",
                                    "InstrProfiling.c",
@@ -56,5 +56,5 @@ fn main() {
         cfg.file(Path::new("../libcompiler_builtins/compiler-rt/lib/profile").join(src));
     }
 
-    cfg.compile("libprofiler-rt.a");
+    cfg.compile("profiler-rt");
 }

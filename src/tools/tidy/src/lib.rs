@@ -33,10 +33,9 @@ macro_rules! t {
 
 macro_rules! tidy_error {
     ($bad:expr, $fmt:expr, $($arg:tt)*) => ({
-        use std::io::Write;
         *$bad = true;
-        write!(::std::io::stderr(), "tidy error: ").expect("could not write to stderr");
-        writeln!(::std::io::stderr(), $fmt, $($arg)*).expect("could not write to stderr");
+        eprint!("tidy error: ");
+        eprintln!($fmt, $($arg)*);
     });
 }
 
@@ -51,12 +50,14 @@ pub mod unstable_book;
 
 fn filter_dirs(path: &Path) -> bool {
     let skip = [
+        "src/binaryen",
+        "src/dlmalloc",
         "src/jemalloc",
         "src/llvm",
         "src/libbacktrace",
         "src/libcompiler_builtins",
+        "src/librustc_data_structures/owning_ref",
         "src/compiler-rt",
-        "src/rustllvm",
         "src/liblibc",
         "src/vendor",
         "src/rt/hoedown",
@@ -66,6 +67,8 @@ fn filter_dirs(path: &Path) -> bool {
         "src/tools/rust-installer",
         "src/tools/rustfmt",
         "src/tools/miri",
+        "src/librustc/mir/interpret",
+        "src/librustc_mir/interpret",
     ];
     skip.iter().any(|p| path.ends_with(p))
 }

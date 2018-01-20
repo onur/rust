@@ -359,18 +359,21 @@ lifetime elision rules (see below).
 Here are some simple examples of where you'll run into this error:
 
 ```compile_fail,E0106
-struct Foo { x: &bool }        // error
-struct Foo<'a> { x: &'a bool } // correct
+struct Foo1 { x: &bool }
+              // ^ expected lifetime parameter
+struct Foo2<'a> { x: &'a bool } // correct
 
-struct Bar { x: Foo }
-               ^^^ expected lifetime parameter
-struct Bar<'a> { x: Foo<'a> } // correct
+struct Bar1 { x: Foo2 }
+              // ^^^^ expected lifetime parameter
+struct Bar2<'a> { x: Foo2<'a> } // correct
 
-enum Bar { A(u8), B(&bool), }        // error
-enum Bar<'a> { A(u8), B(&'a bool), } // correct
+enum Baz1 { A(u8), B(&bool), }
+                  // ^ expected lifetime parameter
+enum Baz2<'a> { A(u8), B(&'a bool), } // correct
 
-type MyStr = &str;        // error
-type MyStr<'a> = &'a str; // correct
+type MyStr1 = &str;
+           // ^ expected lifetime parameter
+type MyStr2<'a> = &'a str; // correct
 ```
 
 Lifetime elision is a special, limited kind of inference for lifetimes in
@@ -399,16 +402,6 @@ fn bar(x: &str, y: &str) -> &str { }
 
 // error, `y`'s lifetime is inferred to be distinct from `x`'s
 fn baz<'a>(x: &'a str, y: &str) -> &str { }
-```
-
-Here's an example that is currently an error, but may work in a future version
-of Rust:
-
-```compile_fail,E0106
-struct Foo<'a>(&'a str);
-
-trait Quux { }
-impl Quux for Foo { }
 ```
 
 Lifetime elision in implementation headers was part of the lifetime elision
@@ -477,40 +470,6 @@ fn main() {
     f.get(); // the trait is implemented so we can use it
 }
 ```
-"##,
-
-E0133: r##"
-Unsafe code was used outside of an unsafe function or block.
-
-Erroneous code example:
-
-```compile_fail,E0133
-unsafe fn f() { return; } // This is the unsafe code
-
-fn main() {
-    f(); // error: call to unsafe function requires unsafe function or block
-}
-```
-
-Using unsafe functionality is potentially dangerous and disallowed by safety
-checks. Examples:
-
-* Dereferencing raw pointers
-* Calling functions via FFI
-* Calling functions marked unsafe
-
-These safety checks can be relaxed for a section of the code by wrapping the
-unsafe instructions with an `unsafe` block. For instance:
-
-```
-unsafe fn f() { return; }
-
-fn main() {
-    unsafe { f(); } // ok!
-}
-```
-
-See also https://doc.rust-lang.org/book/first-edition/unsafe.html
 "##,
 
 // This shouldn't really ever trigger since the repeated value error comes first
@@ -1139,11 +1098,13 @@ already specify all requirements that will be used for every type parameter.
 "##,
 
 E0281: r##"
+#### Note: this error code is no longer emitted by the compiler.
+
 You tried to supply a type which doesn't implement some trait in a location
 which expected that trait. This error typically occurs when working with
 `Fn`-based types. Erroneous code example:
 
-```compile_fail,E0281
+```compile-fail
 fn foo<F: Fn(usize)>(x: F) { }
 
 fn main() {
@@ -1381,74 +1342,6 @@ struct Foo<T: 'static> {
     foo: &'static T
 }
 ```
-"##,
-
-E0312: r##"
-A lifetime of reference outlives lifetime of borrowed content.
-
-Erroneous code example:
-
-```compile_fail,E0312
-fn make_child<'tree, 'human>(
-  x: &'human i32,
-  y: &'tree i32
-) -> &'human i32 {
-    if x > y
-       { x }
-    else
-       { y }
-       // error: lifetime of reference outlives lifetime of borrowed content
-}
-```
-
-The function declares that it returns a reference with the `'human`
-lifetime, but it may return data with the `'tree` lifetime. As neither
-lifetime is declared longer than the other, this results in an
-error. Sometimes, this error is because the function *body* is
-incorrect -- that is, maybe you did not *mean* to return data from
-`y`. In that case, you should fix the function body.
-
-Often, however, the body is correct. In that case, the function
-signature needs to be altered to match the body, so that the caller
-understands that data from either `x` or `y` may be returned. The
-simplest way to do this is to give both function parameters the *same*
-named lifetime:
-
-```
-fn make_child<'human>(
-  x: &'human i32,
-  y: &'human i32
-) -> &'human i32 {
-    if x > y
-       { x }
-    else
-       { y } // ok!
-}
-```
-
-However, in some cases, you may prefer to explicitly declare that one lifetime
-outlives another using a `where` clause:
-
-```
-fn make_child<'tree, 'human>(
-  x: &'human i32,
-  y: &'tree i32
-) -> &'human i32
-where
-  'tree: 'human
-{
-    if x > y
-       { x }
-    else
-       { y } // ok!
-}
-```
-
-Here, the where clause `'tree: 'human` can be read as "the lifetime
-'tree outlives the lifetime 'human" -- meaning, references with the
-`'tree` lifetime live *at least as long as* references with the
-`'human` lifetime. Therefore, it is safe to return data with lifetime
-`'tree` when data with the lifetime `'human` is needed.
 "##,
 
 E0317: r##"
@@ -1751,14 +1644,14 @@ impl Foo {
 These attributes do not work on typedefs, since typedefs are just aliases.
 
 Representations like `#[repr(u8)]`, `#[repr(i64)]` are for selecting the
-discriminant size for C-like enums (when there is no associated data, e.g.
-`enum Color {Red, Blue, Green}`), effectively setting the size of the enum to
+discriminant size for enums with no data fields on any of the variants, e.g.
+`enum Color {Red, Blue, Green}`, effectively setting the size of the enum to
 the size of the provided type. Such an enum can be cast to a value of the same
 type as well. In short, `#[repr(u8)]` makes the enum behave like an integer
 with a constrained set of allowed values.
 
-Only C-like enums can be cast to numerical primitives, so this attribute will
-not apply to structs.
+Only field-less enums can be cast to numerical primitives, so this attribute
+will not apply to structs.
 
 `#[repr(packed)]` reduces padding to make the struct size smaller. The
 representation of enums isn't strictly defined in Rust, and this attribute
@@ -1880,6 +1773,46 @@ If you want to get command-line arguments, use `std::env::args`. To exit with a
 specified exit code, use `std::process::exit`.
 "##,
 
+E0562: r##"
+Abstract return types (written `impl Trait` for some trait `Trait`) are only
+allowed as function return types.
+
+Erroneous code example:
+
+```compile_fail,E0562
+#![feature(conservative_impl_trait)]
+
+fn main() {
+    let count_to_ten: impl Iterator<Item=usize> = 0..10;
+    // error: `impl Trait` not allowed outside of function and inherent method
+    //        return types
+    for i in count_to_ten {
+        println!("{}", i);
+    }
+}
+```
+
+Make sure `impl Trait` only appears in return-type position.
+
+```
+#![feature(conservative_impl_trait)]
+
+fn count_to_n(n: usize) -> impl Iterator<Item=usize> {
+    0..n
+}
+
+fn main() {
+    for i in count_to_n(10) {  // ok!
+        println!("{}", i);
+    }
+}
+```
+
+See [RFC 1522] for more details.
+
+[RFC 1522]: https://github.com/rust-lang/rfcs/blob/master/text/1522-conservative-impl-trait.md
+"##,
+
 E0591: r##"
 Per [RFC 401][rfc401], if you have a function declaration `foo`:
 
@@ -1975,7 +1908,7 @@ fn main() {
 "##,
 
 E0601: r##"
-No `main` function was found in a binary crate. To fix this error, just add a
+No `main` function was found in a binary crate. To fix this error, add a
 `main` function. For example:
 
 ```
@@ -2039,7 +1972,38 @@ fn foo<'a>(x: &'a i32, y: &i32) -> &'a i32 {
 ```
 "##,
 
+E0644: r##"
+A closure or generator was constructed that references its own type.
+
+Erroneous example:
+
+```compile-fail,E0644
+fn fix<F>(f: &F)
+  where F: Fn(&F)
+{
+  f(&f);
 }
+
+fn main() {
+  fix(&|y| {
+    // Here, when `x` is called, the parameter `y` is equal to `x`.
+  });
+}
+```
+
+Rust does not permit a closure to directly reference its own type,
+either through an argument (as in the example above) or by capturing
+itself through its environment. This restriction helps keep closure
+inference tractable.
+
+The easiest fix is to rewrite your closure into a top-level function,
+or into a method. In some cases, you may also be able to have your
+closure call itself by capturing a `&Fn()` object or `fn()` pointer
+that refers to itself. That is permitting, since the closure would be
+invoking itself via a virtual call, and hence does not directly
+reference its own *type*.
+
+"##, }
 
 
 register_diagnostics! {
@@ -2060,6 +2024,7 @@ register_diagnostics! {
 //  E0304, // expected signed integer constant
 //  E0305, // expected constant
     E0311, // thing may not live long enough
+    E0312, // lifetime of reference outlives lifetime of borrowed content
     E0313, // lifetime of borrowed pointer outlives lifetime of captured variable
     E0314, // closure outlives stack frame
     E0315, // cannot invoke closure outside of its lifetime
@@ -2086,4 +2051,9 @@ register_diagnostics! {
     E0566, // conflicting representation hints
     E0623, // lifetime mismatch where both parameters are anonymous regions
     E0628, // generators cannot have explicit arguments
+    E0631, // type mismatch in closure arguments
+    E0637, // "'_" is not a valid lifetime bound
+    E0657, // `impl Trait` can only capture lifetimes bound at the fn level
+    E0687, // in-band lifetimes cannot be used in `fn`/`Fn` syntax
+    E0688, // in-band lifetimes cannot be mixed with explicit lifetime binders
 }

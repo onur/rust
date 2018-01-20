@@ -75,6 +75,7 @@ use rustc::middle::cstore::CrateStore;
 use rustc_metadata::locator;
 use rustc_metadata::cstore::CStore;
 use rustc::util::common::{time, ErrorReported};
+use rustc_trans_utils::trans_crate::TransCrate;
 
 use serialize::json::ToJson;
 
@@ -97,7 +98,7 @@ use syntax::ast;
 use syntax::codemap::{CodeMap, FileLoader, RealFileLoader};
 use syntax::feature_gate::{GatedCfg, UnstableFeatures};
 use syntax::parse::{self, PResult};
-use syntax_pos::{DUMMY_SP, MultiSpan};
+use syntax_pos::{DUMMY_SP, MultiSpan, FileName};
 
 #[cfg(test)]
 mod test;
@@ -137,7 +138,9 @@ pub fn run<F>(run_compiler: F) -> isize
                 }
                 None => {
                     let emitter =
-                        errors::emitter::EmitterWriter::stderr(errors::ColorConfig::Auto, None);
+                        errors::emitter::EmitterWriter::stderr(errors::ColorConfig::Auto,
+                                                               None,
+                                                               true);
                     let handler = errors::Handler::with_emitter(true, false, Box::new(emitter));
                     handler.emit(&MultiSpan::new(),
                                  "aborting due to previous error(s)",
@@ -151,101 +154,31 @@ pub fn run<F>(run_compiler: F) -> isize
 }
 
 #[cfg(not(feature="llvm"))]
-pub use no_llvm_metadata_loader::NoLLvmMetadataLoader as MetadataLoader;
+pub use rustc_trans_utils::trans_crate::MetadataOnlyTransCrate as DefaultTransCrate;
 #[cfg(feature="llvm")]
-pub use rustc_trans::LlvmMetadataLoader as MetadataLoader;
-
-#[cfg(not(feature="llvm"))]
-mod no_llvm_metadata_loader {
-    extern crate ar;
-    extern crate owning_ref;
-
-    use rustc::middle::cstore::MetadataLoader as MetadataLoaderTrait;
-    use rustc_back::target::Target;
-    use std::io;
-    use std::fs::File;
-    use std::path::Path;
-
-    use self::ar::Archive;
-    use self::owning_ref::{OwningRef, ErasedBoxRef};
-
-    pub struct NoLLvmMetadataLoader;
-
-    impl MetadataLoaderTrait for NoLLvmMetadataLoader {
-        fn get_rlib_metadata(
-            &self,
-            _: &Target,
-            filename: &Path
-        ) -> Result<ErasedBoxRef<[u8]>, String> {
-            let file = File::open(filename).map_err(|e| {
-                format!("metadata file open err: {:?}", e)
-            })?;
-            let mut archive = Archive::new(file);
-
-            while let Some(entry_result) = archive.next_entry() {
-                let mut entry = entry_result.map_err(|e| {
-                    format!("metadata section read err: {:?}", e)
-                })?;
-                if entry.header().identifier() == "rust.metadata.bin" {
-                    let mut buf = Vec::new();
-                    io::copy(&mut entry, &mut buf).unwrap();
-                    let buf: OwningRef<Vec<u8>, [u8]> = OwningRef::new(buf).into();
-                    return Ok(buf.map_owner_box().erase_owner());
-                }
-            }
-
-            Err("Couldnt find metadata section".to_string())
-        }
-
-        fn get_dylib_metadata(&self,
-                            _target: &Target,
-                            _filename: &Path)
-                            -> Result<ErasedBoxRef<[u8]>, String> {
-            panic!("Dylib metadata loading not supported without LLVM")
-        }
-    }
-}
+pub use rustc_trans::LlvmTransCrate as DefaultTransCrate;
 
 #[cfg(not(feature="llvm"))]
 mod rustc_trans {
     use syntax_pos::symbol::Symbol;
     use rustc::session::Session;
-    use rustc::session::config::{PrintRequest, OutputFilenames};
-    use rustc::ty::{TyCtxt, CrateAnalysis};
-    use rustc::ty::maps::Providers;
-    use rustc_incremental::IncrementalHashesMap;
-
-    use self::back::write::OngoingCrateTranslation;
+    use rustc::session::config::PrintRequest;
+    pub use rustc_trans_utils::trans_crate::MetadataOnlyTransCrate as LlvmTransCrate;
+    pub use rustc_trans_utils::trans_crate::TranslatedCrate as CrateTranslation;
 
     pub fn init(_sess: &Session) {}
-    pub fn enable_llvm_debug() {}
-    pub fn provide(_providers: &mut Providers) {}
     pub fn print_version() {}
     pub fn print_passes() {}
     pub fn print(_req: PrintRequest, _sess: &Session) {}
     pub fn target_features(_sess: &Session) -> Vec<Symbol> { vec![] }
 
-    pub fn trans_crate<'a, 'tcx>(
-        _tcx: TyCtxt<'a, 'tcx, 'tcx>,
-        _analysis: CrateAnalysis,
-        _incr_hashes_map: IncrementalHashesMap,
-        _output_filenames: &OutputFilenames
-    ) -> OngoingCrateTranslation {
-        OngoingCrateTranslation(())
-    }
-
-    pub struct CrateTranslation(());
-
     pub mod back {
         pub mod write {
-            pub struct OngoingCrateTranslation(pub (in ::rustc_trans) ());
-
             pub const RELOC_MODEL_ARGS: [(&'static str, ()); 0] = [];
             pub const CODE_GEN_MODEL_ARGS: [(&'static str, ()); 0] = [];
+            pub const TLS_MODEL_ARGS: [(&'static str, ()); 0] = [];
         }
     }
-
-    __build_diagnostic_array! { librustc_trans, DIAGNOSTICS }
 }
 
 // Parse args and run the compiler. This is the primary entry point for rustc.
@@ -271,10 +204,6 @@ pub fn run_compiler<'a>(args: &[String],
 
     let (sopts, cfg) = config::build_session_options_and_crate_config(&matches);
 
-    if sopts.debugging_opts.debug_llvm {
-        rustc_trans::enable_llvm_debug();
-    }
-
     let descriptions = diagnostics_registry();
 
     do_or_return!(callbacks.early_callback(&matches,
@@ -293,12 +222,12 @@ pub fn run_compiler<'a>(args: &[String],
         },
     };
 
-    let cstore = Rc::new(CStore::new(box ::MetadataLoader));
+    let cstore = CStore::new(DefaultTransCrate::metadata_loader());
 
     let loader = file_loader.unwrap_or(box RealFileLoader);
     let codemap = Rc::new(CodeMap::with_file_loader(loader, sopts.file_path_mapping()));
     let mut sess = session::build_session_with_codemap(
-        sopts, input_file_path, descriptions, codemap, emitter_dest,
+        sopts, input_file_path.clone(), descriptions, codemap, emitter_dest,
     );
     rustc_trans::init(&sess);
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
@@ -309,7 +238,7 @@ pub fn run_compiler<'a>(args: &[String],
 
     do_or_return!(callbacks.late_callback(&matches,
                                           &sess,
-                                          &*cstore,
+                                          &cstore,
                                           &input,
                                           &odir,
                                           &ofile), Some(sess));
@@ -318,6 +247,7 @@ pub fn run_compiler<'a>(args: &[String],
     let control = callbacks.build_controller(&sess, &matches);
     (driver::compile_input(&sess,
                            &cstore,
+                           &input_file_path,
                            &input,
                            &odir,
                            &ofile,
@@ -340,7 +270,7 @@ fn make_input(free_matches: &[String]) -> Option<(Input, Option<PathBuf>)> {
         if ifile == "-" {
             let mut src = String::new();
             io::stdin().read_to_string(&mut src).unwrap();
-            Some((Input::Str { name: driver::anon_src(), input: src },
+            Some((Input::Str { name: FileName::Anon, input: src },
                   None))
         } else {
             Some((Input::File(PathBuf::from(ifile)),
@@ -631,7 +561,9 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                 control.after_hir_lowering.stop = Compilation::Stop;
 
                 control.after_parse.callback = box move |state| {
-                    state.krate = Some(pretty::fold_crate(state.krate.take().unwrap(), ppm));
+                    state.krate = Some(pretty::fold_crate(state.session,
+                                                          state.krate.take().unwrap(),
+                                                          ppm));
                 };
                 control.after_hir_lowering.callback = box move |state| {
                     pretty::print_after_hir_lowering(state.session,
@@ -643,7 +575,6 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                                                      &state.expanded_crate.take().unwrap(),
                                                      state.crate_name.unwrap(),
                                                      ppm,
-                                                     state.arena.unwrap(),
                                                      state.arenas.unwrap(),
                                                      state.output_filenames.unwrap(),
                                                      opt_uii.clone(),
@@ -653,7 +584,7 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                 control.after_parse.stop = Compilation::Stop;
 
                 control.after_parse.callback = box move |state| {
-                    let krate = pretty::fold_crate(state.krate.take().unwrap(), ppm);
+                    let krate = pretty::fold_crate(state.session, state.krate.take().unwrap(), ppm);
                     pretty::print_after_parsing(state.session,
                                                 state.input,
                                                 &krate,
@@ -864,12 +795,18 @@ impl RustcDefaultCalls {
                     }
                     println!("");
                 }
+                PrintRequest::TlsModels => {
+                    println!("Available TLS models:");
+                    for &(name, _) in rustc_trans::back::write::TLS_MODEL_ARGS.iter(){
+                        println!("    {}", name);
+                    }
+                    println!("");
+                }
                 PrintRequest::TargetCPUs | PrintRequest::TargetFeatures => {
                     rustc_trans::print(*req, sess);
                 }
-                PrintRequest::NativeStaticLibs => {
-                    println!("Native static libs can be printed only during linking");
-                }
+                // Any output here interferes with Cargo's parsing of other printed output
+                PrintRequest::NativeStaticLibs => {}
             }
         }
         return Compilation::Stop;
@@ -1039,7 +976,7 @@ Available lint options:
     println!("Lint groups provided by rustc:\n");
     println!("    {}  {}", padded("name"), "sub-lints");
     println!("    {}  {}", padded("----"), "---------");
-    println!("    {}  {}", padded("warnings"), "all built-in lints");
+    println!("    {}  {}", padded("warnings"), "all lints that are set to issue warnings");
 
     let print_lint_groups = |lints: Vec<(&'static str, Vec<lint::LintId>)>| {
         for (name, to) in lints {
@@ -1222,7 +1159,9 @@ fn parse_crate_attrs<'a>(sess: &'a Session, input: &Input) -> PResult<'a, Vec<as
             parse::parse_crate_attrs_from_file(ifile, &sess.parse_sess)
         }
         Input::Str { ref name, ref input } => {
-            parse::parse_crate_attrs_from_source_str(name.clone(), input.clone(), &sess.parse_sess)
+            parse::parse_crate_attrs_from_source_str(name.clone(),
+                                                     input.clone(),
+                                                     &sess.parse_sess)
         }
     }
 }
@@ -1277,7 +1216,9 @@ pub fn monitor<F: FnOnce() + Send + 'static>(f: F) {
         // Thread panicked without emitting a fatal diagnostic
         if !value.is::<errors::FatalError>() {
             let emitter =
-                Box::new(errors::emitter::EmitterWriter::stderr(errors::ColorConfig::Auto, None));
+                Box::new(errors::emitter::EmitterWriter::stderr(errors::ColorConfig::Auto,
+                                                                None,
+                                                                false));
             let handler = errors::Handler::with_emitter(true, false, emitter);
 
             // a .span_bug or .bug call has already printed what
@@ -1307,7 +1248,7 @@ pub fn monitor<F: FnOnce() + Send + 'static>(f: F) {
                              errors::Level::Note);
             }
 
-            writeln!(io::stderr(), "{}", str::from_utf8(&data.lock().unwrap()).unwrap()).unwrap();
+            eprintln!("{}", str::from_utf8(&data.lock().unwrap()).unwrap());
         }
 
         exit_on_err();
@@ -1322,15 +1263,23 @@ fn exit_on_err() -> ! {
     panic!();
 }
 
+#[cfg(stage0)]
+pub fn diagnostics_registry() -> errors::registry::Registry {
+    use errors::registry::Registry;
+
+    Registry::new(&[])
+}
+
+#[cfg(not(stage0))]
 pub fn diagnostics_registry() -> errors::registry::Registry {
     use errors::registry::Registry;
 
     let mut all_errors = Vec::new();
     all_errors.extend_from_slice(&rustc::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_typeck::DIAGNOSTICS);
-    all_errors.extend_from_slice(&rustc_borrowck::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_resolve::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_privacy::DIAGNOSTICS);
+    #[cfg(feature="llvm")]
     all_errors.extend_from_slice(&rustc_trans::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_const_eval::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_metadata::DIAGNOSTICS);

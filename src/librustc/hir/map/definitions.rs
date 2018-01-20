@@ -19,15 +19,15 @@ use hir::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE, DefIndexAddressSpace,
                   CRATE_DEF_INDEX};
 use ich::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::indexed_vec::IndexVec;
+use rustc_data_structures::indexed_vec::{IndexVec};
 use rustc_data_structures::stable_hasher::StableHasher;
 use serialize::{Encodable, Decodable, Encoder, Decoder};
+use session::CrateDisambiguator;
 use std::fmt::Write;
 use std::hash::Hash;
 use syntax::ast;
 use syntax::ext::hygiene::Mark;
 use syntax::symbol::{Symbol, InternedString};
-use ty::TyCtxt;
 use util::nodemap::NodeMap;
 
 /// The DefPathTable maps DefIndexes to DefKeys and vice versa.
@@ -61,7 +61,7 @@ impl DefPathTable {
                 -> DefIndex {
         let index = {
             let index_to_key = &mut self.index_to_key[address_space.index()];
-            let index = DefIndex::new(index_to_key.len() + address_space.start());
+            let index = DefIndex::from_array_index(index_to_key.len(), address_space);
             debug!("DefPathTable::insert() - {:?} <-> {:?}", key, index);
             index_to_key.push(key);
             index
@@ -89,8 +89,7 @@ impl DefPathTable {
     pub fn add_def_path_hashes_to(&self,
                                   cnum: CrateNum,
                                   out: &mut FxHashMap<DefPathHash, DefId>) {
-        for address_space in &[DefIndexAddressSpace::Low, DefIndexAddressSpace::High] {
-            let start_index = address_space.start();
+        for &address_space in &[DefIndexAddressSpace::Low, DefIndexAddressSpace::High] {
             out.extend(
                 (&self.def_path_hashes[address_space.index()])
                     .iter()
@@ -98,7 +97,7 @@ impl DefPathTable {
                     .map(|(index, &hash)| {
                         let def_id = DefId {
                             krate: cnum,
-                            index: DefIndex::new(index + start_index),
+                            index: DefIndex::from_array_index(index, address_space),
                         };
                         (hash, def_id)
                     })
@@ -232,7 +231,9 @@ impl DefKey {
         DefPathHash(hasher.finish())
     }
 
-    fn root_parent_stable_hash(crate_name: &str, crate_disambiguator: &str) -> DefPathHash {
+    fn root_parent_stable_hash(crate_name: &str,
+                               crate_disambiguator: CrateDisambiguator)
+                               -> DefPathHash {
         let mut hasher = StableHasher::new();
         // Disambiguate this from a regular DefPath hash,
         // see compute_stable_hash() above.
@@ -296,26 +297,6 @@ impl DefPath {
         DefPath { data: data, krate: krate }
     }
 
-    pub fn to_string(&self, tcx: TyCtxt) -> String {
-        let mut s = String::with_capacity(self.data.len() * 16);
-
-        s.push_str(&tcx.original_crate_name(self.krate).as_str());
-        s.push_str("/");
-        // Don't print the whole crate disambiguator. That's just annoying in
-        // debug output.
-        s.push_str(&tcx.crate_disambiguator(self.krate).as_str()[..7]);
-
-        for component in &self.data {
-            write!(s,
-                   "::{}[{}]",
-                   component.data.as_interned_str(),
-                   component.disambiguator)
-                .unwrap();
-        }
-
-        s
-    }
-
     /// Returns a string representation of the DefPath without
     /// the crate-prefix. This method is useful if you don't have
     /// a TyCtxt available.
@@ -330,6 +311,29 @@ impl DefPath {
                 .unwrap();
         }
 
+        s
+    }
+
+    /// Return filename friendly string of the DefPah without
+    /// the crate-prefix. This method is useful if you don't have
+    /// a TyCtxt available.
+    pub fn to_filename_friendly_no_crate(&self) -> String {
+        let mut s = String::with_capacity(self.data.len() * 16);
+
+        let mut opt_delimiter = None;
+        for component in &self.data {
+            opt_delimiter.map(|d| s.push(d));
+            opt_delimiter = Some('-');
+            if component.disambiguator == 0 {
+                write!(s, "{}", component.data.as_interned_str()).unwrap();
+            } else {
+                write!(s,
+                       "{}[{}]",
+                       component.data.as_interned_str(),
+                       component.disambiguator)
+                    .unwrap();
+            }
+        }
         s
     }
 }
@@ -488,7 +492,7 @@ impl Definitions {
     /// Add a definition with a parent definition.
     pub fn create_root_def(&mut self,
                            crate_name: &str,
-                           crate_disambiguator: &str)
+                           crate_disambiguator: CrateDisambiguator)
                            -> DefIndex {
         let key = DefKey {
             parent: None,
@@ -570,7 +574,8 @@ impl Definitions {
             self.node_to_def_index.insert(node_id, index);
         }
 
-        if expansion.is_modern() {
+        let expansion = expansion.modern();
+        if expansion != Mark::root() {
             self.expansions.insert(index, expansion);
         }
 

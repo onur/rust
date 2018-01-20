@@ -70,7 +70,7 @@ impl Layout {
     ///
     /// * `align` must be a power of two,
     ///
-    /// * `align` must not exceed 2^31 (i.e. `1 << 31`),
+    /// * `align` must not exceed 2<sup>31</sup> (i.e. `1 << 31`),
     ///
     /// * `size`, when rounded up to the nearest multiple of `align`,
     ///    must not overflow (i.e. the rounded value must be less than
@@ -113,7 +113,7 @@ impl Layout {
     /// # Safety
     ///
     /// This function is unsafe as it does not verify that `align` is
-    /// a power-of-two that is also less than or equal to 2^31, nor
+    /// a power-of-two that is also less than or equal to 2<sup>31</sup>, nor
     /// that `size` aligned to `align` fits within the address space
     /// (i.e. the `Layout::from_size_align` preconditions).
     #[inline]
@@ -217,17 +217,11 @@ impl Layout {
     /// On arithmetic overflow, returns `None`.
     #[inline]
     pub fn repeat(&self, n: usize) -> Option<(Self, usize)> {
-        let padded_size = match self.size.checked_add(self.padding_needed_for(self.align)) {
-            None => return None,
-            Some(padded_size) => padded_size,
-        };
-        let alloc_size = match padded_size.checked_mul(n) {
-            None => return None,
-            Some(alloc_size) => alloc_size,
-        };
+        let padded_size = self.size.checked_add(self.padding_needed_for(self.align))?;
+        let alloc_size = padded_size.checked_mul(n)?;
 
         // We can assume that `self.align` is a power-of-two that does
-        // not exceed 2^31. Furthermore, `alloc_size` has already been
+        // not exceed 2<sup>31</sup>. Furthermore, `alloc_size` has already been
         // rounded up to a multiple of `self.align`; therefore, the
         // call to `Layout::from_size_align` below should never panic.
         Some((Layout::from_size_align(alloc_size, self.align).unwrap(), padded_size))
@@ -246,26 +240,14 @@ impl Layout {
     /// On arithmetic overflow, returns `None`.
     pub fn extend(&self, next: Self) -> Option<(Self, usize)> {
         let new_align = cmp::max(self.align, next.align);
-        let realigned = match Layout::from_size_align(self.size, new_align) {
-            None => return None,
-            Some(l) => l,
-        };
+        let realigned = Layout::from_size_align(self.size, new_align)?;
 
         let pad = realigned.padding_needed_for(next.align);
 
-        let offset = match self.size.checked_add(pad) {
-            None => return None,
-            Some(offset) => offset,
-        };
-        let new_size = match offset.checked_add(next.size) {
-            None => return None,
-            Some(new_size) => new_size,
-        };
+        let offset = self.size.checked_add(pad)?;
+        let new_size = offset.checked_add(next.size)?;
 
-        let layout = match Layout::from_size_align(new_size, new_align) {
-            None => return None,
-            Some(l) => l,
-        };
+        let layout = Layout::from_size_align(new_size, new_align)?;
         Some((layout, offset))
     }
 
@@ -282,11 +264,7 @@ impl Layout {
     ///
     /// On arithmetic overflow, returns `None`.
     pub fn repeat_packed(&self, n: usize) -> Option<Self> {
-        let size = match self.size().checked_mul(n) {
-            None => return None,
-            Some(scaled) => scaled,
-        };
-
+        let size = self.size().checked_mul(n)?;
         Layout::from_size_align(size, self.align)
     }
 
@@ -306,14 +284,8 @@ impl Layout {
     ///
     /// On arithmetic overflow, returns `None`.
     pub fn extend_packed(&self, next: Self) -> Option<(Self, usize)> {
-        let new_size = match self.size().checked_add(next.size()) {
-            None => return None,
-            Some(new_size) => new_size,
-        };
-        let layout = match Layout::from_size_align(new_size, self.align) {
-            None => return None,
-            Some(l) => l,
-        };
+        let new_size = self.size().checked_add(next.size())?;
+        let layout = Layout::from_size_align(new_size, self.align)?;
         Some((layout, self.size()))
     }
 

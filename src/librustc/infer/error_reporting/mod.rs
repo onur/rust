@@ -57,8 +57,8 @@
 
 use infer;
 use super::{InferCtxt, TypeTrace, SubregionOrigin, RegionVariableOrigin, ValuePairs};
-use super::region_inference::{RegionResolutionError, ConcreteFailure, SubSupConflict,
-                              GenericBoundFailure, GenericKind};
+use super::region_constraints::GenericKind;
+use super::lexical_region_resolve::RegionResolutionError;
 
 use std::fmt;
 use hir;
@@ -66,20 +66,19 @@ use hir::map as hir_map;
 use hir::def_id::DefId;
 use middle::region;
 use traits::{ObligationCause, ObligationCauseCode};
-use ty::{self, Region, Ty, TyCtxt, TypeFoldable};
+use ty::{self, Region, Ty, TyCtxt, TypeFoldable, TypeVariants};
 use ty::error::TypeError;
 use syntax::ast::DUMMY_NODE_ID;
 use syntax_pos::{Pos, Span};
 use errors::{DiagnosticBuilder, DiagnosticStyledString};
 
+use rustc_data_structures::indexed_vec::Idx;
+
 mod note;
 
 mod need_type_info;
 
-mod named_anon_conflict;
-#[macro_use]
-mod util;
-mod different_lifetimes;
+pub mod nice_region_error;
 
 impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     pub fn note_and_explain_region(self,
@@ -152,21 +151,21 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                         return;
                     }
                 };
-                let scope_decorated_tag = match scope {
-                    region::Scope::Node(_) => tag,
-                    region::Scope::CallSite(_) => {
+                let scope_decorated_tag = match scope.data() {
+                    region::ScopeData::Node(_) => tag,
+                    region::ScopeData::CallSite(_) => {
                         "scope of call-site for function"
                     }
-                    region::Scope::Arguments(_) => {
+                    region::ScopeData::Arguments(_) => {
                         "scope of function body"
                     }
-                    region::Scope::Destruction(_) => {
+                    region::ScopeData::Destruction(_) => {
                         new_string = format!("destruction scope surrounding {}", tag);
                         &new_string[..]
                     }
-                    region::Scope::Remainder(r) => {
+                    region::ScopeData::Remainder(r) => {
                         new_string = format!("block suffix following statement {}",
-                                             r.first_statement_index);
+                                             r.first_statement_index.index());
                         &new_string[..]
                     }
                 };
@@ -175,13 +174,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 
             ty::ReEarlyBound(_) |
             ty::ReFree(_) => {
-                let scope = match *region {
-                    ty::ReEarlyBound(ref br) => {
-                        self.parent_def_id(br.def_id).unwrap()
-                    }
-                    ty::ReFree(ref fr) => fr.scope,
-                    _ => bug!()
-                };
+                let scope = region.free_region_binding_scope(self);
                 let prefix = match *region {
                     ty::ReEarlyBound(ref br) => {
                         format!("the lifetime {} as defined on", br.name)
@@ -244,6 +237,14 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             ty::ReErased => {
                 (format!("lifetime {:?}", region), None)
             }
+
+            // We shouldn't encounter an error message with ReClosureBound.
+            ty::ReClosureBound(..) => {
+                bug!(
+                    "encountered unexpected ReClosureBound: {:?}",
+                    region,
+                );
+            }
         };
         let message = format!("{}{}{}", prefix, description, suffix);
         if let Some(span) = span {
@@ -257,8 +258,38 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     pub fn report_region_errors(&self,
                                 region_scope_tree: &region::ScopeTree,
-                                errors: &Vec<RegionResolutionError<'tcx>>) {
+                                errors: &Vec<RegionResolutionError<'tcx>>,
+                                will_later_be_reported_by_nll: bool) {
         debug!("report_region_errors(): {} errors to start", errors.len());
+
+        if will_later_be_reported_by_nll && self.tcx.sess.nll() {
+            // With `#![feature(nll)]`, we want to present a nice user
+            // experience, so don't even mention the errors from the
+            // AST checker.
+            if self.tcx.sess.features.borrow().nll {
+                return;
+            }
+
+            // But with -Znll, it's nice to have some note for later.
+            for error in errors {
+                match *error {
+                    RegionResolutionError::ConcreteFailure(ref origin, ..) |
+                    RegionResolutionError::GenericBoundFailure(ref origin, ..) => {
+                        self.tcx.sess.span_warn(
+                            origin.span(),
+                            "not reporting region error due to -Znll");
+                    }
+
+                    RegionResolutionError::SubSupConflict(ref rvo, ..) => {
+                        self.tcx.sess.span_warn(
+                            rvo.span(),
+                            "not reporting region error due to -Znll");
+                    }
+                }
+            }
+
+            return;
+        }
 
         // try to pre-process the errors, which will group some of them
         // together into a `ProcessedErrors` group:
@@ -269,34 +300,42 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         for error in errors {
             debug!("report_region_errors: error = {:?}", error);
 
-            if !self.try_report_named_anon_conflict(&error) &&
-               !self.try_report_anon_anon_conflict(&error) {
+            if !self.try_report_nice_region_error(&error) {
+                match error.clone() {
+                    // These errors could indicate all manner of different
+                    // problems with many different solutions. Rather
+                    // than generate a "one size fits all" error, what we
+                    // attempt to do is go through a number of specific
+                    // scenarios and try to find the best way to present
+                    // the error. If all of these fails, we fall back to a rather
+                    // general bit of code that displays the error information
+                    RegionResolutionError::ConcreteFailure(origin, sub, sup) => {
+                        self.report_concrete_failure(region_scope_tree, origin, sub, sup).emit();
+                    }
 
-               match error.clone() {
-                  // These errors could indicate all manner of different
-                  // problems with many different solutions. Rather
-                  // than generate a "one size fits all" error, what we
-                  // attempt to do is go through a number of specific
-                  // scenarios and try to find the best way to present
-                  // the error. If all of these fails, we fall back to a rather
-                  // general bit of code that displays the error information
-                  ConcreteFailure(origin, sub, sup) => {
-                      self.report_concrete_failure(region_scope_tree, origin, sub, sup).emit();
-                  }
+                    RegionResolutionError::GenericBoundFailure(origin, param_ty, sub) => {
+                        self.report_generic_bound_failure(
+                            region_scope_tree,
+                            origin.span(),
+                            Some(origin),
+                            param_ty,
+                            sub,
+                        );
+                    }
 
-                  GenericBoundFailure(kind, param_ty, sub) => {
-                      self.report_generic_bound_failure(region_scope_tree, kind, param_ty, sub);
-                  }
-
-                  SubSupConflict(var_origin, sub_origin, sub_r, sup_origin, sup_r) => {
+                    RegionResolutionError::SubSupConflict(var_origin,
+                                                          sub_origin,
+                                                          sub_r,
+                                                          sup_origin,
+                                                          sup_r) => {
                         self.report_sub_sup_conflict(region_scope_tree,
                                                      var_origin,
                                                      sub_origin,
                                                      sub_r,
                                                      sup_origin,
                                                      sup_r);
-                  }
-               }
+                    }
+                }
             }
         }
     }
@@ -328,16 +367,25 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         // the only thing in the list.
 
         let is_bound_failure = |e: &RegionResolutionError<'tcx>| match *e {
-            ConcreteFailure(..) => false,
-            SubSupConflict(..) => false,
-            GenericBoundFailure(..) => true,
+            RegionResolutionError::GenericBoundFailure(..) => true,
+            RegionResolutionError::ConcreteFailure(..) |
+            RegionResolutionError::SubSupConflict(..) => false,
         };
 
-        if errors.iter().all(|e| is_bound_failure(e)) {
+
+        let mut errors = if errors.iter().all(|e| is_bound_failure(e)) {
             errors.clone()
         } else {
             errors.iter().filter(|&e| !is_bound_failure(e)).cloned().collect()
-        }
+        };
+
+        // sort the errors by span, for better error message stability.
+        errors.sort_by_key(|u| match *u {
+            RegionResolutionError::ConcreteFailure(ref sro, _, _) => sro.span(),
+            RegionResolutionError::GenericBoundFailure(ref sro, _, _) => sro.span(),
+            RegionResolutionError::SubSupConflict(ref rvo, _, _, _, _) => rvo.span(),
+        });
+        errors
     }
 
     /// Adds a note if the types come from similarly named crates
@@ -389,10 +437,20 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         match cause.code {
             ObligationCauseCode::MatchExpressionArm { arm_span, source } => match source {
                 hir::MatchSource::IfLetDesugar {..} => {
-                    err.span_note(arm_span, "`if let` arm with an incompatible type");
+                    let msg = "`if let` arm with an incompatible type";
+                    if self.tcx.sess.codemap().is_multiline(arm_span) {
+                        err.span_note(arm_span, msg);
+                    } else {
+                        err.span_label(arm_span, msg);
+                    }
                 }
                 _ => {
-                    err.span_note(arm_span, "match arm with an incompatible type");
+                    let msg = "match arm with an incompatible type";
+                    if self.tcx.sess.codemap().is_multiline(arm_span) {
+                        err.span_note(arm_span, msg);
+                    } else {
+                        err.span_label(arm_span, msg);
+                    }
                 }
             },
             _ => ()
@@ -525,6 +583,39 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     fn cmp(&self, t1: Ty<'tcx>, t2: Ty<'tcx>)
         -> (DiagnosticStyledString, DiagnosticStyledString)
     {
+        fn equals<'tcx>(a: &Ty<'tcx>, b: &Ty<'tcx>) -> bool {
+            match (&a.sty, &b.sty) {
+                (a, b) if *a == *b => true,
+                (&ty::TyInt(_), &ty::TyInfer(ty::InferTy::IntVar(_))) |
+                (&ty::TyInfer(ty::InferTy::IntVar(_)), &ty::TyInt(_)) |
+                (&ty::TyInfer(ty::InferTy::IntVar(_)), &ty::TyInfer(ty::InferTy::IntVar(_))) |
+                (&ty::TyFloat(_), &ty::TyInfer(ty::InferTy::FloatVar(_))) |
+                (&ty::TyInfer(ty::InferTy::FloatVar(_)), &ty::TyFloat(_)) |
+                (&ty::TyInfer(ty::InferTy::FloatVar(_)),
+                 &ty::TyInfer(ty::InferTy::FloatVar(_))) => true,
+                _ => false,
+            }
+        }
+
+        fn push_ty_ref<'tcx>(r: &ty::Region<'tcx>,
+                             tnm: &ty::TypeAndMut<'tcx>,
+                             s: &mut DiagnosticStyledString) {
+            let r = &format!("{}", r);
+            s.push_highlighted(format!("&{}{}{}",
+                                       r,
+                                       if r == "" {
+                                           ""
+                                       } else {
+                                           " "
+                                       },
+                                       if tnm.mutbl == hir::MutMutable {
+                                          "mut "
+                                       } else {
+                                           ""
+                                       }));
+            s.push_normal(format!("{}", tnm.ty));
+        }
+
         match (&t1.sty, &t2.sty) {
             (&ty::TyAdt(def1, sub1), &ty::TyAdt(def2, sub2)) => {
                 let mut values = (DiagnosticStyledString::new(), DiagnosticStyledString::new());
@@ -642,6 +733,29 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                      DiagnosticStyledString::highlighted(format!("{}", t2)))
                 }
             }
+
+            // When finding T != &T, hightlight only the borrow
+            (&ty::TyRef(r1, ref tnm1), _) if equals(&tnm1.ty, &t2) => {
+                let mut values = (DiagnosticStyledString::new(), DiagnosticStyledString::new());
+                push_ty_ref(&r1, tnm1, &mut values.0);
+                values.1.push_normal(format!("{}", t2));
+                values
+            }
+            (_, &ty::TyRef(r2, ref tnm2)) if equals(&t1, &tnm2.ty) => {
+                let mut values = (DiagnosticStyledString::new(), DiagnosticStyledString::new());
+                values.0.push_normal(format!("{}", t1));
+                push_ty_ref(&r2, tnm2, &mut values.1);
+                values
+            }
+
+            // When encountering &T != &mut T, highlight only the borrow
+            (&ty::TyRef(r1, ref tnm1), &ty::TyRef(r2, ref tnm2)) if equals(&tnm1.ty, &tnm2.ty) => {
+                let mut values = (DiagnosticStyledString::new(), DiagnosticStyledString::new());
+                push_ty_ref(&r1, tnm1, &mut values.0);
+                push_ty_ref(&r2, tnm2, &mut values.1);
+                values
+            }
+
             _ => {
                 if t1 == t2 {
                     // The two types are the same, elide and don't highlight.
@@ -659,17 +773,27 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                          diag: &mut DiagnosticBuilder<'tcx>,
                          cause: &ObligationCause<'tcx>,
                          secondary_span: Option<(Span, String)>,
-                         values: Option<ValuePairs<'tcx>>,
+                         mut values: Option<ValuePairs<'tcx>>,
                          terr: &TypeError<'tcx>)
     {
-        let (expected_found, is_simple_error) = match values {
-            None => (None, false),
+        // For some types of errors, expected-found does not make
+        // sense, so just ignore the values we were given.
+        match terr {
+            TypeError::CyclicTy(_) => { values = None; }
+            _ => { }
+        }
+
+        let (expected_found, exp_found, is_simple_error) = match values {
+            None => (None, None, false),
             Some(values) => {
-                let is_simple_error = match values {
+                let (is_simple_error, exp_found) = match values {
                     ValuePairs::Types(exp_found) => {
-                        exp_found.expected.is_primitive() && exp_found.found.is_primitive()
+                        let is_simple_err = exp_found.expected.is_primitive()
+                            && exp_found.found.is_primitive();
+
+                        (is_simple_err, Some(exp_found))
                     }
-                    _ => false,
+                    _ => (false, None),
                 };
                 let vals = match self.values_str(&values) {
                     Some((expected, found)) => Some((expected, found)),
@@ -679,11 +803,16 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                         return
                     }
                 };
-                (vals, is_simple_error)
+                (vals, exp_found, is_simple_error)
             }
         };
 
         let span = cause.span;
+
+        diag.span_label(span, terr.to_string());
+        if let Some((sp, msg)) = secondary_span {
+            diag.span_label(sp, msg);
+        }
 
         if let Some((expected, found)) = expected_found {
             match (terr, is_simple_error, expected == found) {
@@ -693,21 +822,43 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                         &format!(" ({})", values.expected.sort_string(self.tcx)),
                         &format!(" ({})", values.found.sort_string(self.tcx)));
                 }
-                (_, false,  _) => {
+                (_, false, _) => {
+                    if let Some(exp_found) = exp_found {
+                        let (def_id, ret_ty) = match exp_found.found.sty {
+                            TypeVariants::TyFnDef(def, _) => {
+                                (Some(def), Some(self.tcx.fn_sig(def).output()))
+                            }
+                            _ => (None, None)
+                        };
+
+                        let exp_is_struct = match exp_found.expected.sty {
+                            TypeVariants::TyAdt(def, _) => def.is_struct(),
+                            _ => false
+                        };
+
+                        if let (Some(def_id), Some(ret_ty)) = (def_id, ret_ty) {
+                            if exp_is_struct && exp_found.expected == ret_ty.0 {
+                                let message = format!(
+                                    "did you mean `{}(/* fields */)`?",
+                                    self.tcx.item_path_str(def_id)
+                                );
+                                diag.span_label(cause.span, message);
+                            }
+                        }
+                    }
+
                     diag.note_expected_found(&"type", expected, found);
                 }
                 _ => (),
             }
         }
 
-        diag.span_label(span, terr.to_string());
-        if let Some((sp, msg)) = secondary_span {
-            diag.span_label(sp, msg);
-        }
-
-        self.note_error_origin(diag, &cause);
         self.check_and_note_conflicting_crates(diag, terr, span);
         self.tcx.note_and_explain_type_err(diag, terr, span);
+
+        // It reads better to have the error origin as the final
+        // thing.
+        self.note_error_origin(diag, &cause);
     }
 
     pub fn report_and_explain_type_error(&self,
@@ -715,17 +866,24 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                                          terr: &TypeError<'tcx>)
                                          -> DiagnosticBuilder<'tcx>
     {
+        debug!("report_and_explain_type_error(trace={:?}, terr={:?})",
+               trace,
+               terr);
+
         let span = trace.cause.span;
-        let failure_str = trace.cause.as_failure_str();
-        let mut diag = match trace.cause.code {
-            ObligationCauseCode::IfExpressionWithNoElse => {
+        let failure_code = trace.cause.as_failure_code(terr);
+        let mut diag = match failure_code {
+            FailureCode::Error0317(failure_str) => {
                 struct_span_err!(self.tcx.sess, span, E0317, "{}", failure_str)
             }
-            ObligationCauseCode::MainFunctionType => {
+            FailureCode::Error0580(failure_str) => {
                 struct_span_err!(self.tcx.sess, span, E0580, "{}", failure_str)
             }
-            _ => {
+            FailureCode::Error0308(failure_str) => {
                 struct_span_err!(self.tcx.sess, span, E0308, "{}", failure_str)
+            }
+            FailureCode::Error0644(failure_str) => {
+                struct_span_err!(self.tcx.sess, span, E0644, "{}", failure_str)
             }
         };
         self.note_type_err(&mut diag, &trace.cause, None, Some(trace.values), terr);
@@ -768,16 +926,51 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
               DiagnosticStyledString::highlighted(format!("{}", exp_found.found))))
     }
 
-    fn report_generic_bound_failure(&self,
-                                    region_scope_tree: &region::ScopeTree,
-                                    origin: SubregionOrigin<'tcx>,
-                                    bound_kind: GenericKind<'tcx>,
-                                    sub: Region<'tcx>)
+    pub fn report_generic_bound_failure(&self,
+                                        region_scope_tree: &region::ScopeTree,
+                                        span: Span,
+                                        origin: Option<SubregionOrigin<'tcx>>,
+                                        bound_kind: GenericKind<'tcx>,
+                                        sub: Region<'tcx>)
     {
-        // FIXME: it would be better to report the first error message
-        // with the span of the parameter itself, rather than the span
-        // where the error was detected. But that span is not readily
-        // accessible.
+        // Attempt to obtain the span of the parameter so we can
+        // suggest adding an explicit lifetime bound to it.
+        let type_param_span = match (self.in_progress_tables, bound_kind) {
+            (Some(ref table), GenericKind::Param(ref param)) => {
+                let table = table.borrow();
+                table.local_id_root.and_then(|did| {
+                    let generics = self.tcx.generics_of(did);
+                    // Account for the case where `did` corresponds to `Self`, which doesn't have
+                    // the expected type argument.
+                    if !param.is_self() {
+                        let type_param = generics.type_param(param, self.tcx);
+                        let hir = &self.tcx.hir;
+                        hir.as_local_node_id(type_param.def_id).map(|id| {
+                            // Get the `hir::TyParam` to verify wether it already has any bounds.
+                            // We do this to avoid suggesting code that ends up as `T: 'a'b`,
+                            // instead we suggest `T: 'a + 'b` in that case.
+                            let has_lifetimes = if let hir_map::NodeTyParam(ref p) = hir.get(id) {
+                                p.bounds.len() > 0
+                            } else {
+                                false
+                            };
+                            let sp = hir.span(id);
+                            // `sp` only covers `T`, change it so that it covers
+                            // `T:` when appropriate
+                            let sp = if has_lifetimes {
+                                sp.to(sp.next_point().next_point())
+                            } else {
+                                sp
+                            };
+                            (sp, has_lifetimes)
+                        })
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        };
 
         let labeled_user_string = match bound_kind {
             GenericKind::Param(ref p) =>
@@ -786,17 +979,36 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 format!("the associated type `{}`", p),
         };
 
-        if let SubregionOrigin::CompareImplMethodObligation {
-            span, item_name, impl_item_def_id, trait_item_def_id, lint_id
-        } = origin {
+        if let Some(SubregionOrigin::CompareImplMethodObligation {
+            span, item_name, impl_item_def_id, trait_item_def_id,
+        }) = origin {
             self.report_extra_impl_obligation(span,
                                               item_name,
                                               impl_item_def_id,
                                               trait_item_def_id,
-                                              &format!("`{}: {}`", bound_kind, sub),
-                                              lint_id)
+                                              &format!("`{}: {}`", bound_kind, sub))
                 .emit();
             return;
+        }
+
+        fn binding_suggestion<'tcx, S: fmt::Display>(err: &mut DiagnosticBuilder<'tcx>,
+                                                     type_param_span: Option<(Span, bool)>,
+                                                     bound_kind: GenericKind<'tcx>,
+                                                     sub: S) {
+            let consider = &format!("consider adding an explicit lifetime bound `{}: {}`...",
+                                    bound_kind,
+                                    sub);
+            if let Some((sp, has_lifetimes)) = type_param_span {
+                let tail = if has_lifetimes {
+                    " + "
+                } else {
+                    ""
+                };
+                let suggestion = format!("{}: {}{}", bound_kind, sub, tail);
+                err.span_suggestion_short(sp, consider, suggestion);
+            } else {
+                err.help(consider);
+            }
         }
 
         let mut err = match *sub {
@@ -804,33 +1016,29 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             ty::ReFree(ty::FreeRegion {bound_region: ty::BrNamed(..), ..}) => {
                 // Does the required lifetime have a nice name we can print?
                 let mut err = struct_span_err!(self.tcx.sess,
-                                               origin.span(),
+                                               span,
                                                E0309,
                                                "{} may not live long enough",
                                                labeled_user_string);
-                err.help(&format!("consider adding an explicit lifetime bound `{}: {}`...",
-                         bound_kind,
-                         sub));
+                binding_suggestion(&mut err, type_param_span, bound_kind, sub);
                 err
             }
 
             ty::ReStatic => {
                 // Does the required lifetime have a nice name we can print?
                 let mut err = struct_span_err!(self.tcx.sess,
-                                               origin.span(),
+                                               span,
                                                E0310,
                                                "{} may not live long enough",
                                                labeled_user_string);
-                err.help(&format!("consider adding an explicit lifetime \
-                                   bound `{}: 'static`...",
-                                  bound_kind));
+                binding_suggestion(&mut err, type_param_span, bound_kind, "'static");
                 err
             }
 
             _ => {
                 // If not, be less specific.
                 let mut err = struct_span_err!(self.tcx.sess,
-                                               origin.span(),
+                                               span,
                                                E0311,
                                                "{} may not live long enough",
                                                labeled_user_string);
@@ -846,7 +1054,9 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             }
         };
 
-        self.note_region_origin(&mut err, &origin);
+        if let Some(origin) = origin {
+            self.note_region_origin(&mut err, &origin);
+        }
         err.emit();
     }
 
@@ -917,6 +1127,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 let var_name = self.tcx.hir.name(var_node_id);
                 format!(" for capture of `{}` by closure", var_name)
             }
+            infer::NLL(..) => bug!("NLL variable found in lexical phase"),
         };
 
         struct_span_err!(self.tcx.sess, var_origin.span(), E0495,
@@ -926,23 +1137,40 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     }
 }
 
+enum FailureCode {
+    Error0317(&'static str),
+    Error0580(&'static str),
+    Error0308(&'static str),
+    Error0644(&'static str),
+}
+
 impl<'tcx> ObligationCause<'tcx> {
-    fn as_failure_str(&self) -> &'static str {
+    fn as_failure_code(&self, terr: &TypeError<'tcx>) -> FailureCode {
+        use self::FailureCode::*;
         use traits::ObligationCauseCode::*;
         match self.code {
-            CompareImplMethodObligation { .. } => "method not compatible with trait",
-            MatchExpressionArm { source, .. } => match source {
+            CompareImplMethodObligation { .. } => Error0308("method not compatible with trait"),
+            MatchExpressionArm { source, .. } => Error0308(match source {
                 hir::MatchSource::IfLetDesugar{..} => "`if let` arms have incompatible types",
                 _ => "match arms have incompatible types",
-            },
-            IfExpression => "if and else have incompatible types",
-            IfExpressionWithNoElse => "if may be missing an else clause",
-            EquatePredicate => "equality predicate not satisfied",
-            MainFunctionType => "main function has wrong type",
-            StartFunctionType => "start function has wrong type",
-            IntrinsicType => "intrinsic has wrong type",
-            MethodReceiver => "mismatched method receiver",
-            _ => "mismatched types",
+            }),
+            IfExpression => Error0308("if and else have incompatible types"),
+            IfExpressionWithNoElse => Error0317("if may be missing an else clause"),
+            EquatePredicate => Error0308("equality predicate not satisfied"),
+            MainFunctionType => Error0580("main function has wrong type"),
+            StartFunctionType => Error0308("start function has wrong type"),
+            IntrinsicType => Error0308("intrinsic has wrong type"),
+            MethodReceiver => Error0308("mismatched method receiver"),
+
+            // In the case where we have no more specific thing to
+            // say, also take a look at the error code, maybe we can
+            // tailor to that.
+            _ => match terr {
+                TypeError::CyclicTy(ty) if ty.is_closure() || ty.is_generator() =>
+                    Error0644("closure/generator type that references itself"),
+                _ =>
+                    Error0308("mismatched types"),
+            }
         }
     }
 

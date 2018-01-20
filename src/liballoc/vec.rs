@@ -71,6 +71,7 @@ use core::fmt;
 use core::hash::{self, Hash};
 use core::intrinsics::{arith_offset, assume};
 use core::iter::{FromIterator, FusedIterator, TrustedLen};
+use core::marker::PhantomData;
 use core::mem;
 #[cfg(not(test))]
 use core::num::Float;
@@ -223,8 +224,10 @@ use Bound::{Excluded, Included, Unbounded};
 /// types inside a `Vec`, it will not allocate space for them. *Note that in this case
 /// the `Vec` may not report a [`capacity`] of 0*. `Vec` will allocate if and only
 /// if [`mem::size_of::<T>`]`() * capacity() > 0`. In general, `Vec`'s allocation
-/// details are subtle enough that it is strongly recommended that you only
-/// free memory allocated by a `Vec` by creating a new `Vec` and dropping it.
+/// details are very subtle &mdash; if you intend to allocate memory using a `Vec`
+/// and use it for something else (either to pass to unsafe code, or to build your
+/// own memory-backed collection), be sure to deallocate this memory by using
+/// `from_raw_parts` to recover the `Vec` and then dropping it.
 ///
 /// If a `Vec` *has* allocated memory, then the memory it points to is on the heap
 /// (as defined by the allocator Rust is configured to use by default), and its
@@ -507,13 +510,9 @@ impl<T> Vec<T> {
 
     /// Converts the vector into [`Box<[T]>`][owned slice].
     ///
-    /// Note that this will drop any excess capacity. Calling this and
-    /// converting back to a vector with [`into_vec`] is equivalent to calling
-    /// [`shrink_to_fit`].
+    /// Note that this will drop any excess capacity.
     ///
     /// [owned slice]: ../../std/boxed/struct.Box.html
-    /// [`into_vec`]: ../../std/primitive.slice.html#method.into_vec
-    /// [`shrink_to_fit`]: #method.shrink_to_fit
     ///
     /// # Examples
     ///
@@ -716,7 +715,7 @@ impl<T> Vec<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `index` is out of bounds.
+    /// Panics if `index > len`.
     ///
     /// # Examples
     ///
@@ -857,8 +856,6 @@ impl<T> Vec<T> {
     /// # Examples
     ///
     /// ```
-    /// use std::ascii::AsciiExt;
-    ///
     /// let mut vec = vec!["foo", "bar", "Bar", "baz", "bar"];
     ///
     /// vec.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
@@ -1095,7 +1092,7 @@ impl<T> Vec<T> {
         // Memory safety
         //
         // When the Drain is first created, it shortens the length of
-        // the source vector to make sure no uninitalized or moved-from elements
+        // the source vector to make sure no uninitialized or moved-from elements
         // are accessible at all if the Drain's destructor never gets to run.
         //
         // Drain will ptr::read out the values to remove.
@@ -1429,10 +1426,7 @@ impl<T: PartialEq> Vec<T> {
     /// ```
     #[unstable(feature = "vec_remove_item", reason = "recently added", issue = "40062")]
     pub fn remove_item(&mut self, item: &T) -> Option<T> {
-        let pos = match self.iter().position(|x| *x == *item) {
-            Some(x) => x,
-            None => return None,
-        };
+        let pos = self.iter().position(|x| *x == *item)?;
         Some(self.remove(pos))
     }
 }
@@ -1547,6 +1541,7 @@ impl<T: Hash> Hash for Vec<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> Index<usize> for Vec<T> {
     type Output = T;
 
@@ -1558,6 +1553,7 @@ impl<T> Index<usize> for Vec<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> IndexMut<usize> for Vec<T> {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut T {
@@ -1566,8 +1562,8 @@ impl<T> IndexMut<usize> for Vec<T> {
     }
 }
 
-
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::Index<ops::Range<usize>> for Vec<T> {
     type Output = [T];
 
@@ -1576,7 +1572,9 @@ impl<T> ops::Index<ops::Range<usize>> for Vec<T> {
         Index::index(&**self, index)
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::Index<ops::RangeTo<usize>> for Vec<T> {
     type Output = [T];
 
@@ -1585,7 +1583,9 @@ impl<T> ops::Index<ops::RangeTo<usize>> for Vec<T> {
         Index::index(&**self, index)
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::Index<ops::RangeFrom<usize>> for Vec<T> {
     type Output = [T];
 
@@ -1594,7 +1594,9 @@ impl<T> ops::Index<ops::RangeFrom<usize>> for Vec<T> {
         Index::index(&**self, index)
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::Index<ops::RangeFull> for Vec<T> {
     type Output = [T];
 
@@ -1603,7 +1605,9 @@ impl<T> ops::Index<ops::RangeFull> for Vec<T> {
         self
     }
 }
+
 #[unstable(feature = "inclusive_range", reason = "recently added, follows RFC", issue = "28237")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::Index<ops::RangeInclusive<usize>> for Vec<T> {
     type Output = [T];
 
@@ -1612,7 +1616,9 @@ impl<T> ops::Index<ops::RangeInclusive<usize>> for Vec<T> {
         Index::index(&**self, index)
     }
 }
+
 #[unstable(feature = "inclusive_range", reason = "recently added, follows RFC", issue = "28237")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::Index<ops::RangeToInclusive<usize>> for Vec<T> {
     type Output = [T];
 
@@ -1623,41 +1629,52 @@ impl<T> ops::Index<ops::RangeToInclusive<usize>> for Vec<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::IndexMut<ops::Range<usize>> for Vec<T> {
     #[inline]
     fn index_mut(&mut self, index: ops::Range<usize>) -> &mut [T] {
         IndexMut::index_mut(&mut **self, index)
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::IndexMut<ops::RangeTo<usize>> for Vec<T> {
     #[inline]
     fn index_mut(&mut self, index: ops::RangeTo<usize>) -> &mut [T] {
         IndexMut::index_mut(&mut **self, index)
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::IndexMut<ops::RangeFrom<usize>> for Vec<T> {
     #[inline]
     fn index_mut(&mut self, index: ops::RangeFrom<usize>) -> &mut [T] {
         IndexMut::index_mut(&mut **self, index)
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::IndexMut<ops::RangeFull> for Vec<T> {
     #[inline]
     fn index_mut(&mut self, _index: ops::RangeFull) -> &mut [T] {
         self
     }
 }
+
 #[unstable(feature = "inclusive_range", reason = "recently added, follows RFC", issue = "28237")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::IndexMut<ops::RangeInclusive<usize>> for Vec<T> {
     #[inline]
     fn index_mut(&mut self, index: ops::RangeInclusive<usize>) -> &mut [T] {
         IndexMut::index_mut(&mut **self, index)
     }
 }
+
 #[unstable(feature = "inclusive_range", reason = "recently added, follows RFC", issue = "28237")]
+#[rustc_on_unimplemented = "vector indices are of type `usize` or ranges of `usize`"]
 impl<T> ops::IndexMut<ops::RangeToInclusive<usize>> for Vec<T> {
     #[inline]
     fn index_mut(&mut self, index: ops::RangeToInclusive<usize>) -> &mut [T] {
@@ -1729,6 +1746,7 @@ impl<T> IntoIterator for Vec<T> {
             mem::forget(self);
             IntoIter {
                 buf: Shared::new_unchecked(begin),
+                phantom: PhantomData,
                 cap,
                 ptr: begin,
                 end,
@@ -1950,7 +1968,7 @@ impl<T> Vec<T> {
     /// assert_eq!(u, &[1, 2]);
     /// ```
     #[inline]
-    #[stable(feature = "vec_splice", since = "1.22.0")]
+    #[stable(feature = "vec_splice", since = "1.21.0")]
     pub fn splice<R, I>(&mut self, range: R, replace_with: I) -> Splice<I::IntoIter>
         where R: RangeArgument<usize>, I: IntoIterator<Item=T>
     {
@@ -2250,6 +2268,7 @@ impl<'a, T> FromIterator<T> for Cow<'a, [T]> where T: Clone {
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct IntoIter<T> {
     buf: Shared<T>,
+    phantom: PhantomData<T>,
     cap: usize,
     ptr: *const T,
     end: *const T,
@@ -2553,13 +2572,13 @@ impl<'a, T> InPlace<T> for PlaceBack<'a, T> {
 /// [`splice()`]: struct.Vec.html#method.splice
 /// [`Vec`]: struct.Vec.html
 #[derive(Debug)]
-#[stable(feature = "vec_splice", since = "1.22.0")]
+#[stable(feature = "vec_splice", since = "1.21.0")]
 pub struct Splice<'a, I: Iterator + 'a> {
     drain: Drain<'a, I::Item>,
     replace_with: I,
 }
 
-#[stable(feature = "vec_splice", since = "1.22.0")]
+#[stable(feature = "vec_splice", since = "1.21.0")]
 impl<'a, I: Iterator> Iterator for Splice<'a, I> {
     type Item = I::Item;
 
@@ -2572,18 +2591,18 @@ impl<'a, I: Iterator> Iterator for Splice<'a, I> {
     }
 }
 
-#[stable(feature = "vec_splice", since = "1.22.0")]
+#[stable(feature = "vec_splice", since = "1.21.0")]
 impl<'a, I: Iterator> DoubleEndedIterator for Splice<'a, I> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.drain.next_back()
     }
 }
 
-#[stable(feature = "vec_splice", since = "1.22.0")]
+#[stable(feature = "vec_splice", since = "1.21.0")]
 impl<'a, I: Iterator> ExactSizeIterator for Splice<'a, I> {}
 
 
-#[stable(feature = "vec_splice", since = "1.22.0")]
+#[stable(feature = "vec_splice", since = "1.21.0")]
 impl<'a, I: Iterator> Drop for Splice<'a, I> {
     fn drop(&mut self) {
         // exhaust drain first

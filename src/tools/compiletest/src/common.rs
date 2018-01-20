@@ -34,6 +34,20 @@ pub enum Mode {
     MirOpt,
 }
 
+impl Mode {
+    pub fn disambiguator(self) -> &'static str {
+        // Run-pass and pretty run-pass tests could run concurrently, and if they do,
+        // they need to keep their output segregated. Same is true for debuginfo tests that
+        // can be run both on gdb and lldb.
+        match self {
+            Pretty => ".pretty",
+            DebugInfoGdb => ".gdb",
+            DebugInfoLldb => ".lldb",
+            _ => "",
+        }
+    }
+}
+
 impl FromStr for Mode {
     type Err = ();
     fn from_str(s: &str) -> Result<Mode, ()> {
@@ -201,7 +215,30 @@ pub struct Config {
     pub cc: String,
     pub cxx: String,
     pub cflags: String,
+    pub ar: String,
+    pub linker: Option<String>,
     pub llvm_components: String,
     pub llvm_cxxflags: String,
     pub nodejs: Option<String>,
 }
+
+#[derive(Clone)]
+pub struct TestPaths {
+    pub file: PathBuf,         // e.g., compile-test/foo/bar/baz.rs
+    pub base: PathBuf,         // e.g., compile-test, auxiliary
+    pub relative_dir: PathBuf, // e.g., foo/bar
+}
+
+/// Used by `ui` tests to generate things like `foo.stderr` from `foo.rs`.
+pub fn expected_output_path(testpaths: &TestPaths, revision: Option<&str>, kind: &str) -> PathBuf {
+    assert!(UI_EXTENSIONS.contains(&kind));
+    let extension = match revision {
+        Some(r) => format!("{}.{}", r, kind),
+        None => kind.to_string(),
+    };
+    testpaths.file.with_extension(extension)
+}
+
+pub const UI_EXTENSIONS: &[&str] = &[UI_STDERR, UI_STDOUT];
+pub const UI_STDERR: &str = "stderr";
+pub const UI_STDOUT: &str = "stdout";

@@ -9,6 +9,8 @@
 // except according to those terms.
 
 // ignore-tidy-linelength
+// revisions: ast mir
+//[mir]compile-flags: -Z borrowck=mir
 
 #[derive(Clone, Copy)]
 union U {
@@ -30,11 +32,13 @@ fn main() {
         }
         {
             let ra = &u.a;
-            let rma = &mut u.a; //~ ERROR cannot borrow `u.a` as mutable because it is also borrowed as immutable
+            let rma = &mut u.a; //[ast]~ ERROR cannot borrow `u.a` as mutable because it is also borrowed as immutable
+                                //[mir]~^ ERROR cannot borrow `u.a` as mutable because it is also borrowed as immutable
         }
         {
             let ra = &u.a;
-            u.a = 1; //~ ERROR cannot assign to `u.a` because it is borrowed
+            u.a = 1; //[ast]~ ERROR cannot assign to `u.a` because it is borrowed
+                     //[mir]~^ ERROR cannot assign to `u.a` because it is borrowed
         }
         // Imm borrow, other field
         {
@@ -47,45 +51,56 @@ fn main() {
         }
         {
             let ra = &u.a;
-            let rmb = &mut u.b; //~ ERROR cannot borrow `u` (via `u.b`) as mutable because `u` is also borrowed as immutable (via `u.a`)
+            let rmb = &mut u.b; //[ast]~ ERROR cannot borrow `u` (via `u.b`) as mutable because `u` is also borrowed as immutable (via `u.a`)
+                                //[mir]~^ ERROR cannot borrow `u.b` as mutable because it is also borrowed as immutable
         }
         {
             let ra = &u.a;
-            u.b = 1; //~ ERROR cannot assign to `u.b` because it is borrowed
+            u.b = 1; //[ast]~ ERROR cannot assign to `u.b` because it is borrowed
+                     //[mir]~^ ERROR cannot assign to `u.b` because it is borrowed
         }
         // Mut borrow, same field
         {
             let rma = &mut u.a;
-            let ra = &u.a; //~ ERROR cannot borrow `u.a` as immutable because it is also borrowed as mutable
+            let ra = &u.a; //[ast]~ ERROR cannot borrow `u.a` as immutable because it is also borrowed as mutable
+                         //[mir]~^ ERROR cannot borrow `u.a` as immutable because it is also borrowed as mutable
         }
         {
             let ra = &mut u.a;
-            let a = u.a; //~ ERROR cannot use `u.a` because it was mutably borrowed
+            let a = u.a; //[ast]~ ERROR cannot use `u.a` because it was mutably borrowed
+                         //[mir]~^ ERROR cannot use `u.a` because it was mutably borrowed
         }
         {
             let rma = &mut u.a;
-            let rma2 = &mut u.a; //~ ERROR cannot borrow `u.a` as mutable more than once at a time
+            let rma2 = &mut u.a; //[ast]~ ERROR cannot borrow `u.a` as mutable more than once at a time
+                                 //[mir]~^ ERROR cannot borrow `u.a` as mutable more than once at a time
         }
         {
             let rma = &mut u.a;
-            u.a = 1; //~ ERROR cannot assign to `u.a` because it is borrowed
+            u.a = 1; //[ast]~ ERROR cannot assign to `u.a` because it is borrowed
+                     //[mir]~^ ERROR cannot assign to `u.a` because it is borrowed
         }
         // Mut borrow, other field
         {
             let rma = &mut u.a;
-            let rb = &u.b; //~ ERROR cannot borrow `u` (via `u.b`) as immutable because `u` is also borrowed as mutable (via `u.a`)
+            let rb = &u.b; //[ast]~ ERROR cannot borrow `u` (via `u.b`) as immutable because `u` is also borrowed as mutable (via `u.a`)
+                           //[mir]~^ ERROR cannot borrow `u.b` as immutable because it is also borrowed as mutable
         }
         {
             let ra = &mut u.a;
-            let b = u.b; //~ ERROR cannot use `u.b` because it was mutably borrowed
+            let b = u.b; //[ast]~ ERROR cannot use `u.b` because it was mutably borrowed
+                         //[mir]~^ ERROR cannot use `u.b` because it was mutably borrowed
+
         }
         {
             let rma = &mut u.a;
-            let rmb2 = &mut u.b; //~ ERROR cannot borrow `u` (via `u.b`) as mutable more than once at a time
+            let rmb2 = &mut u.b; //[ast]~ ERROR cannot borrow `u` (via `u.b`) as mutable more than once at a time
+                                 //[mir]~^ ERROR cannot borrow `u.b` as mutable more than once at a time
         }
         {
             let rma = &mut u.a;
-            u.b = 1; //~ ERROR cannot assign to `u.b` because it is borrowed
+            u.b = 1; //[ast]~ ERROR cannot assign to `u.b` because it is borrowed
+                     //[mir]~^ ERROR cannot assign to `u.b` because it is borrowed
         }
     }
 }

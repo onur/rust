@@ -10,10 +10,52 @@
 
 use rustc::session::config::{self, OutputFilenames, Input, OutputType};
 use rustc::session::Session;
-use rustc::middle::cstore;
-use std::path::PathBuf;
-use syntax::ast;
+use rustc::middle::cstore::{self, LinkMeta};
+use rustc::hir::svh::Svh;
+use std::path::{Path, PathBuf};
+use syntax::{ast, attr};
 use syntax_pos::Span;
+
+pub fn out_filename(sess: &Session,
+                crate_type: config::CrateType,
+                outputs: &OutputFilenames,
+                crate_name: &str)
+                -> PathBuf {
+    let default_filename = filename_for_input(sess, crate_type, crate_name, outputs);
+    let out_filename = outputs.outputs.get(&OutputType::Exe)
+                              .and_then(|s| s.to_owned())
+                              .or_else(|| outputs.single_output_file.clone())
+                              .unwrap_or(default_filename);
+
+    check_file_is_writeable(&out_filename, sess);
+
+    out_filename
+}
+
+// Make sure files are writeable.  Mac, FreeBSD, and Windows system linkers
+// check this already -- however, the Linux linker will happily overwrite a
+// read-only file.  We should be consistent.
+pub fn check_file_is_writeable(file: &Path, sess: &Session) {
+    if !is_writeable(file) {
+        sess.fatal(&format!("output file {} is not writeable -- check its \
+                            permissions", file.display()));
+    }
+}
+
+fn is_writeable(p: &Path) -> bool {
+    match p.metadata() {
+        Err(..) => true,
+        Ok(m) => !m.permissions().readonly()
+    }
+}
+
+pub fn build_link_meta(crate_hash: Svh) -> LinkMeta {
+    let r = LinkMeta {
+        crate_hash,
+    };
+    info!("{:?}", r);
+    return r;
+}
 
 pub fn find_crate_name(sess: Option<&Session>,
                        attrs: &[ast::Attribute],
@@ -27,8 +69,8 @@ pub fn find_crate_name(sess: Option<&Session>,
     // as used. After doing this, however, we still prioritize a crate name from
     // the command line over one found in the #[crate_name] attribute. If we
     // find both we ensure that they're the same later on as well.
-    let attr_crate_name = attrs.iter().find(|at| at.check_name("crate_name"))
-                               .and_then(|at| at.value_str().map(|s| (at, s)));
+    let attr_crate_name = attr::find_by_name(attrs, "crate_name")
+        .and_then(|at| at.value_str().map(|s| (at, s)));
 
     if let Some(sess) = sess {
         if let Some(ref s) = sess.opts.crate_name {
@@ -120,15 +162,30 @@ pub fn default_output_for_target(sess: &Session) -> config::CrateType {
 /// Checks if target supports crate_type as output
 pub fn invalid_output_for_target(sess: &Session,
                                  crate_type: config::CrateType) -> bool {
-    match (sess.target.target.options.dynamic_linking,
-           sess.target.target.options.executables, crate_type) {
-        (false, _, config::CrateTypeCdylib) |
-        (false, _, config::CrateTypeDylib) |
-        (false, _, config::CrateTypeProcMacro) => true,
-        (true, _, config::CrateTypeCdylib) |
-        (true, _, config::CrateTypeDylib) => sess.crt_static() &&
-            !sess.target.target.options.crt_static_allows_dylibs,
-        (_, false, config::CrateTypeExecutable) => true,
-        _ => false
+    match crate_type {
+        config::CrateTypeCdylib |
+        config::CrateTypeDylib |
+        config::CrateTypeProcMacro => {
+            if !sess.target.target.options.dynamic_linking {
+                return true
+            }
+            if sess.crt_static() && !sess.target.target.options.crt_static_allows_dylibs {
+                return true
+            }
+        }
+        _ => {}
     }
+    if sess.target.target.options.only_cdylib {
+        match crate_type {
+            config::CrateTypeProcMacro | config::CrateTypeDylib => return true,
+            _ => {}
+        }
+    }
+    if !sess.target.target.options.executables {
+        if crate_type == config::CrateTypeExecutable {
+            return true
+        }
+    }
+
+    false
 }

@@ -37,7 +37,7 @@ use hir::intravisit;
 // Returns true if the given set of generics implies that the item it's
 // associated with must be inlined.
 fn generics_require_inlining(generics: &hir::Generics) -> bool {
-    !generics.ty_params.is_empty()
+    generics.params.iter().any(|param| param.is_type_param())
 }
 
 // Returns true if the given item must be inlined because it may be
@@ -58,11 +58,10 @@ fn item_might_be_inlined(item: &hir::Item) -> bool {
 }
 
 fn method_might_be_inlined<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                     sig: &hir::MethodSig,
                                      impl_item: &hir::ImplItem,
                                      impl_src: DefId) -> bool {
     if attr::requests_inline(&impl_item.attrs) ||
-        generics_require_inlining(&sig.generics) {
+        generics_require_inlining(&impl_item.generics) {
         return true
     }
     if let Some(impl_node_id) = tcx.hir.as_local_node_id(impl_src) {
@@ -176,8 +175,8 @@ impl<'a, 'tcx> ReachableContext<'a, 'tcx> {
             Some(hir_map::NodeImplItem(impl_item)) => {
                 match impl_item.node {
                     hir::ImplItemKind::Const(..) => true,
-                    hir::ImplItemKind::Method(ref sig, _) => {
-                        if generics_require_inlining(&sig.generics) ||
+                    hir::ImplItemKind::Method(..) => {
+                        if generics_require_inlining(&impl_item.generics) ||
                                 attr::requests_inline(&impl_item.attrs) {
                             true
                         } else {
@@ -269,10 +268,9 @@ impl<'a, 'tcx> ReachableContext<'a, 'tcx> {
                     hir::ItemExternCrate(_) | hir::ItemUse(..) |
                     hir::ItemTy(..) | hir::ItemStatic(..) |
                     hir::ItemMod(..) | hir::ItemForeignMod(..) |
-                    hir::ItemImpl(..) | hir::ItemTrait(..) |
+                    hir::ItemImpl(..) | hir::ItemTrait(..) | hir::ItemTraitAlias(..) |
                     hir::ItemStruct(..) | hir::ItemEnum(..) |
-                    hir::ItemUnion(..) | hir::ItemDefaultImpl(..) |
-                    hir::ItemGlobalAsm(..) => {}
+                    hir::ItemUnion(..) |  hir::ItemGlobalAsm(..) => {}
                 }
             }
             hir_map::NodeTraitItem(trait_method) => {
@@ -293,9 +291,9 @@ impl<'a, 'tcx> ReachableContext<'a, 'tcx> {
                     hir::ImplItemKind::Const(_, body) => {
                         self.visit_nested_body(body);
                     }
-                    hir::ImplItemKind::Method(ref sig, body) => {
+                    hir::ImplItemKind::Method(_, body) => {
                         let did = self.tcx.hir.get_parent_did(search_item);
-                        if method_might_be_inlined(self.tcx, sig, impl_item, did) {
+                        if method_might_be_inlined(self.tcx, impl_item, did) {
                             self.visit_nested_body(body)
                         }
                     }
@@ -310,7 +308,8 @@ impl<'a, 'tcx> ReachableContext<'a, 'tcx> {
             hir_map::NodeVariant(_) |
             hir_map::NodeStructCtor(_) |
             hir_map::NodeField(_) |
-            hir_map::NodeTy(_) => {}
+            hir_map::NodeTy(_) |
+            hir_map::NodeMacroDef(_) => {}
             _ => {
                 bug!("found unexpected thingy in worklist: {}",
                      self.tcx.hir.node_to_string(search_item))
@@ -335,6 +334,12 @@ struct CollectPrivateImplItemsVisitor<'a, 'tcx: 'a> {
 
 impl<'a, 'tcx: 'a> ItemLikeVisitor<'tcx> for CollectPrivateImplItemsVisitor<'a, 'tcx> {
     fn visit_item(&mut self, item: &hir::Item) {
+        // Anything which has custom linkage gets thrown on the worklist no
+        // matter where it is in the crate.
+        if attr::contains_name(&item.attrs, "linkage") {
+            self.worklist.push(item.id);
+        }
+
         // We need only trait impls here, not inherent impls, and only non-exported ones
         if let hir::ItemImpl(.., Some(ref trait_ref), _, ref impl_item_refs) = item.node {
             if !self.access_levels.is_reachable(item.id) {
