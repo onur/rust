@@ -958,7 +958,8 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                             // `sp` only covers `T`, change it so that it covers
                             // `T:` when appropriate
                             let sp = if has_lifetimes {
-                                sp.to(sp.next_point().next_point())
+                                sp.to(self.tcx.sess.codemap().next_point(
+                                        self.tcx.sess.codemap().next_point(sp)))
                             } else {
                                 sp
                             };
@@ -1067,6 +1068,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                                sub_region: Region<'tcx>,
                                sup_origin: SubregionOrigin<'tcx>,
                                sup_region: Region<'tcx>) {
+
         let mut err = self.report_inference_failure(var_origin);
 
         self.tcx.note_and_explain_region(region_scope_tree, &mut err,

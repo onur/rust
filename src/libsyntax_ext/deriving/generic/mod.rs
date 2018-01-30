@@ -830,7 +830,9 @@ fn find_repr_type_name(diagnostic: &Handler, type_attrs: &[ast::Attribute]) -> &
     for a in type_attrs {
         for r in &attr::find_repr_attrs(diagnostic, a) {
             repr_type_name = match *r {
-                attr::ReprPacked | attr::ReprSimd | attr::ReprAlign(_) => continue,
+                attr::ReprPacked | attr::ReprSimd | attr::ReprAlign(_) | attr::ReprTransparent =>
+                    continue,
+
                 attr::ReprC => "i32",
 
                 attr::ReprInt(attr::SignedInt(ast::IntTy::Isize)) => "isize",
@@ -1437,7 +1439,7 @@ impl<'a> MethodDef<'a> {
                                                          &catch_all_substructure);
 
             // Final wrinkle: the self_args are expressions that deref
-            // down to desired l-values, but we cannot actually deref
+            // down to desired places, but we cannot actually deref
             // them when they are fed as r-values into a tuple
             // expression; here add a layer of borrowing, turning
             // `(*self, *__arg_0, ...)` into `(&*self, &*__arg_0, ...)`.
@@ -1514,7 +1516,7 @@ impl<'a> MethodDef<'a> {
         } else {
 
             // Final wrinkle: the self_args are expressions that deref
-            // down to desired l-values, but we cannot actually deref
+            // down to desired places, but we cannot actually deref
             // them when they are fed as r-values into a tuple
             // expression; here add a layer of borrowing, turning
             // `(*self, *__arg_0, ...)` into `(&*self, &*__arg_0, ...)`.

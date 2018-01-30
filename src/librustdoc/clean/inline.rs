@@ -135,7 +135,11 @@ pub fn record_extern_fqn(cx: &DocContext, did: DefId, kind: clean::TypeKind) {
             None
         }
     });
-    let fqn = once(crate_name).chain(relative).collect();
+    let fqn = if let clean::TypeKind::Macro = kind {
+        vec![crate_name, relative.last().unwrap()]
+    } else {
+        once(crate_name).chain(relative).collect()
+    };
     cx.renderinfo.borrow_mut().external_paths.insert(did, (fqn, kind));
 }
 
@@ -146,12 +150,14 @@ pub fn build_external_trait(cx: &DocContext, did: DefId) -> clean::Trait {
     let generics = filter_non_trait_generics(did, generics);
     let (generics, supertrait_bounds) = separate_supertrait_bounds(generics);
     let is_spotlight = load_attrs(cx, did).has_doc_flag("spotlight");
+    let is_auto = cx.tcx.trait_is_auto(did);
     clean::Trait {
         unsafety: cx.tcx.trait_def(did).unsafety,
         generics,
         items: trait_items,
         bounds: supertrait_bounds,
         is_spotlight,
+        is_auto,
     }
 }
 

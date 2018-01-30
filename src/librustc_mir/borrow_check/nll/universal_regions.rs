@@ -96,6 +96,8 @@ pub struct UniversalRegions<'tcx> {
     /// our special inference variable there, we would mess that up.
     pub region_bound_pairs: Vec<(ty::Region<'tcx>, GenericKind<'tcx>)>,
 
+    pub yield_ty: Option<Ty<'tcx>>,
+
     relations: UniversalRegionRelations,
 }
 
@@ -505,6 +507,13 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
             num_universals
         );
 
+        let yield_ty = match defining_ty {
+            DefiningTy::Generator(def_id, substs, _) => {
+                Some(substs.generator_yield_ty(def_id, self.infcx.tcx))
+            }
+            _ => None,
+        };
+
         UniversalRegions {
             indices,
             fr_static,
@@ -516,6 +525,7 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
             unnormalized_output_ty,
             unnormalized_input_tys,
             region_bound_pairs: self.region_bound_pairs,
+            yield_ty: yield_ty,
             relations: self.relations,
         }
     }
@@ -584,13 +594,9 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
 
             DefiningTy::FnDef(_, substs) => substs,
 
-            // When we encounter other sorts of constant
-            // expressions, such as the `22` in `[foo; 22]`, we can
-            // get the type `usize` here. For now, just return an
-            // empty vector of substs in this case, since there are no
-            // generics in scope in such expressions right now.
+            // When we encounter a constant body, just return whatever
+            // substitutions are in scope for that constant.
             DefiningTy::Const(_) => {
-                assert!(identity_substs.is_empty());
                 identity_substs
             }
         };
@@ -654,9 +660,8 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
                 sig.inputs_and_output()
             }
 
-            // This happens on things like `[foo; 22]`. Hence, no
-            // inputs, one output, but it seems like we need a more
-            // general way to handle this category of MIR.
+            // For a constant body, there are no inputs, and one
+            // "output" (the type of the constant).
             DefiningTy::Const(ty) => ty::Binder::dummy(tcx.mk_type_list(iter::once(ty))),
         }
     }
@@ -799,10 +804,12 @@ impl<'tcx> UniversalRegionIndices<'tcx> {
     /// during initialization. Relies on the `indices` map having been
     /// fully initialized.
     pub fn to_region_vid(&self, r: ty::Region<'tcx>) -> RegionVid {
-        match r {
-            ty::ReEarlyBound(..) | ty::ReStatic => *self.indices.get(&r).unwrap(),
-            ty::ReVar(..) => r.to_region_vid(),
-            _ => bug!("cannot convert `{:?}` to a region vid", r),
+        if let ty::ReVar(..) = r {
+            r.to_region_vid()
+        } else {
+            *self.indices.get(&r).unwrap_or_else(|| {
+                bug!("cannot convert `{:?}` to a region vid", r)
+            })
         }
     }
 

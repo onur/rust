@@ -170,7 +170,7 @@ fn build_borrowck_dataflow_data<'a, 'c, 'tcx, F>(this: &mut BorrowckCtxt<'a, 'tc
     if !force_analysis && move_data.is_empty() && all_loans.is_empty() {
         // large arrays of data inserted as constants can take a lot of
         // time and memory to borrow-check - see issue #36799. However,
-        // they don't have lvalues, so no borrow-check is actually needed.
+        // they don't have places, so no borrow-check is actually needed.
         // Recognize that case and skip borrow-checking.
         debug!("skipping loan propagation for {:?} because of no loans", body_id);
         return None;
@@ -384,9 +384,9 @@ impl ToInteriorKind for mc::InteriorKind {
 }
 
 // This can be:
-// - a pointer dereference (`*LV` in README.md)
+// - a pointer dereference (`*P` in README.md)
 // - a field reference, with an optional definition of the containing
-//   enum variant (`LV.f` in README.md)
+//   enum variant (`P.f` in README.md)
 // `DefId` is present when the field is part of struct that is in
 // a variant of an enum. For instance in:
 // `enum E { X { foo: u32 }, Y { foo: u32 }}`
@@ -906,73 +906,6 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                     }
                 };
 
-                // When you have a borrow that lives across a yield,
-                // that reference winds up captured in the generator
-                // type. Regionck then constraints it to live as long
-                // as the generator itself. If that borrow is borrowing
-                // data owned by the generator, this winds up resulting in
-                // an `err_out_of_scope` error:
-                //
-                // ```
-                // {
-                //     let g = || {
-                //         let a = &3; // this borrow is forced to ... -+
-                //         yield ();          //                        |
-                //         println!("{}", a); //                        |
-                //     };                     //                        |
-                // } <----------------------... live until here --------+
-                // ```
-                //
-                // To detect this case, we look for cases where the
-                // `super_scope` (lifetime of the value) is within the
-                // body, but the `sub_scope` is not.
-                debug!("err_out_of_scope: self.body.is_generator = {:?}",
-                       self.body.is_generator);
-                let maybe_borrow_across_yield = if self.body.is_generator {
-                    let body_scope = region::Scope::Node(self.body.value.hir_id.local_id);
-                    debug!("err_out_of_scope: body_scope = {:?}", body_scope);
-                    debug!("err_out_of_scope: super_scope = {:?}", super_scope);
-                    debug!("err_out_of_scope: sub_scope = {:?}", sub_scope);
-                    match (super_scope, sub_scope) {
-                        (&ty::RegionKind::ReScope(value_scope),
-                         &ty::RegionKind::ReScope(loan_scope)) => {
-                            if {
-                                // value_scope <= body_scope &&
-                                self.region_scope_tree.is_subscope_of(value_scope, body_scope) &&
-                                    // body_scope <= loan_scope
-                                    self.region_scope_tree.is_subscope_of(body_scope, loan_scope)
-                            } {
-                                // We now know that this is a case
-                                // that fits the bill described above:
-                                // a borrow of something whose scope
-                                // is within the generator, but the
-                                // borrow is for a scope outside the
-                                // generator.
-                                //
-                                // Now look within the scope of the of
-                                // the value being borrowed (in the
-                                // example above, that would be the
-                                // block remainder that starts with
-                                // `let a`) for a yield. We can cite
-                                // that for the user.
-                                self.region_scope_tree.yield_in_scope(value_scope)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Some((yield_span, _)) = maybe_borrow_across_yield {
-                    debug!("err_out_of_scope: opt_yield_span = {:?}", yield_span);
-                    self.cannot_borrow_across_generator_yield(error_span, yield_span, Origin::Ast)
-                        .emit();
-                    return;
-                }
-
                 let mut db = self.path_does_not_live_long_enough(error_span, &msg, Origin::Ast);
                 let value_kind = match err.cmt.cat {
                     mc::Categorization::Rvalue(..) => "temporary value",
@@ -1343,7 +1276,8 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
     fn region_end_span(&self, region: ty::Region<'tcx>) -> Option<Span> {
         match *region {
             ty::ReScope(scope) => {
-                Some(scope.span(self.tcx, &self.region_scope_tree).end_point())
+                Some(self.tcx.sess.codemap().end_point(
+                        scope.span(self.tcx, &self.region_scope_tree)))
             }
             _ => None
         }

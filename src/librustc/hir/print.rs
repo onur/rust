@@ -1104,7 +1104,7 @@ impl<'a> State<'a> {
     }
 
     pub fn print_expr_maybe_paren(&mut self, expr: &hir::Expr, prec: i8) -> io::Result<()> {
-        let needs_par = expr_precedence(expr) < prec;
+        let needs_par = expr.precedence().order() < prec;
         if needs_par {
             self.popen()?;
         }
@@ -1337,9 +1337,9 @@ impl<'a> State<'a> {
             hir::ExprIf(ref test, ref blk, ref elseopt) => {
                 self.print_if(&test, &blk, elseopt.as_ref().map(|e| &**e))?;
             }
-            hir::ExprWhile(ref test, ref blk, opt_sp_name) => {
-                if let Some(sp_name) = opt_sp_name {
-                    self.print_name(sp_name.node)?;
+            hir::ExprWhile(ref test, ref blk, opt_label) => {
+                if let Some(label) = opt_label {
+                    self.print_name(label.name)?;
                     self.word_space(":")?;
                 }
                 self.head("while")?;
@@ -1347,9 +1347,9 @@ impl<'a> State<'a> {
                 self.s.space()?;
                 self.print_block(&blk)?;
             }
-            hir::ExprLoop(ref blk, opt_sp_name, _) => {
-                if let Some(sp_name) = opt_sp_name {
-                    self.print_name(sp_name.node)?;
+            hir::ExprLoop(ref blk, opt_label, _) => {
+                if let Some(label) = opt_label {
+                    self.print_name(label.name)?;
                     self.word_space(":")?;
                 }
                 self.head("loop")?;
@@ -1424,11 +1424,11 @@ impl<'a> State<'a> {
             hir::ExprPath(ref qpath) => {
                 self.print_qpath(qpath, true)?
             }
-            hir::ExprBreak(label, ref opt_expr) => {
+            hir::ExprBreak(destination, ref opt_expr) => {
                 self.s.word("break")?;
                 self.s.space()?;
-                if let Some(label_ident) = label.ident {
-                    self.print_name(label_ident.node.name)?;
+                if let Some(label) = destination.label {
+                    self.print_name(label.name)?;
                     self.s.space()?;
                 }
                 if let Some(ref expr) = *opt_expr {
@@ -1436,11 +1436,11 @@ impl<'a> State<'a> {
                     self.s.space()?;
                 }
             }
-            hir::ExprAgain(label) => {
+            hir::ExprAgain(destination) => {
                 self.s.word("continue")?;
                 self.s.space()?;
-                if let Some(label_ident) = label.ident {
-                    self.print_name(label_ident.node.name)?;
+                if let Some(label) = destination.label {
+                    self.print_name(label.name)?;
                     self.s.space()?
                 }
             }
@@ -2315,55 +2315,6 @@ fn stmt_ends_with_semi(stmt: &hir::Stmt_) -> bool {
         hir::StmtSemi(..) => {
             false
         }
-    }
-}
-
-
-fn expr_precedence(expr: &hir::Expr) -> i8 {
-    use syntax::util::parser::*;
-
-    match expr.node {
-        hir::ExprClosure(..) => PREC_CLOSURE,
-
-        hir::ExprBreak(..) |
-        hir::ExprAgain(..) |
-        hir::ExprRet(..) |
-        hir::ExprYield(..) => PREC_JUMP,
-
-        // Binop-like expr kinds, handled by `AssocOp`.
-        hir::ExprBinary(op, _, _) => bin_op_to_assoc_op(op.node).precedence() as i8,
-
-        hir::ExprCast(..) => AssocOp::As.precedence() as i8,
-        hir::ExprType(..) => AssocOp::Colon.precedence() as i8,
-
-        hir::ExprAssign(..) |
-        hir::ExprAssignOp(..) => AssocOp::Assign.precedence() as i8,
-
-        // Unary, prefix
-        hir::ExprBox(..) |
-        hir::ExprAddrOf(..) |
-        hir::ExprUnary(..) => PREC_PREFIX,
-
-        // Unary, postfix
-        hir::ExprCall(..) |
-        hir::ExprMethodCall(..) |
-        hir::ExprField(..) |
-        hir::ExprTupField(..) |
-        hir::ExprIndex(..) |
-        hir::ExprInlineAsm(..) => PREC_POSTFIX,
-
-        // Never need parens
-        hir::ExprArray(..) |
-        hir::ExprRepeat(..) |
-        hir::ExprTup(..) |
-        hir::ExprLit(..) |
-        hir::ExprPath(..) |
-        hir::ExprIf(..) |
-        hir::ExprWhile(..) |
-        hir::ExprLoop(..) |
-        hir::ExprMatch(..) |
-        hir::ExprBlock(..) |
-        hir::ExprStruct(..) => PREC_PAREN,
     }
 }
 

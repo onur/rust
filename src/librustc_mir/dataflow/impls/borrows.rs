@@ -131,7 +131,7 @@ impl<'tcx> fmt::Display for BorrowData<'tcx> {
 }
 
 impl ReserveOrActivateIndex {
-    fn reserved(i: BorrowIndex) -> Self { ReserveOrActivateIndex::new((i.index() * 2)) }
+    fn reserved(i: BorrowIndex) -> Self { ReserveOrActivateIndex::new(i.index() * 2) }
     fn active(i: BorrowIndex) -> Self { ReserveOrActivateIndex::new((i.index() * 2) + 1) }
 
     pub(crate) fn is_reservation(self) -> bool { self.index() % 2 == 0 }
@@ -537,8 +537,8 @@ impl<'a, 'gcx, 'tcx> ActiveBorrows<'a, 'gcx, 'tcx> {
             Some(_) => None,
             None => {
                 match self.0.region_span_map.get(region) {
-                    Some(span) => Some(span.end_point()),
-                    None => Some(self.0.mir.span.end_point())
+                    Some(span) => Some(self.0.tcx.sess.codemap().end_point(*span)),
+                    None => Some(self.0.tcx.sess.codemap().end_point(self.0.mir.span))
                 }
             }
         }
@@ -575,10 +575,10 @@ impl<'a, 'b, 'tcx> FindPlaceUses<'a, 'b, 'tcx> {
     /// has a reservation at the time).
     fn is_potential_use(context: PlaceContext) -> bool {
         match context {
-            // storage effects on an place do not activate it
+            // storage effects on a place do not activate it
             PlaceContext::StorageLive | PlaceContext::StorageDead => false,
 
-            // validation effects do not activate an place
+            // validation effects do not activate a place
             //
             // FIXME: Should they? Is it just another read? Or can we
             // guarantee it won't dereference the stored address? How
@@ -589,11 +589,11 @@ impl<'a, 'b, 'tcx> FindPlaceUses<'a, 'b, 'tcx> {
             // AsmOutput existed, but it's not necessarily a pure overwrite.
             // so it's possible this should activate the place.
             PlaceContext::AsmOutput |
-            // pure overwrites of an place do not activate it. (note
+            // pure overwrites of a place do not activate it. (note
             // PlaceContext::Call is solely about dest place)
             PlaceContext::Store | PlaceContext::Call => false,
 
-            // reads of an place *do* activate it
+            // reads of a place *do* activate it
             PlaceContext::Move |
             PlaceContext::Copy |
             PlaceContext::Drop |

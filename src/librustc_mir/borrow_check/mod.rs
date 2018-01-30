@@ -35,8 +35,8 @@ use dataflow::{do_dataflow, DebugFormatted};
 use dataflow::FlowAtLocation;
 use dataflow::MoveDataParamEnv;
 use dataflow::{DataflowAnalysis, DataflowResultsConsumer};
-use dataflow::{MaybeInitializedLvals, MaybeUninitializedLvals};
-use dataflow::{EverInitializedLvals, MovingOutStatements};
+use dataflow::{MaybeInitializedPlaces, MaybeUninitializedPlaces};
+use dataflow::{EverInitializedPlaces, MovingOutStatements};
 use dataflow::{BorrowData, Borrows, ReserveOrActivateIndex};
 use dataflow::{ActiveBorrows, Reservations};
 use dataflow::indexes::BorrowIndex;
@@ -160,7 +160,7 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         id,
         &attributes,
         &dead_unwinds,
-        MaybeInitializedLvals::new(tcx, mir, &mdpe),
+        MaybeInitializedPlaces::new(tcx, mir, &mdpe),
         |bd, i| DebugFormatted::new(&bd.move_data().move_paths[i]),
     ));
     let flow_uninits = FlowAtLocation::new(do_dataflow(
@@ -169,7 +169,7 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         id,
         &attributes,
         &dead_unwinds,
-        MaybeUninitializedLvals::new(tcx, mir, &mdpe),
+        MaybeUninitializedPlaces::new(tcx, mir, &mdpe),
         |bd, i| DebugFormatted::new(&bd.move_data().move_paths[i]),
     ));
     let flow_move_outs = FlowAtLocation::new(do_dataflow(
@@ -187,7 +187,7 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         id,
         &attributes,
         &dead_unwinds,
-        EverInitializedLvals::new(tcx, mir, &mdpe),
+        EverInitializedPlaces::new(tcx, mir, &mdpe),
         |bd, i| DebugFormatted::new(&bd.move_data().inits[i]),
     ));
 
@@ -209,12 +209,21 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
     };
     let flow_inits = flow_inits; // remove mut
 
+    let movable_generator = !match tcx.hir.get(id) {
+        hir::map::Node::NodeExpr(&hir::Expr {
+            node: hir::ExprClosure(.., Some(hir::GeneratorMovability::Static)),
+            ..
+        }) => true,
+        _ => false,
+    };
+
     let mut mbcx = MirBorrowckCtxt {
         tcx: tcx,
         mir: mir,
         node_id: id,
         move_data: &mdpe.move_data,
         param_env: param_env,
+        movable_generator,
         locals_are_invalidated_at_exit: match tcx.hir.body_owner_kind(id) {
             hir::BodyOwnerKind::Const | hir::BodyOwnerKind::Static(_) => false,
             hir::BodyOwnerKind::Fn => true,
@@ -277,6 +286,7 @@ pub struct MirBorrowckCtxt<'cx, 'gcx: 'tcx, 'tcx: 'cx> {
     node_id: ast::NodeId,
     move_data: &'cx MoveData<'tcx>,
     param_env: ParamEnv<'gcx>,
+    movable_generator: bool,
     /// This keeps track of whether local variables are free-ed when the function
     /// exits even without a `StorageDead`, which appears to be the case for
     /// constants.
@@ -534,6 +544,18 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
                 drop: _,
             } => {
                 self.consume_operand(ContextKind::Yield.new(loc), (value, span), flow_state);
+
+                if self.movable_generator {
+                    // Look for any active borrows to locals
+                    let domain = flow_state.borrows.operator();
+                    let data = domain.borrows();
+                    flow_state.borrows.with_elems_outgoing(|borrows| {
+                        for i in borrows {
+                            let borrow = &data[i.borrow_index()];
+                            self.check_for_local_borrow(borrow, span);
+                        }
+                    });
+                }
             }
 
             TerminatorKind::Resume | TerminatorKind::Return | TerminatorKind::GeneratorDrop => {
@@ -585,7 +607,7 @@ enum ArtificialField {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum ShallowOrDeep {
     /// From the RFC: "A *shallow* access means that the immediate
-    /// fields reached at LV are accessed, but references or pointers
+    /// fields reached at P are accessed, but references or pointers
     /// found within are not dereferenced. Right now, the only access
     /// that is shallow is an assignment like `x = ...;`, which would
     /// be a *shallow write* of `x`."
@@ -1090,12 +1112,52 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
             debug!("check_for_invalidation_at_exit({:?}): INVALID", place);
             // FIXME: should be talking about the region lifetime instead
             // of just a span here.
+            let span = self.tcx.sess.codemap().end_point(span);
             self.report_borrowed_value_does_not_live_long_enough(
                 context,
                 borrow,
-                span.end_point(),
+                span,
                 flow_state.borrows.operator(),
             )
+        }
+    }
+
+    /// Reports an error if this is a borrow of local data.
+    /// This is called for all Yield statements on movable generators
+    fn check_for_local_borrow(
+        &mut self,
+        borrow: &BorrowData<'tcx>,
+        yield_span: Span)
+    {
+        fn borrow_of_local_data<'tcx>(place: &Place<'tcx>) -> bool {
+            match place {
+                Place::Static(..) => false,
+                Place::Local(..) => true,
+                Place::Projection(box proj) => {
+                    match proj.elem {
+                        // Reborrow of already borrowed data is ignored
+                        // Any errors will be caught on the initial borrow
+                        ProjectionElem::Deref => false,
+
+                        // For interior references and downcasts, find out if the base is local
+                        ProjectionElem::Field(..) |
+                        ProjectionElem::Index(..) |
+                        ProjectionElem::ConstantIndex { .. } |
+                        ProjectionElem::Subslice { .. } |
+                        ProjectionElem::Downcast(..) => {
+                            borrow_of_local_data(&proj.base)
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("check_for_local_borrow({:?})", borrow);
+
+        if borrow_of_local_data(&borrow.borrowed_place) {
+            self.tcx.cannot_borrow_across_generator_yield(self.retrieve_borrow_span(borrow),
+                                                          yield_span,
+                                                          Origin::Mir).emit();
         }
     }
 

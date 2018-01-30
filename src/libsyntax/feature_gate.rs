@@ -343,9 +343,6 @@ declare_features! (
     // Allows the `catch {...}` expression
     (active, catch_expr, "1.17.0", Some(31436)),
 
-    // Allows `repr(align(u16))` struct attribute (RFC 1358)
-    (active, repr_align, "1.17.0", Some(33626)),
-
     // Used to preserve symbols (see llvm.used)
     (active, used, "1.18.0", Some(40289)),
 
@@ -452,6 +449,9 @@ declare_features! (
 
     // `extern` in paths
     (active, extern_in_paths, "1.23.0", Some(44660)),
+
+    // Allows `#[repr(transparent)]` attribute on newtype structs
+    (active, repr_transparent, "1.25.0", Some(43036)),
 );
 
 declare_features! (
@@ -543,6 +543,8 @@ declare_features! (
     // Allows the sysV64 ABI to be specified on all platforms
     // instead of just the platforms on which it is the C ABI
     (accepted, abi_sysv64, "1.24.0", Some(36167)),
+    // Allows `repr(align(16))` struct attribute (RFC 1358)
+    (accepted, repr_align, "1.24.0", Some(33626)),
 );
 
 // If you change this, please modify src/doc/unstable-book as well. You must
@@ -692,9 +694,7 @@ pub const BUILTIN_ATTRIBUTES: &'static [(&'static str, AttributeType, AttributeG
     ("thread_local", Whitelisted, Gated(Stability::Unstable,
                                         "thread_local",
                                         "`#[thread_local]` is an experimental feature, and does \
-                                         not currently handle destructors. There is no \
-                                         corresponding `#[task_local]` mapping to the task \
-                                         model",
+                                         not currently handle destructors.",
                                         cfg_fn!(thread_local))),
 
     ("rustc_on_unimplemented", Normal, Gated(Stability::Unstable,
@@ -1453,15 +1453,25 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             }
         }
 
+        // allow attr_literals in #[repr(align(x))]
+        let mut is_repr_align = false;
+        if attr.path == "repr" {
+            if let Some(content) = attr.meta_item_list() {
+                is_repr_align = content.iter().any(|c| c.check_name("align"));
+            }
+        }
+
         if self.context.features.proc_macro && attr::is_known(attr) {
             return
         }
 
-        let meta = panictry!(attr.parse_meta(self.context.parse_sess));
-        if contains_novel_literal(&meta) {
-            gate_feature_post!(&self, attr_literals, attr.span,
-                               "non-string literals in attributes, or string \
-                               literals in top-level positions, are experimental");
+        if !is_repr_align {
+            let meta = panictry!(attr.parse_meta(self.context.parse_sess));
+            if contains_novel_literal(&meta) {
+                gate_feature_post!(&self, attr_literals, attr.span,
+                                   "non-string literals in attributes, or string \
+                                   literals in top-level positions, are experimental");
+            }
         }
     }
 
@@ -1519,10 +1529,10 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                             gate_feature_post!(&self, repr_simd, attr.span,
                                                "SIMD types are experimental and possibly buggy");
                         }
-                        if item.check_name("align") {
-                            gate_feature_post!(&self, repr_align, attr.span,
-                                               "the struct `#[repr(align(u16))]` attribute \
-                                                is experimental");
+                        if item.check_name("transparent") {
+                            gate_feature_post!(&self, repr_transparent, attr.span,
+                                               "the `#[repr(transparent)]` attribute \
+                                               is experimental");
                         }
                     }
                 }
@@ -1942,7 +1952,7 @@ impl FeatureChecker {
                 .span_note(ca_span, "`#![feature(custom_attribute)]` declared here")
                 .emit();
 
-            panic!(FatalError);
+            FatalError.raise();
         }
 
         if let (Some(span), None) = (self.copy_closures, self.clone_closures) {
@@ -1951,7 +1961,7 @@ impl FeatureChecker {
                   .span_note(span, "`#![feature(copy_closures)]` declared here")
                   .emit();
 
-            panic!(FatalError);
+            FatalError.raise();
         }
     }
 }

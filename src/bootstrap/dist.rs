@@ -434,6 +434,15 @@ impl Step for Rustc {
                 }
             }
 
+            // Copy over the codegen backends
+            let backends_src = builder.sysroot_libdir(compiler, host)
+                .join("codegen-backends");
+            let backends_dst = image.join("lib/rustlib")
+                .join(&*host)
+                .join("lib/codegen-backends");
+            t!(fs::create_dir_all(&backends_dst));
+            cp_r(&backends_src, &backends_dst);
+
             // Man pages
             t!(fs::create_dir_all(image.join("share/man/man1")));
             let man_src = build.src.join("src/doc/man");
@@ -581,7 +590,9 @@ impl Step for Std {
         t!(fs::create_dir_all(&dst));
         let mut src = builder.sysroot_libdir(compiler, target).to_path_buf();
         src.pop(); // Remove the trailing /lib folder from the sysroot_libdir
-        cp_r(&src, &dst);
+        cp_filtered(&src, &dst, &|path| {
+            path.file_name().and_then(|s| s.to_str()) != Some("codegen-backends")
+        });
 
         let mut cmd = rust_installer(builder);
         cmd.arg("generate")
@@ -1652,7 +1663,6 @@ fn add_env(build: &Build, cmd: &mut Command, target: Interned<String>) {
     cmd.env("CFG_RELEASE_INFO", build.rust_version())
        .env("CFG_RELEASE_NUM", channel::CFG_RELEASE_NUM)
        .env("CFG_RELEASE", build.rust_release())
-       .env("CFG_PRERELEASE_VERSION", channel::CFG_PRERELEASE_VERSION)
        .env("CFG_VER_MAJOR", parts.next().unwrap())
        .env("CFG_VER_MINOR", parts.next().unwrap())
        .env("CFG_VER_PATCH", parts.next().unwrap())

@@ -130,7 +130,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             ty::TyInfer(_) => None,
 
             ty::TyBool | ty::TyChar | ty::TyInt(..) | ty::TyUint(..) |
-            ty::TyFloat(_) | ty::TyArray(..) |
+            ty::TyFloat(_) | ty::TyArray(..) | ty::TyGeneratorWitness(..) |
             ty::TyRawPtr(_) | ty::TyRef(..) | ty::TyFnDef(..) |
             ty::TyFnPtr(..) | ty::TyClosure(..) | ty::TyGenerator(..) |
             ty::TyAdt(..) | ty::TyNever | ty::TyError => {
@@ -281,10 +281,12 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
                                 .emit();
             }
             CastError::SizedUnsizedCast => {
-                type_error_struct!(fcx.tcx.sess, self.span, self.expr_ty, E0607,
-                                 "cannot cast thin pointer `{}` to fat pointer `{}`",
-                                 self.expr_ty,
-                                 fcx.ty_to_string(self.cast_ty)).emit();
+                use structured_errors::{SizedUnsizedCastError, StructuredDiagnostic};
+                SizedUnsizedCastError::new(&fcx.tcx.sess,
+                                           self.span,
+                                           self.expr_ty,
+                                           fcx.ty_to_string(self.cast_ty))
+                    .diagnostic().emit();
             }
             CastError::UnknownCastPtrKind |
             CastError::UnknownExprPtrKind => {

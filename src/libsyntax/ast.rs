@@ -15,6 +15,7 @@ pub use self::UnsafeSource::*;
 pub use self::PathParameters::*;
 pub use symbol::{Ident, Symbol as Name};
 pub use util::ThinVec;
+pub use util::parser::ExprPrecedence;
 
 use syntax_pos::{Span, DUMMY_SP};
 use codemap::{respan, Spanned};
@@ -31,6 +32,18 @@ use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 use std::u32;
+
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
+pub struct Label {
+    pub ident: Ident,
+    pub span: Span,
+}
+
+impl fmt::Debug for Label {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "label({:?})", self.ident)
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
 pub struct Lifetime {
@@ -730,6 +743,7 @@ impl BinOpKind {
             _ => false
         }
     }
+
     pub fn is_comparison(&self) -> bool {
         use self::BinOpKind::*;
         match *self {
@@ -740,6 +754,7 @@ impl BinOpKind {
             false,
         }
     }
+
     /// Returns `true` if the binary operator takes its arguments by value
     pub fn is_by_value(&self) -> bool {
         !self.is_comparison()
@@ -966,6 +981,49 @@ impl Expr {
 
         Some(P(Ty { node, id: self.id, span: self.span }))
     }
+
+    pub fn precedence(&self) -> ExprPrecedence {
+        match self.node {
+            ExprKind::Box(_) => ExprPrecedence::Box,
+            ExprKind::InPlace(..) => ExprPrecedence::InPlace,
+            ExprKind::Array(_) => ExprPrecedence::Array,
+            ExprKind::Call(..) => ExprPrecedence::Call,
+            ExprKind::MethodCall(..) => ExprPrecedence::MethodCall,
+            ExprKind::Tup(_) => ExprPrecedence::Tup,
+            ExprKind::Binary(op, ..) => ExprPrecedence::Binary(op.node),
+            ExprKind::Unary(..) => ExprPrecedence::Unary,
+            ExprKind::Lit(_) => ExprPrecedence::Lit,
+            ExprKind::Type(..) | ExprKind::Cast(..) => ExprPrecedence::Cast,
+            ExprKind::If(..) => ExprPrecedence::If,
+            ExprKind::IfLet(..) => ExprPrecedence::IfLet,
+            ExprKind::While(..) => ExprPrecedence::While,
+            ExprKind::WhileLet(..) => ExprPrecedence::WhileLet,
+            ExprKind::ForLoop(..) => ExprPrecedence::ForLoop,
+            ExprKind::Loop(..) => ExprPrecedence::Loop,
+            ExprKind::Match(..) => ExprPrecedence::Match,
+            ExprKind::Closure(..) => ExprPrecedence::Closure,
+            ExprKind::Block(..) => ExprPrecedence::Block,
+            ExprKind::Catch(..) => ExprPrecedence::Catch,
+            ExprKind::Assign(..) => ExprPrecedence::Assign,
+            ExprKind::AssignOp(..) => ExprPrecedence::AssignOp,
+            ExprKind::Field(..) => ExprPrecedence::Field,
+            ExprKind::TupField(..) => ExprPrecedence::TupField,
+            ExprKind::Index(..) => ExprPrecedence::Index,
+            ExprKind::Range(..) => ExprPrecedence::Range,
+            ExprKind::Path(..) => ExprPrecedence::Path,
+            ExprKind::AddrOf(..) => ExprPrecedence::AddrOf,
+            ExprKind::Break(..) => ExprPrecedence::Break,
+            ExprKind::Continue(..) => ExprPrecedence::Continue,
+            ExprKind::Ret(..) => ExprPrecedence::Ret,
+            ExprKind::InlineAsm(..) => ExprPrecedence::InlineAsm,
+            ExprKind::Mac(..) => ExprPrecedence::Mac,
+            ExprKind::Struct(..) => ExprPrecedence::Struct,
+            ExprKind::Repeat(..) => ExprPrecedence::Repeat,
+            ExprKind::Paren(..) => ExprPrecedence::Paren,
+            ExprKind::Try(..) => ExprPrecedence::Try,
+            ExprKind::Yield(..) => ExprPrecedence::Yield,
+        }
+    }
 }
 
 impl fmt::Debug for Expr {
@@ -1032,29 +1090,29 @@ pub enum ExprKind {
     /// A while loop, with an optional label
     ///
     /// `'label: while expr { block }`
-    While(P<Expr>, P<Block>, Option<SpannedIdent>),
+    While(P<Expr>, P<Block>, Option<Label>),
     /// A while-let loop, with an optional label
     ///
     /// `'label: while let pat = expr { block }`
     ///
     /// This is desugared to a combination of `loop` and `match` expressions.
-    WhileLet(P<Pat>, P<Expr>, P<Block>, Option<SpannedIdent>),
+    WhileLet(P<Pat>, P<Expr>, P<Block>, Option<Label>),
     /// A for loop, with an optional label
     ///
     /// `'label: for pat in expr { block }`
     ///
     /// This is desugared to a combination of `loop` and `match` expressions.
-    ForLoop(P<Pat>, P<Expr>, P<Block>, Option<SpannedIdent>),
+    ForLoop(P<Pat>, P<Expr>, P<Block>, Option<Label>),
     /// Conditionless loop (can be exited with break, continue, or return)
     ///
     /// `'label: loop { block }`
-    Loop(P<Block>, Option<SpannedIdent>),
+    Loop(P<Block>, Option<Label>),
     /// A `match` block.
     Match(P<Expr>, Vec<Arm>),
     /// A closure (for example, `move |a, b, c| a + b + c`)
     ///
     /// The final span is the span of the argument block `|...|`
-    Closure(CaptureBy, P<FnDecl>, P<Expr>, Span),
+    Closure(CaptureBy, Movability, P<FnDecl>, P<Expr>, Span),
     /// A block (`{ ... }`)
     Block(P<Block>),
     /// A catch block (`catch { ... }`)
@@ -1087,9 +1145,9 @@ pub enum ExprKind {
     /// A referencing operation (`&a` or `&mut a`)
     AddrOf(Mutability, P<Expr>),
     /// A `break`, with an optional label to break, and an optional expression
-    Break(Option<SpannedIdent>, Option<P<Expr>>),
+    Break(Option<Label>, Option<P<Expr>>),
     /// A `continue`, with an optional label
-    Continue(Option<SpannedIdent>),
+    Continue(Option<Label>),
     /// A `return`, with an optional value to be returned
     Ret(Option<P<Expr>>),
 
@@ -1146,6 +1204,13 @@ pub struct QSelf {
 pub enum CaptureBy {
     Value,
     Ref,
+}
+
+/// The movability of a generator / closure literal
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
+pub enum Movability {
+    Static,
+    Movable,
 }
 
 pub type Mac = Spanned<Mac_>;

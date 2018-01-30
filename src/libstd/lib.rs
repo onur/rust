@@ -293,11 +293,10 @@
 #![feature(placement_in_syntax)]
 #![feature(placement_new_protocol)]
 #![feature(prelude_import)]
+#![feature(ptr_internals)]
 #![feature(rand)]
 #![feature(raw)]
-#![feature(repr_align)]
 #![feature(rustc_attrs)]
-#![feature(shared)]
 #![feature(sip_hash_13)]
 #![feature(slice_bytes)]
 #![feature(slice_concat_ext)]
@@ -315,7 +314,6 @@
 #![feature(try_from)]
 #![feature(unboxed_closures)]
 #![feature(unicode)]
-#![feature(unique)]
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
 #![feature(vec_push_all)]
@@ -324,6 +322,7 @@
 #![feature(doc_spotlight)]
 #![cfg_attr(test, feature(update_panic_count))]
 #![cfg_attr(windows, feature(used))]
+#![cfg_attr(stage0, feature(repr_align))]
 
 #![default_lib_allocator]
 

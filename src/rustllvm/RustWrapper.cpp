@@ -315,7 +315,11 @@ extern "C" void LLVMRustRemoveFunctionAttributes(LLVMValueRef Fn,
 // enable fpmath flag UnsafeAlgebra
 extern "C" void LLVMRustSetHasUnsafeAlgebra(LLVMValueRef V) {
   if (auto I = dyn_cast<Instruction>(unwrap<Value>(V))) {
+#if LLVM_VERSION_GE(6, 0)
+    I->setFast(true);
+#else
     I->setHasUnsafeAlgebra(true);
+#endif
   }
 }
 
@@ -457,9 +461,13 @@ enum class LLVMRustDIFlags : uint32_t {
   FlagStaticMember = (1 << 12),
   FlagLValueReference = (1 << 13),
   FlagRValueReference = (1 << 14),
-  FlagMainSubprogram      = (1 << 21),
+  FlagExternalTypeRef = (1 << 15),
+  FlagIntroducedVirtual = (1 << 18),
+  FlagBitField = (1 << 19),
+  FlagNoReturn = (1 << 20),
+  FlagMainSubprogram = (1 << 21),
   // Do not add values that are not supported by the minimum LLVM
-  // version we support!
+  // version we support! see llvm/include/llvm/IR/DebugInfoFlags.def
 };
 
 inline LLVMRustDIFlags operator&(LLVMRustDIFlags A, LLVMRustDIFlags B) {
@@ -544,7 +552,19 @@ static unsigned fromRust(LLVMRustDIFlags Flags) {
   if (isSet(Flags & LLVMRustDIFlags::FlagRValueReference)) {
     Result |= DINode::DIFlags::FlagRValueReference;
   }
+  if (isSet(Flags & LLVMRustDIFlags::FlagExternalTypeRef)) {
+    Result |= DINode::DIFlags::FlagExternalTypeRef;
+  }
+  if (isSet(Flags & LLVMRustDIFlags::FlagIntroducedVirtual)) {
+    Result |= DINode::DIFlags::FlagIntroducedVirtual;
+  }
+  if (isSet(Flags & LLVMRustDIFlags::FlagBitField)) {
+    Result |= DINode::DIFlags::FlagBitField;
+  }
 #if LLVM_RUSTLLVM || LLVM_VERSION_GE(4, 0)
+  if (isSet(Flags & LLVMRustDIFlags::FlagNoReturn)) {
+    Result |= DINode::DIFlags::FlagNoReturn;
+  }
   if (isSet(Flags & LLVMRustDIFlags::FlagMainSubprogram)) {
     Result |= DINode::DIFlags::FlagMainSubprogram;
   }
@@ -866,7 +886,14 @@ extern "C" int64_t LLVMRustDIBuilderCreateOpDeref() {
   return dwarf::DW_OP_deref;
 }
 
-extern "C" int64_t LLVMRustDIBuilderCreateOpPlus() { return dwarf::DW_OP_plus; }
+extern "C" int64_t LLVMRustDIBuilderCreateOpPlusUconst() {
+#if LLVM_VERSION_GE(5, 0)
+  return dwarf::DW_OP_plus_uconst;
+#else
+  // older LLVM used `plus` to behave like `plus_uconst`.
+  return dwarf::DW_OP_plus;
+#endif
+}
 
 extern "C" void LLVMRustWriteTypeToString(LLVMTypeRef Ty, RustStringRef Str) {
   RawRustStringOstream OS(Str);

@@ -466,8 +466,7 @@ impl<'test> TestCx<'test> {
         let mut rustc = Command::new(&self.config.rustc_path);
         rustc
             .arg("-")
-            .arg("-Zunstable-options")
-            .args(&["--unpretty", &pretty_type])
+            .args(&["-Z", &format!("unpretty={}", pretty_type)])
             .args(&["--target", &self.config.target])
             .arg("-L")
             .arg(&aux_dir)
@@ -1403,7 +1402,7 @@ impl<'test> TestCx<'test> {
     }
 
     /// For each `aux-build: foo/bar` annotation, we check to find the
-    /// file in a `aux` directory relative to the test itself.
+    /// file in a `auxiliary` directory relative to the test itself.
     fn compute_aux_test_paths(&self, rel_ab: &str) -> TestPaths {
         let test_ab = self.testpaths
             .file

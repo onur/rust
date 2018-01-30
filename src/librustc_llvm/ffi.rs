@@ -299,12 +299,11 @@ pub enum RelocMode {
 #[repr(C)]
 pub enum CodeModel {
     Other,
-    Default,
-    JITDefault,
     Small,
     Kernel,
     Medium,
     Large,
+    None,
 }
 
 /// LLVMRustDiagnosticKind
@@ -331,7 +330,6 @@ pub enum DiagnosticKind {
 pub enum ArchiveKind {
     Other,
     K_GNU,
-    K_MIPS64,
     K_BSD,
     K_COFF,
 }
@@ -498,6 +496,10 @@ pub mod debuginfo {
             const FlagStaticMember        = (1 << 12);
             const FlagLValueReference     = (1 << 13);
             const FlagRValueReference     = (1 << 14);
+            const FlagExternalTypeRef     = (1 << 15);
+            const FlagIntroducedVirtual   = (1 << 18);
+            const FlagBitField            = (1 << 19);
+            const FlagNoReturn            = (1 << 20);
             const FlagMainSubprogram      = (1 << 21);
         }
     }
@@ -1546,7 +1548,7 @@ extern "C" {
                                                 InlinedAt: MetadataRef)
                                                 -> ValueRef;
     pub fn LLVMRustDIBuilderCreateOpDeref() -> i64;
-    pub fn LLVMRustDIBuilderCreateOpPlus() -> i64;
+    pub fn LLVMRustDIBuilderCreateOpPlusUconst() -> i64;
 
     pub fn LLVMRustWriteTypeToString(Type: TypeRef, s: RustStringRef);
     pub fn LLVMRustWriteValueToString(value_ref: ValueRef, s: RustStringRef);

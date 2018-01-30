@@ -73,6 +73,26 @@ pub enum OptLevel {
 }
 
 #[derive(Clone, Copy, PartialEq, Hash)]
+pub enum Lto {
+    /// Don't do any LTO whatsoever
+    No,
+
+    /// Do a full crate graph LTO. The flavor is determined by the compiler
+    /// (currently the default is "fat").
+    Yes,
+
+    /// Do a full crate graph LTO with ThinLTO
+    Thin,
+
+    /// Do a local graph LTO with ThinLTO (only relevant for multiple codegen
+    /// units).
+    ThinLocal,
+
+    /// Do a full crate graph LTO with "fat" LTO
+    Fat,
+}
+
+#[derive(Clone, Copy, PartialEq, Hash)]
 pub enum DebugInfoLevel {
     NoDebugInfo,
     LimitedDebugInfo,
@@ -389,7 +409,7 @@ top_level_options!(
         // commands like `--emit llvm-ir` which they're often incompatible with
         // if we otherwise use the defaults of rustc.
         cli_forced_codegen_units: Option<usize> [UNTRACKED],
-        cli_forced_thinlto: Option<bool> [UNTRACKED],
+        cli_forced_thinlto_off: bool [UNTRACKED],
     }
 );
 
@@ -590,7 +610,7 @@ pub fn basic_options() -> Options {
         debug_assertions: true,
         actually_rustdoc: false,
         cli_forced_codegen_units: None,
-        cli_forced_thinlto: None,
+        cli_forced_thinlto_off: false,
     }
 }
 
@@ -778,11 +798,15 @@ macro_rules! options {
             Some(::rustc_back::LinkerFlavor::one_of());
         pub const parse_optimization_fuel: Option<&'static str> =
             Some("crate=integer");
+        pub const parse_unpretty: Option<&'static str> =
+            Some("`string` or `string=string`");
+        pub const parse_lto: Option<&'static str> =
+            Some("one of `thin`, `fat`, or omitted");
     }
 
     #[allow(dead_code)]
     mod $mod_set {
-        use super::{$struct_name, Passes, SomePasses, AllPasses, Sanitizer};
+        use super::{$struct_name, Passes, SomePasses, AllPasses, Sanitizer, Lto};
         use rustc_back::{LinkerFlavor, PanicStrategy, RelroLevel};
         use std::path::PathBuf;
 
@@ -965,6 +989,27 @@ macro_rules! options {
                 }
             }
         }
+
+        fn parse_unpretty(slot: &mut Option<String>, v: Option<&str>) -> bool {
+            match v {
+                None => false,
+                Some(s) if s.split('=').count() <= 2 => {
+                    *slot = Some(s.to_string());
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        fn parse_lto(slot: &mut Lto, v: Option<&str>) -> bool {
+            *slot = match v {
+                None => Lto::Yes,
+                Some("thin") => Lto::Thin,
+                Some("fat") => Lto::Fat,
+                Some(_) => return false,
+            };
+            true
+        }
     }
 ) }
 
@@ -981,7 +1026,7 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
         "extra arguments to append to the linker invocation (space separated)"),
     link_dead_code: bool = (false, parse_bool, [UNTRACKED],
         "don't let linker strip dead code (turning it on can be used for code coverage)"),
-    lto: bool = (false, parse_bool, [TRACKED],
+    lto: Lto = (Lto::No, parse_lto, [TRACKED],
         "perform LLVM link-time optimizations"),
     target_cpu: Option<String> = (None, parse_opt_string, [TRACKED],
         "select target processor (rustc --print target-cpus for details)"),
@@ -1045,6 +1090,8 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
 options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
          build_debugging_options, "Z", "debugging",
          DB_OPTIONS, db_type_desc, dbsetters,
+    codegen_backend: Option<String> = (None, parse_opt_string, [TRACKED],
+        "the backend to use"),
     verbose: bool = (false, parse_bool, [UNTRACKED],
         "in general, enable more debug printouts"),
     span_free_formats: bool = (false, parse_bool, [UNTRACKED],
@@ -1102,13 +1149,13 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "write syntax and type analysis (in JSON format) information, in \
          addition to normal output"),
     flowgraph_print_loans: bool = (false, parse_bool, [UNTRACKED],
-        "include loan analysis data in --unpretty flowgraph output"),
+        "include loan analysis data in -Z unpretty flowgraph output"),
     flowgraph_print_moves: bool = (false, parse_bool, [UNTRACKED],
-        "include move analysis data in --unpretty flowgraph output"),
+        "include move analysis data in -Z unpretty flowgraph output"),
     flowgraph_print_assigns: bool = (false, parse_bool, [UNTRACKED],
-        "include assignment analysis data in --unpretty flowgraph output"),
+        "include assignment analysis data in -Z unpretty flowgraph output"),
     flowgraph_print_all: bool = (false, parse_bool, [UNTRACKED],
-        "include all dataflow analysis data in --unpretty flowgraph output"),
+        "include all dataflow analysis data in -Z unpretty flowgraph output"),
     print_region_graph: bool = (false, parse_bool, [UNTRACKED],
          "prints region inference graph. \
           Use with RUST_REGION_GRAPH=help for more info"),
@@ -1120,6 +1167,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "treat all errors that occur as bugs"),
     external_macro_backtrace: bool = (false, parse_bool, [UNTRACKED],
           "show macro backtraces even for non-local macros"),
+    teach: bool = (false, parse_bool, [TRACKED],
+          "show extended diagnostic help"),
     continue_parse_after_error: bool = (false, parse_bool, [TRACKED],
           "attempt to recover from parse errors (experimental)"),
     incremental: Option<String> = (None, parse_opt_string, [UNTRACKED],
@@ -1239,6 +1288,13 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     dep_info_omit_d_target: bool = (false, parse_bool, [TRACKED],
         "in dep-info output, omit targets for tracking dependencies of the dep-info files \
          themselves"),
+    unpretty: Option<String> = (None, parse_unpretty, [UNTRACKED],
+        "Present the input source, unstable (and less-pretty) variants;
+        valid types are any of the types for `--pretty`, as well as:
+        `flowgraph=<nodeid>` (graphviz formatted flowgraph for node),
+        `everybody_loops` (all function bodies replaced with `loop {}`),
+        `hir` (the HIR), `hir,identified`, or
+        `hir,typed` (HIR with types for each node)."),
 }
 
 pub fn default_lib_output() -> CrateType {
@@ -1311,7 +1367,7 @@ pub fn build_target_config(opts: &Options, sp: &Handler) -> Config {
             sp.struct_fatal(&format!("Error loading target specification: {}", e))
                 .help("Use `--print target-list` for a list of built-in targets")
                 .emit();
-            panic!(FatalError);
+            FatalError.raise();
         }
     };
 
@@ -1319,8 +1375,8 @@ pub fn build_target_config(opts: &Options, sp: &Handler) -> Config {
         "16" => (ast::IntTy::I16, ast::UintTy::U16),
         "32" => (ast::IntTy::I32, ast::UintTy::U32),
         "64" => (ast::IntTy::I64, ast::UintTy::U64),
-        w    => panic!(sp.fatal(&format!("target specification was invalid: \
-                                          unrecognized target-pointer-width {}", w))),
+        w    => sp.fatal(&format!("target specification was invalid: \
+                                          unrecognized target-pointer-width {}", w)).raise(),
     };
 
     Config {
@@ -1513,14 +1569,6 @@ pub fn rustc_optgroups() -> Vec<RustcOptGroup> {
                   `expanded` (crates expanded), or
                   `expanded,identified` (fully parenthesized, AST nodes with IDs).",
                  "TYPE"),
-        opt::opt("", "unpretty",
-                 "Present the input source, unstable (and less-pretty) variants;
-                  valid types are any of the types for `--pretty`, as well as:
-                  `flowgraph=<nodeid>` (graphviz formatted flowgraph for node),
-                  `everybody_loops` (all function bodies replaced with `loop {}`),
-                  `hir` (the HIR), `hir,identified`, or
-                  `hir,typed` (HIR with types for each node).",
-                 "TYPE"),
     ]);
     opts
 }
@@ -1619,8 +1667,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
     let mut debugging_opts = build_debugging_options(matches, error_format);
 
     if !debugging_opts.unstable_options && error_format == ErrorOutputType::Json(true) {
-        early_error(ErrorOutputType::Json(false),
-                    "--error-format=pretty-json is unstable");
+        early_error(ErrorOutputType::Json(false), "--error-format=pretty-json is unstable");
     }
 
     let mut output_types = BTreeMap::new();
@@ -1664,7 +1711,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
 
     let mut cg = build_codegen_options(matches, error_format);
     let mut codegen_units = cg.codegen_units;
-    let mut thinlto = None;
+    let mut disable_thinlto = false;
 
     // Issue #30063: if user requests llvm-related output to one
     // particular path, disable codegen-units.
@@ -1686,12 +1733,12 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
                     }
                     early_warn(error_format, "resetting to default -C codegen-units=1");
                     codegen_units = Some(1);
-                    thinlto = Some(false);
+                    disable_thinlto = true;
                 }
             }
             _ => {
                 codegen_units = Some(1);
-                thinlto = Some(false);
+                disable_thinlto = true;
             }
         }
     }
@@ -1721,7 +1768,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
         (&None, &None) => None,
     }.map(|m| PathBuf::from(m));
 
-    if cg.lto && incremental.is_some() {
+    if cg.lto != Lto::No && incremental.is_some() {
         early_error(error_format, "can't perform LTO when compiling incrementally");
     }
 
@@ -1921,7 +1968,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
         debug_assertions,
         actually_rustdoc: false,
         cli_forced_codegen_units: codegen_units,
-        cli_forced_thinlto: thinlto,
+        cli_forced_thinlto_off: disable_thinlto,
     },
     cfg)
 }
@@ -2039,7 +2086,7 @@ mod dep_tracking {
     use std::hash::Hash;
     use std::path::PathBuf;
     use std::collections::hash_map::DefaultHasher;
-    use super::{Passes, CrateType, OptLevel, DebugInfoLevel,
+    use super::{Passes, CrateType, OptLevel, DebugInfoLevel, Lto,
                 OutputTypes, Externs, ErrorOutputType, Sanitizer};
     use syntax::feature_gate::UnstableFeatures;
     use rustc_back::{PanicStrategy, RelroLevel};
@@ -2094,6 +2141,7 @@ mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(RelroLevel);
     impl_dep_tracking_hash_via_hash!(Passes);
     impl_dep_tracking_hash_via_hash!(OptLevel);
+    impl_dep_tracking_hash_via_hash!(Lto);
     impl_dep_tracking_hash_via_hash!(DebugInfoLevel);
     impl_dep_tracking_hash_via_hash!(UnstableFeatures);
     impl_dep_tracking_hash_via_hash!(Externs);
@@ -2167,6 +2215,7 @@ mod tests {
     use lint;
     use middle::cstore;
     use session::config::{build_configuration, build_session_options_and_crate_config};
+    use session::config::Lto;
     use session::build_session;
     use std::collections::{BTreeMap, BTreeSet};
     use std::iter::FromIterator;
@@ -2643,7 +2692,7 @@ mod tests {
 
         // Make sure changing a [TRACKED] option changes the hash
         opts = reference.clone();
-        opts.cg.lto = true;
+        opts.cg.lto = Lto::Fat;
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();

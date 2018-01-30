@@ -732,8 +732,8 @@ and [RFC 809] for more details.
 "##,
 
 E0067: r##"
-The left-hand side of a compound assignment expression must be an lvalue
-expression. An lvalue expression represents a memory location and includes
+The left-hand side of a compound assignment expression must be a place
+expression. A place expression represents a memory location and includes
 item paths (ie, namespaced variables), dereferences, indexing expressions,
 and field references.
 
@@ -742,7 +742,7 @@ Let's start with some erroneous code examples:
 ```compile_fail,E0067
 use std::collections::LinkedList;
 
-// Bad: assignment to non-lvalue expression
+// Bad: assignment to non-place expression
 LinkedList::new() += 1;
 
 // ...
@@ -783,14 +783,14 @@ function's return type and the value being returned.
 "##,
 
 E0070: r##"
-The left-hand side of an assignment operator must be an lvalue expression. An
-lvalue expression represents a memory location and can be a variable (with
+The left-hand side of an assignment operator must be a place expression. An
+place expression represents a memory location and can be a variable (with
 optional namespacing), a dereference, an indexing expression or a field
 reference.
 
 More details can be found in the [Expressions] section of the Reference.
 
-[Expressions]: https://doc.rust-lang.org/reference/expressions.html#lvalues-rvalues-and-temporaries
+[Expressions]: https://doc.rust-lang.org/reference/expressions.html#places-rvalues-and-temporaries
 
 Now, we can go further. Here are some erroneous code examples:
 
@@ -806,7 +806,7 @@ fn some_other_func() {}
 
 fn some_function() {
     SOME_CONST = 14; // error : a constant value cannot be changed!
-    1 = 3; // error : 1 isn't a valid lvalue!
+    1 = 3; // error : 1 isn't a valid place!
     some_other_func() = 4; // error : we can't assign value to a function!
     SomeStruct.x = 12; // error : SomeStruct a structure name but it is used
                        // like a variable!
@@ -4605,6 +4605,99 @@ let _ = x.powi(2);
 let _ = (2.0 as f32).powi(2);
 ```
 "##,
+
+E0690: r##"
+A struct with the representation hint `repr(transparent)` had zero or more than
+on fields that were not guaranteed to be zero-sized.
+
+Erroneous code example:
+
+```compile_fail,E0690
+#![feature(repr_transparent)]
+
+#[repr(transparent)]
+struct LengthWithUnit<U> { // error: transparent struct needs exactly one
+    value: f32,            //        non-zero-sized field, but has 2
+    unit: U,
+}
+```
+
+Because transparent structs are represented exactly like one of their fields at
+run time, said field must be uniquely determined. If there is no field, or if
+there are multiple fields, it is not clear how the struct should be represented.
+Note that fields of zero-typed types (e.g., `PhantomData`) can also exist
+alongside the field that contains the actual data, they do not count for this
+error. When generic types are involved (as in the above example), an error is
+reported because the type parameter could be non-zero-sized.
+
+To combine `repr(transparent)` with type parameters, `PhantomData` may be
+useful:
+
+```
+#![feature(repr_transparent)]
+
+use std::marker::PhantomData;
+
+#[repr(transparent)]
+struct LengthWithUnit<U> {
+    value: f32,
+    unit: PhantomData<U>,
+}
+```
+"##,
+
+E0691: r##"
+A struct with the `repr(transparent)` representation hint contains a zero-sized
+field that requires non-trivial alignment.
+
+Erroneous code example:
+
+```compile_fail,E0691
+#![feature(repr_transparent, repr_align, attr_literals)]
+
+#[repr(align(32))]
+struct ForceAlign32;
+
+#[repr(transparent)]
+struct Wrapper(f32, ForceAlign32); // error: zero-sized field in transparent
+                                   //        struct has alignment larger than 1
+```
+
+A transparent struct is supposed to be represented exactly like the piece of
+data it contains. Zero-sized fields with different alignment requirements
+potentially conflict with this property. In the example above, `Wrapper` would
+have to be aligned to 32 bytes even though `f32` has a smaller alignment
+requirement.
+
+Consider removing the over-aligned zero-sized field:
+
+```
+#![feature(repr_transparent)]
+
+#[repr(transparent)]
+struct Wrapper(f32);
+```
+
+Alternatively, `PhantomData<T>` has alignment 1 for all `T`, so you can use it
+if you need to keep the field for some reason:
+
+```
+#![feature(repr_transparent, repr_align, attr_literals)]
+
+use std::marker::PhantomData;
+
+#[repr(align(32))]
+struct ForceAlign32;
+
+#[repr(transparent)]
+struct Wrapper(f32, PhantomData<ForceAlign32>);
+```
+
+Note that empty arrays `[T; 0]` have the same alignment requirement as the
+element type `T`. Also note that the error is conservatively reported even when
+the alignment of the zero-sized type is less than or equal to the data field's
+alignment.
+"##,
 }
 
 register_diagnostics! {
@@ -4683,4 +4776,5 @@ register_diagnostics! {
            // argument position.
     E0641, // cannot cast to/from a pointer with an unknown kind
     E0645, // trait aliases not finished
+    E0907, // type inside generator must be known in this context
 }

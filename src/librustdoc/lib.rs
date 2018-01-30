@@ -34,7 +34,7 @@ extern crate libc;
 extern crate rustc;
 extern crate rustc_data_structures;
 extern crate rustc_const_math;
-extern crate rustc_trans;
+extern crate rustc_trans_utils;
 extern crate rustc_driver;
 extern crate rustc_resolve;
 extern crate rustc_lint;
@@ -265,6 +265,11 @@ pub fn opts() -> Vec<RustcOptGroup> {
             o.optflag("", "deny-render-differences", "abort doc runs when markdown rendering \
                                                       differences are found")
         }),
+        unstable("themes", |o| {
+            o.optmulti("", "themes",
+                       "additional themes which will be added to the generated docs",
+                       "FILES")
+        }),
     ]
 }
 
@@ -374,6 +379,15 @@ pub fn main_args(args: &[String]) -> isize {
         }
     }
 
+    let mut themes = Vec::new();
+    for theme in matches.opt_strs("themes").iter().map(|s| PathBuf::from(&s)) {
+        if !theme.is_file() {
+            eprintln!("rustdoc: option --themes arguments must all be files");
+            return 1;
+        }
+        themes.push(theme);
+    }
+
     let external_html = match ExternalHtml::load(
             &matches.opt_strs("html-in-header"),
             &matches.opt_strs("html-before-content"),
@@ -422,7 +436,8 @@ pub fn main_args(args: &[String]) -> isize {
                                   renderinfo,
                                   render_type,
                                   sort_modules_alphabetically,
-                                  deny_render_differences)
+                                  deny_render_differences,
+                                  themes)
                     .expect("failed to generate documentation");
                 0
             }
@@ -529,6 +544,11 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
     let crate_name = matches.opt_str("crate-name");
     let crate_version = matches.opt_str("crate-version");
     let plugin_path = matches.opt_str("plugin-path");
+    let render_type = if matches.opt_present("disable-commonmark") {
+        RenderType::Hoedown
+    } else {
+        RenderType::Pulldown
+    };
 
     info!("starting to run rustc");
     let display_warnings = matches.opt_present("display-warnings");
@@ -543,7 +563,7 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
 
         let (mut krate, renderinfo) =
             core::run_core(paths, cfgs, externs, Input::File(cratefile), triple, maybe_sysroot,
-                           display_warnings, force_unstable_if_unmarked);
+                           display_warnings, force_unstable_if_unmarked, render_type);
 
         info!("finished with rustc");
 

@@ -320,8 +320,8 @@ pub struct TargetOptions {
     /// Relocation model to use in object file. Corresponds to `llc
     /// -relocation-model=$relocation_model`. Defaults to "pic".
     pub relocation_model: String,
-    /// Code model to use. Corresponds to `llc -code-model=$code_model`. Defaults to "default".
-    pub code_model: String,
+    /// Code model to use. Corresponds to `llc -code-model=$code_model`.
+    pub code_model: Option<String>,
     /// TLS model to use. Options are "global-dynamic" (default), "local-dynamic", "initial-exec"
     /// and "local-exec". This is similar to the -ftls-model option in GCC/Clang.
     pub tls_model: String,
@@ -465,6 +465,9 @@ pub struct TargetOptions {
     /// Whether to lower 128-bit operations to compiler_builtins calls.  Use if
     /// your backend only supports 64-bit and smaller math.
     pub i128_lowering: bool,
+
+    /// The codegen backend to use for this target, typically "llvm"
+    pub codegen_backend: String,
 }
 
 impl Default for TargetOptions {
@@ -483,7 +486,7 @@ impl Default for TargetOptions {
             only_cdylib: false,
             executables: false,
             relocation_model: "pic".to_string(),
-            code_model: "default".to_string(),
+            code_model: None,
             tls_model: "global-dynamic".to_string(),
             disable_redzone: false,
             eliminate_frame_pointer: true,
@@ -534,6 +537,7 @@ impl Default for TargetOptions {
             singlethread: false,
             no_builtins: false,
             i128_lowering: false,
+            codegen_backend: "llvm".to_string(),
         }
     }
 }
@@ -736,7 +740,7 @@ impl Target {
         key!(only_cdylib, bool);
         key!(executables, bool);
         key!(relocation_model);
-        key!(code_model);
+        key!(code_model, optional);
         key!(tls_model);
         key!(disable_redzone, bool);
         key!(eliminate_frame_pointer, bool);
@@ -780,6 +784,7 @@ impl Target {
         key!(requires_lto, bool);
         key!(singlethread, bool);
         key!(no_builtins, bool);
+        key!(codegen_backend);
 
         if let Some(array) = obj.find("abi-blacklist").and_then(Json::as_array) {
             for name in array.iter().filter_map(|abi| abi.as_string()) {
@@ -976,6 +981,7 @@ impl ToJson for Target {
         target_option_val!(requires_lto);
         target_option_val!(singlethread);
         target_option_val!(no_builtins);
+        target_option_val!(codegen_backend);
 
         if default.abi_blacklist != self.options.abi_blacklist {
             d.insert("abi-blacklist".to_string(), self.options.abi_blacklist.iter()

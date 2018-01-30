@@ -19,11 +19,12 @@ use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
-pub fn init(sess: &Session) {
+static POISONED: AtomicBool = AtomicBool::new(false);
+static INIT: Once = Once::new();
+
+pub(crate) fn init(sess: &Session) {
     unsafe {
         // Before we touch LLVM, make sure that multithreading is enabled.
-        static POISONED: AtomicBool = AtomicBool::new(false);
-        static INIT: Once = Once::new();
         INIT.call_once(|| {
             if llvm::LLVMStartMultithreaded() != 1 {
                 // use an extra bool to make sure that all future usage of LLVM
@@ -37,6 +38,13 @@ pub fn init(sess: &Session) {
         if POISONED.load(Ordering::SeqCst) {
             bug!("couldn't enable multi-threaded LLVM");
         }
+    }
+}
+
+fn require_inited() {
+    INIT.call_once(|| bug!("llvm is not initialized"));
+    if POISONED.load(Ordering::SeqCst) {
+        bug!("couldn't enable multi-threaded LLVM");
     }
 }
 
@@ -71,16 +79,16 @@ unsafe fn configure_llvm(sess: &Session) {
 // detection code will walk past the end of the feature array,
 // leading to crashes.
 
-const ARM_WHITELIST: &'static [&'static str] = &["neon\0", "vfp2\0", "vfp3\0", "vfp4\0"];
+const ARM_WHITELIST: &'static [&'static str] = &["neon\0", "v7\0", "vfp2\0", "vfp3\0", "vfp4\0"];
 
-const AARCH64_WHITELIST: &'static [&'static str] = &["neon\0"];
+const AARCH64_WHITELIST: &'static [&'static str] = &["neon\0", "v7\0"];
 
 const X86_WHITELIST: &'static [&'static str] = &["avx\0", "avx2\0", "bmi\0", "bmi2\0", "sse\0",
                                                  "sse2\0", "sse3\0", "sse4.1\0", "sse4.2\0",
                                                  "ssse3\0", "tbm\0", "lzcnt\0", "popcnt\0",
                                                  "sse4a\0", "rdrnd\0", "rdseed\0", "fma\0",
                                                  "xsave\0", "xsaveopt\0", "xsavec\0",
-                                                 "xsaves\0",
+                                                 "xsaves\0", "aes\0",
                                                  "avx512bw\0", "avx512cd\0",
                                                  "avx512dq\0", "avx512er\0",
                                                  "avx512f\0", "avx512ifma\0",
@@ -125,6 +133,7 @@ pub fn target_feature_whitelist(sess: &Session) -> Vec<&CStr> {
 }
 
 pub fn print_version() {
+    // Can be called without initializing LLVM
     unsafe {
         println!("LLVM version: {}.{}",
                  llvm::LLVMRustVersionMajor(), llvm::LLVMRustVersionMinor());
@@ -132,10 +141,12 @@ pub fn print_version() {
 }
 
 pub fn print_passes() {
+    // Can be called without initializing LLVM
     unsafe { llvm::LLVMRustPrintPasses(); }
 }
 
-pub fn print(req: PrintRequest, sess: &Session) {
+pub(crate) fn print(req: PrintRequest, sess: &Session) {
+    require_inited();
     let tm = create_target_machine(sess);
     unsafe {
         match req {

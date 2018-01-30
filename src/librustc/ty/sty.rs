@@ -141,6 +141,10 @@ pub enum TypeVariants<'tcx> {
     /// `|a| yield a`.
     TyGenerator(DefId, ClosureSubsts<'tcx>, GeneratorInterior<'tcx>),
 
+    /// A type representin the types stored inside a generator.
+    /// This should only appear in GeneratorInteriors.
+    TyGeneratorWitness(Binder<&'tcx Slice<Ty<'tcx>>>),
+
     /// The never type `!`
     TyNever,
 
@@ -405,19 +409,7 @@ impl<'a, 'gcx, 'tcx> ClosureSubsts<'tcx> {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub struct GeneratorInterior<'tcx> {
     pub witness: Ty<'tcx>,
-}
-
-impl<'tcx> GeneratorInterior<'tcx> {
-    pub fn new(witness: Ty<'tcx>) -> GeneratorInterior<'tcx> {
-        GeneratorInterior { witness }
-    }
-
-    pub fn as_slice(&self) -> &'tcx Slice<Ty<'tcx>> {
-        match self.witness.sty {
-            ty::TyTuple(s, _) => s,
-            _ => bug!(),
-        }
-    }
+    pub movable: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
@@ -646,7 +638,7 @@ impl<'tcx> PolyExistentialTraitRef<'tcx> {
 /// erase, or otherwise "discharge" these bound regions, we change the
 /// type from `Binder<T>` to just `T` (see
 /// e.g. `liberate_late_bound_regions`).
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub struct Binder<T>(pub T);
 
 impl<T> Binder<T> {
@@ -746,7 +738,7 @@ impl<T> Binder<T> {
 
 /// Represents the projection of an associated type. In explicit UFCS
 /// form this would be written `<T as Trait<..>>::N`.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub struct ProjectionTy<'tcx> {
     /// The parameters of the associated item.
     pub substs: &'tcx Substs<'tcx>,
@@ -1522,18 +1514,12 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
     ///
     /// The parameter `explicit` indicates if this is an *explicit* dereference.
     /// Some types---notably unsafe ptrs---can only be dereferenced explicitly.
-    pub fn builtin_deref(&self, explicit: bool, pref: ty::LvaluePreference)
-        -> Option<TypeAndMut<'tcx>>
-    {
+    pub fn builtin_deref(&self, explicit: bool) -> Option<TypeAndMut<'tcx>> {
         match self.sty {
             TyAdt(def, _) if def.is_box() => {
                 Some(TypeAndMut {
                     ty: self.boxed_ty(),
-                    mutbl: if pref == ty::PreferMutLvalue {
-                        hir::MutMutable
-                    } else {
-                        hir::MutImmutable
-                    },
+                    mutbl: hir::MutImmutable,
                 })
             },
             TyRef(_, mt) => Some(mt),
@@ -1611,6 +1597,7 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
             }
             TyFnDef(..) |
             TyFnPtr(_) |
+            TyGeneratorWitness(..) |
             TyBool |
             TyChar |
             TyInt(_) |

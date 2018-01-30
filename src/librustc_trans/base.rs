@@ -29,7 +29,6 @@ use super::ModuleTranslation;
 use super::ModuleKind;
 
 use abi;
-use assert_module_sources;
 use back::link;
 use back::symbol_export;
 use back::write::{self, OngoingCrateTranslation, create_target_machine};
@@ -66,7 +65,7 @@ use meth;
 use mir;
 use monomorphize::Instance;
 use monomorphize::partitioning::{self, PartitioningStrategy, CodegenUnit, CodegenUnitExt};
-use symbol_names_test;
+use rustc_trans_utils::symbol_names_test;
 use time_graph;
 use trans_item::{MonoItem, BaseMonoItemExt, MonoItemExt, DefPathBasedNames};
 use type_::Type;
@@ -79,7 +78,7 @@ use std::ffi::CString;
 use std::str;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use std::i32;
+use std::{i32, usize};
 use std::iter;
 use std::sync::mpsc;
 use syntax_pos::Span;
@@ -824,12 +823,10 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     ongoing_translation.submit_pre_translated_module_to_llvm(tcx, metadata_module);
 
     // We sort the codegen units by size. This way we can schedule work for LLVM
-    // a bit more efficiently. Note that "size" is defined rather crudely at the
-    // moment as it is just the number of TransItems in the CGU, not taking into
-    // account the size of each TransItem.
+    // a bit more efficiently.
     let codegen_units = {
         let mut codegen_units = codegen_units;
-        codegen_units.sort_by_key(|cgu| -(cgu.items().len() as isize));
+        codegen_units.sort_by_key(|cgu| usize::MAX - cgu.size_estimate());
         codegen_units
     };
 
@@ -904,7 +901,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                             total_trans_time);
 
     if tcx.sess.opts.incremental.is_some() {
-        assert_module_sources::assert_module_sources(tcx);
+        ::rustc_incremental::assert_module_sources::assert_module_sources(tcx);
     }
 
     symbol_names_test::report_symbol_names(tcx);
@@ -947,54 +944,6 @@ fn assert_and_save_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
          || rustc_incremental::save_dep_graph(tcx));
 }
 
-#[inline(never)] // give this a place in the profiler
-fn assert_symbols_are_distinct<'a, 'tcx, I>(tcx: TyCtxt<'a, 'tcx, 'tcx>, trans_items: I)
-    where I: Iterator<Item=&'a MonoItem<'tcx>>
-{
-    let mut symbols: Vec<_> = trans_items.map(|trans_item| {
-        (trans_item, trans_item.symbol_name(tcx))
-    }).collect();
-
-    (&mut symbols[..]).sort_by(|&(_, ref sym1), &(_, ref sym2)|{
-        sym1.cmp(sym2)
-    });
-
-    for pair in (&symbols[..]).windows(2) {
-        let sym1 = &pair[0].1;
-        let sym2 = &pair[1].1;
-
-        if *sym1 == *sym2 {
-            let trans_item1 = pair[0].0;
-            let trans_item2 = pair[1].0;
-
-            let span1 = trans_item1.local_span(tcx);
-            let span2 = trans_item2.local_span(tcx);
-
-            // Deterministically select one of the spans for error reporting
-            let span = match (span1, span2) {
-                (Some(span1), Some(span2)) => {
-                    Some(if span1.lo().0 > span2.lo().0 {
-                        span1
-                    } else {
-                        span2
-                    })
-                }
-                (Some(span), None) |
-                (None, Some(span)) => Some(span),
-                _ => None
-            };
-
-            let error_message = format!("symbol `{}` is already defined", sym1);
-
-            if let Some(span) = span {
-                tcx.sess.span_fatal(span, &error_message)
-            } else {
-                tcx.sess.fatal(&error_message)
-            }
-        }
-    }
-}
-
 fn collect_and_partition_translation_items<'a, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     cnum: CrateNum,
@@ -1034,7 +983,7 @@ fn collect_and_partition_translation_items<'a, 'tcx>(
             collector::collect_crate_mono_items(tcx, collection_mode)
     });
 
-    assert_symbols_are_distinct(tcx, items.iter());
+    ::rustc_mir::monomorphize::assert_symbols_are_distinct(tcx, items.iter());
 
     let strategy = if tcx.sess.opts.incremental.is_some() {
         PartitioningStrategy::PerModule
