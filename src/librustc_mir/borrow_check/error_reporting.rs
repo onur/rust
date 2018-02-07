@@ -362,32 +362,19 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         let scope_tree = borrows.0.scope_tree();
         let root_place = self.prefixes(&borrow.borrowed_place, PrefixSet::All).last().unwrap();
 
-        match root_place {
-            &Place::Local(local) => {
-                if let Some(_) = self.storage_dead_or_drop_error_reported_l.replace(local) {
-                    debug!("report_does_not_live_long_enough({:?}): <suppressed>",
-                           (borrow, drop_span));
-                    return
-                }
-            }
-            &Place::Static(ref statik) => {
-                if let Some(_) = self.storage_dead_or_drop_error_reported_s
-                    .replace(statik.def_id)
-                {
-                    debug!("report_does_not_live_long_enough({:?}): <suppressed>",
-                           (borrow, drop_span));
-                    return
-                }
-            },
-            &Place::Projection(_) =>
-                unreachable!("root_place is an unreachable???")
-        };
-
         let borrow_span = self.mir.source_info(borrow.location).span;
         let proper_span = match *root_place {
             Place::Local(local) => self.mir.local_decls[local].source_info.span,
             _ => drop_span,
         };
+
+        if self.access_place_error_reported.contains(&(root_place.clone(), borrow_span)) {
+            debug!("suppressing access_place error when borrow doesn't live long enough for {:?}",
+                   borrow_span);
+            return;
+        }
+
+        self.access_place_error_reported.insert((root_place.clone(), borrow_span));
 
         match (borrow.region, &self.describe_place(&borrow.borrowed_place)) {
             (RegionKind::ReScope(_), Some(name)) => {
@@ -746,12 +733,12 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     self.describe_field_from_ty(&tnm.ty, field)
                 }
                 ty::TyArray(ty, _) | ty::TySlice(ty) => self.describe_field_from_ty(&ty, field),
-                ty::TyClosure(closure_def_id, _) => {
+                ty::TyClosure(def_id, _) | ty::TyGenerator(def_id, _, _) => {
                     // Convert the def-id into a node-id. node-ids are only valid for
                     // the local code in the current crate, so this returns an `Option` in case
                     // the closure comes from another crate. But in that case we wouldn't
                     // be borrowck'ing it, so we can just unwrap:
-                    let node_id = self.tcx.hir.as_local_node_id(closure_def_id).unwrap();
+                    let node_id = self.tcx.hir.as_local_node_id(def_id).unwrap();
                     let freevar = self.tcx.with_freevars(node_id, |fv| fv[field.index()]);
 
                     self.tcx.hir.name(freevar.var_id()).to_string()

@@ -162,6 +162,68 @@ fn test_iterator_step_by() {
 }
 
 #[test]
+fn test_iterator_step_by_nth() {
+    let mut it = (0..16).step_by(5);
+    assert_eq!(it.nth(0), Some(0));
+    assert_eq!(it.nth(0), Some(5));
+    assert_eq!(it.nth(0), Some(10));
+    assert_eq!(it.nth(0), Some(15));
+    assert_eq!(it.nth(0), None);
+
+    let it = (0..18).step_by(5);
+    assert_eq!(it.clone().nth(0), Some(0));
+    assert_eq!(it.clone().nth(1), Some(5));
+    assert_eq!(it.clone().nth(2), Some(10));
+    assert_eq!(it.clone().nth(3), Some(15));
+    assert_eq!(it.clone().nth(4), None);
+    assert_eq!(it.clone().nth(42), None);
+}
+
+#[test]
+fn test_iterator_step_by_nth_overflow() {
+    #[cfg(target_pointer_width = "8")]
+    type Bigger = u16;
+    #[cfg(target_pointer_width = "16")]
+    type Bigger = u32;
+    #[cfg(target_pointer_width = "32")]
+    type Bigger = u64;
+    #[cfg(target_pointer_width = "64")]
+    type Bigger = u128;
+
+    #[derive(Clone)]
+    struct Test(Bigger);
+    impl<'a> Iterator for &'a mut Test {
+        type Item = i32;
+        fn next(&mut self) -> Option<Self::Item> { Some(21) }
+        fn nth(&mut self, n: usize) -> Option<Self::Item> {
+            self.0 += n as Bigger + 1;
+            Some(42)
+        }
+    }
+
+    let mut it = Test(0);
+    let root = usize::MAX >> (::std::mem::size_of::<usize>() * 8 / 2);
+    let n = root + 20;
+    (&mut it).step_by(n).nth(n);
+    assert_eq!(it.0, n as Bigger * n as Bigger);
+
+    // large step
+    let mut it = Test(0);
+    (&mut it).step_by(usize::MAX).nth(5);
+    assert_eq!(it.0, (usize::MAX as Bigger) * 5);
+
+    // n + 1 overflows
+    let mut it = Test(0);
+    (&mut it).step_by(2).nth(usize::MAX);
+    assert_eq!(it.0, (usize::MAX as Bigger) * 2);
+
+    // n + 1 overflows
+    let mut it = Test(0);
+    (&mut it).step_by(1).nth(usize::MAX);
+    assert_eq!(it.0, (usize::MAX as Bigger) * 1);
+}
+
+#[test]
 #[should_panic]
 fn test_iterator_step_by_zero() {
     let mut it = (0..).step_by(0);
@@ -1395,6 +1457,26 @@ fn test_range_inclusive_min() {
     let mut r = 10..=10;
     r.next();
     assert_eq!(r.min(), None);
+}
+
+#[test]
+fn test_range_inclusive_folds() {
+    assert_eq!((1..=10).sum::<i32>(), 55);
+    assert_eq!((1..=10).rev().sum::<i32>(), 55);
+
+    let mut it = 40..=50;
+    assert_eq!(it.try_fold(0, i8::checked_add), None);
+    assert_eq!(it, 44..=50);
+    assert_eq!(it.try_rfold(0, i8::checked_add), None);
+    assert_eq!(it, 44..=47);
+
+    let mut it = 10..=20;
+    assert_eq!(it.try_fold(0, |a,b| Some(a+b)), Some(165));
+    assert_eq!(it, 1..=0);
+
+    let mut it = 10..=20;
+    assert_eq!(it.try_rfold(0, |a,b| Some(a+b)), Some(165));
+    assert_eq!(it, 1..=0);
 }
 
 #[test]

@@ -130,6 +130,7 @@ extern crate cc;
 extern crate getopts;
 extern crate num_cpus;
 extern crate toml;
+extern crate time;
 
 #[cfg(unix)]
 extern crate libc;
@@ -422,6 +423,9 @@ impl Build {
         }
         if self.config.profiler {
             features.push_str(" profiler");
+        }
+        if self.config.wasm_syscall {
+            features.push_str(" wasm_syscall");
         }
         features
     }

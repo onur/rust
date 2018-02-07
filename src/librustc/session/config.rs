@@ -548,25 +548,6 @@ impl OutputFilenames {
     pub fn filestem(&self) -> String {
         format!("{}{}", self.out_filestem, self.extra)
     }
-
-    pub fn contains_path(&self, input_path: &PathBuf) -> bool {
-        let input_path = input_path.canonicalize().ok();
-        if input_path.is_none() {
-            return false
-        }
-        match self.single_output_file {
-            Some(ref output_path) => output_path.canonicalize().ok() == input_path,
-            None => {
-                for k in self.outputs.keys() {
-                    let output_path = self.path(k.to_owned());
-                    if output_path.canonicalize().ok() == input_path {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-    }
 }
 
 pub fn host_triple() -> &'static str {
@@ -1288,6 +1269,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     dep_info_omit_d_target: bool = (false, parse_bool, [TRACKED],
         "in dep-info output, omit targets for tracking dependencies of the dep-info files \
          themselves"),
+    approximate_suggestions: bool = (false, parse_bool, [UNTRACKED],
+        "include machine-applicability of suggestions in JSON output"),
     unpretty: Option<String> = (None, parse_unpretty, [UNTRACKED],
         "Present the input source, unstable (and less-pretty) variants;
         valid types are any of the types for `--pretty`, as well as:

@@ -831,6 +831,11 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 span,
                 node: hir::ImplItemKind::Method(hir::MethodSig { ref decl, .. }, _),
                 ..
+            }) |
+            hir::map::NodeTraitItem(&hir::TraitItem {
+                span,
+                node: hir::TraitItemKind::Method(hir::MethodSig { ref decl, .. }, _),
+                ..
             }) => {
                 (self.tcx.sess.codemap().def_span(span), decl.inputs.iter()
                         .map(|arg| match arg.clone().into_inner().node {
@@ -1259,6 +1264,10 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             }
             ObligationCauseCode::SizedReturnType => {
                 err.note("the return type of a function must have a \
+                          statically known size");
+            }
+            ObligationCauseCode::SizedYieldType => {
+                err.note("the yield type of a generator must have a \
                           statically known size");
             }
             ObligationCauseCode::AssignmentLhsSized => {

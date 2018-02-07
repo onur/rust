@@ -83,6 +83,12 @@ pub struct CodeSuggestion {
     pub substitutions: Vec<Substitution>,
     pub msg: String,
     pub show_code_when_inline: bool,
+    /// Whether or not the suggestion is approximate
+    ///
+    /// Sometimes we may show suggestions with placeholders,
+    /// which are useful for users but not useful for
+    /// tools like rustfix
+    pub approximate: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Hash, RustcEncodable, RustcDecodable)]
@@ -297,7 +303,7 @@ impl Handler {
                                       cm: Option<Rc<CodeMapper>>,
                                       flags: HandlerFlags)
                                       -> Handler {
-        let emitter = Box::new(EmitterWriter::stderr(color_config, cm, false));
+        let emitter = Box::new(EmitterWriter::stderr(color_config, cm, false, false));
         Handler::with_emitter_and_flags(emitter, flags)
     }
 

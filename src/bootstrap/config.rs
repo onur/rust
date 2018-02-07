@@ -81,6 +81,7 @@ pub struct Config {
     // rust codegen options
     pub rust_optimize: bool,
     pub rust_codegen_units: Option<u32>,
+    pub rust_thinlto: bool,
     pub rust_debug_assertions: bool,
     pub rust_debuginfo: bool,
     pub rust_debuginfo_lines: bool,
@@ -107,6 +108,7 @@ pub struct Config {
     pub debug_jemalloc: bool,
     pub use_jemalloc: bool,
     pub backtrace: bool, // support for RUST_BACKTRACE
+    pub wasm_syscall: bool,
 
     // misc
     pub low_priority: bool,
@@ -260,6 +262,7 @@ impl Default for StringOrBool {
 struct Rust {
     optimize: Option<bool>,
     codegen_units: Option<u32>,
+    thinlto: Option<bool>,
     debug_assertions: Option<bool>,
     debuginfo: Option<bool>,
     debuginfo_lines: Option<bool>,
@@ -282,6 +285,7 @@ struct Rust {
     test_miri: Option<bool>,
     save_toolstates: Option<String>,
     codegen_backends: Option<Vec<String>>,
+    wasm_syscall: Option<bool>,
 }
 
 /// TOML representation of how each build target is configured.
@@ -410,6 +414,7 @@ impl Config {
 
         // Store off these values as options because if they're not provided
         // we'll infer default values for them later
+        let mut thinlto = None;
         let mut llvm_assertions = None;
         let mut debuginfo_lines = None;
         let mut debuginfo_only_std = None;
@@ -453,6 +458,7 @@ impl Config {
             optimize = rust.optimize;
             ignore_git = rust.ignore_git;
             debug_jemalloc = rust.debug_jemalloc;
+            thinlto = rust.thinlto;
             set(&mut config.rust_optimize_tests, rust.optimize_tests);
             set(&mut config.rust_debuginfo_tests, rust.debuginfo_tests);
             set(&mut config.codegen_tests, rust.codegen_tests);
@@ -463,6 +469,7 @@ impl Config {
             set(&mut config.rust_dist_src, rust.dist_src);
             set(&mut config.quiet_tests, rust.quiet_tests);
             set(&mut config.test_miri, rust.test_miri);
+            set(&mut config.wasm_syscall, rust.wasm_syscall);
             config.rustc_parallel_queries = rust.experimental_parallel_queries.unwrap_or(false);
             config.rustc_default_linker = rust.default_linker.clone();
             config.musl_root = rust.musl_root.clone().map(PathBuf::from);
@@ -536,6 +543,7 @@ impl Config {
             "stable" | "beta" | "nightly" => true,
             _ => false,
         };
+        config.rust_thinlto = thinlto.unwrap_or(true);
         config.rust_debuginfo_lines = debuginfo_lines.unwrap_or(default);
         config.rust_debuginfo_only_std = debuginfo_only_std.unwrap_or(default);
 
