@@ -1,3 +1,9 @@
+rustc (1.25.0-dev-20180207-1) unstable; urgency=low
+
+  * New upstream release.
+
+ -- Onur Aslan <onur@onur.im>  Wed, 07 Feb 2018 22:25:49 +0300
+
 rustc (1.22.0-dev-20170921-1) unstable; urgency=low
 
   * New upstream release.
