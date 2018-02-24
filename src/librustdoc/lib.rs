@@ -264,6 +264,11 @@ pub fn opts() -> Vec<RustcOptGroup> {
                        "check if given theme is valid",
                        "FILES")
         }),
+        unstable("resource-suffix", |o| {
+            o.optopt("",
+                     "resource-suffix", "suffix which will be added at the end of resource files",
+                     "PATH")
+        }),
     ]
 }
 
@@ -428,6 +433,7 @@ pub fn main_args(args: &[String]) -> isize {
     let display_warnings = matches.opt_present("display-warnings");
     let linker = matches.opt_str("linker").map(PathBuf::from);
     let sort_modules_alphabetically = !matches.opt_present("sort-modules-by-appearance");
+    let resource_suffix = matches.opt_str("resource-suffix");
 
     match (should_test, markdown_input) {
         (true, true) => {
@@ -453,6 +459,7 @@ pub fn main_args(args: &[String]) -> isize {
             Some("html") | None => {
                 html::render::run(krate, extern_versions, &external_html, playground_url,
                                   output.unwrap_or(PathBuf::from("doc")),
+                                  resource_suffix.unwrap_or(String::new()),
                                   passes.into_iter().collect(),
                                   css_file_extension,
                                   renderinfo,
