@@ -714,6 +714,10 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
                     mir::CastKind::ReifyFnPointer => {
                         match operand.ty.sty {
                             ty::TyFnDef(def_id, substs) => {
+                                if tcx.has_attr(def_id, "rustc_args_required_const") {
+                                    bug!("reifying a fn ptr that requires \
+                                          const arguments");
+                                }
                                 callee::resolve_and_get_fn(self.cx, def_id, substs)
                             }
                             _ => {
@@ -870,7 +874,7 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
                         } else {
                             self.cx.tcx.data_layout.pointer_align
                         };
-                        if bk == mir::BorrowKind::Mut {
+                        if let mir::BorrowKind::Mut { .. } = bk {
                             consts::addr_of_mut(self.cx, llval, align, "ref_mut")
                         } else {
                             consts::addr_of(self.cx, llval, align, "ref")

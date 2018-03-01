@@ -43,6 +43,7 @@ use syntax::tokenstream::TokenStream;
 use syntax::util::ThinVec;
 use syntax::util::parser::ExprPrecedence;
 use ty::AdtKind;
+use ty::maps::Providers;
 
 use rustc_data_structures::indexed_vec;
 
@@ -543,7 +544,7 @@ impl Generics {
 }
 
 /// Synthetic Type Parameters are converted to an other form during lowering, this allows
-/// to track the original form they had. Usefull for error messages.
+/// to track the original form they had. Useful for error messages.
 #[derive(Copy, Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum SyntheticTyParamKind {
     ImplTrait
@@ -601,9 +602,9 @@ pub type CrateConfig = HirVec<P<MetaItem>>;
 /// The top-level data structure that stores the entire contents of
 /// the crate currently being compiled.
 ///
-/// For more details, see the module-level [README].
+/// For more details, see the [rustc guide].
 ///
-/// [README]: https://github.com/rust-lang/rust/blob/master/src/librustc/hir/README.md.
+/// [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/hir.html
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Debug)]
 pub struct Crate {
     pub module: Mod,
@@ -2204,3 +2205,8 @@ pub type TraitMap = NodeMap<Vec<TraitCandidate>>;
 // Map from the NodeId of a glob import to a list of items which are actually
 // imported.
 pub type GlobMap = NodeMap<FxHashSet<Name>>;
+
+
+pub fn provide(providers: &mut Providers) {
+    providers.describe_def = map::describe_def;
+}

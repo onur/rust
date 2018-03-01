@@ -25,15 +25,18 @@
 #![feature(inclusive_range)]
 #![feature(inclusive_range_syntax)]
 #![feature(iterator_try_fold)]
+#![feature(iterator_flatten)]
+#![feature(conservative_impl_trait)]
 #![feature(iter_rfind)]
 #![feature(iter_rfold)]
+#![feature(iterator_repeat_with)]
 #![feature(nonzero)]
 #![feature(pattern)]
+#![feature(range_is_empty)]
 #![feature(raw)]
 #![feature(refcell_replace_swap)]
 #![feature(sip_hash_13)]
 #![feature(slice_patterns)]
-#![feature(slice_rotate)]
 #![feature(sort_internals)]
 #![feature(specialization)]
 #![feature(step_trait)]
@@ -42,6 +45,7 @@
 #![feature(try_from)]
 #![feature(try_trait)]
 #![feature(exact_chunks)]
+#![feature(atomic_nand)]
 
 extern crate core;
 extern crate test;

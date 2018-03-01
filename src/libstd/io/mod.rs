@@ -1437,8 +1437,6 @@ pub trait BufRead: Read {
     ///
     /// If successful, this function will return the total number of bytes read.
     ///
-    /// An empty buffer returned indicates that the stream has reached EOF.
-    ///
     /// # Errors
     ///
     /// This function will ignore all instances of [`ErrorKind::Interrupted`] and
@@ -1507,6 +1505,8 @@ pub trait BufRead: Read {
     /// also return an error if the read bytes are not valid UTF-8. If an I/O
     /// error is encountered then `buf` may contain some bytes already read in
     /// the event that all data read so far was valid UTF-8.
+    ///
+    /// [`read_until`]: #method.read_until
     ///
     /// # Examples
     ///

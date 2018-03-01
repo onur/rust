@@ -333,7 +333,7 @@ pub struct CodegenContext {
     pub no_landing_pads: bool,
     pub save_temps: bool,
     pub fewer_names: bool,
-    pub exported_symbols: Arc<ExportedSymbols>,
+    pub exported_symbols: Option<Arc<ExportedSymbols>>,
     pub opts: Arc<config::Options>,
     pub crate_types: Vec<config::CrateType>,
     pub each_linked_rlib_for_lto: Vec<(CrateNum, PathBuf)>,
@@ -759,7 +759,10 @@ unsafe fn codegen(cgcx: &CodegenContext,
 
         if asm2wasm && config.emit_obj {
             let assembly = cgcx.output_filenames.temp_path(OutputType::Assembly, module_name);
-            binaryen_assemble(cgcx, diag_handler, &assembly, &obj_out);
+            let suffix = ".wasm.map"; // FIXME use target suffix
+            let map = cgcx.output_filenames.path(OutputType::Exe)
+                .with_extension(&suffix[1..]);
+            binaryen_assemble(cgcx, diag_handler, &assembly, &obj_out, &map);
             timeline.record("binaryen");
 
             if !config.emit_asm {
@@ -814,7 +817,8 @@ unsafe fn codegen(cgcx: &CodegenContext,
 fn binaryen_assemble(cgcx: &CodegenContext,
                      handler: &Handler,
                      assembly: &Path,
-                     object: &Path) {
+                     object: &Path,
+                     map: &Path) {
     use rustc_binaryen::{Module, ModuleOptions};
 
     let input = fs::read(&assembly).and_then(|contents| {
@@ -823,6 +827,8 @@ fn binaryen_assemble(cgcx: &CodegenContext,
     let mut options = ModuleOptions::new();
     if cgcx.debuginfo != config::NoDebugInfo {
         options.debuginfo(true);
+        let map_file_name = map.file_name().unwrap();
+        options.source_map_url(map_file_name.to_str().unwrap());
     }
 
     options.stack(1024 * 1024);
@@ -832,7 +838,13 @@ fn binaryen_assemble(cgcx: &CodegenContext,
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     });
     let err = assembled.and_then(|binary| {
-        fs::write(&object, binary.data())
+        fs::write(&object, binary.data()).and_then(|()| {
+            if cgcx.debuginfo != config::NoDebugInfo {
+                fs::write(map, binary.source_map())
+            } else {
+                Ok(())
+            }
+        })
     });
     if let Err(e) = err {
         handler.err(&format!("failed to run binaryen assembler: {}", e));
@@ -1382,13 +1394,24 @@ fn start_executing_work(tcx: TyCtxt,
                         allocator_config: Arc<ModuleConfig>)
                         -> thread::JoinHandle<Result<CompiledModules, ()>> {
     let coordinator_send = tcx.tx_to_llvm_workers.clone();
-    let mut exported_symbols = FxHashMap();
-    exported_symbols.insert(LOCAL_CRATE, tcx.exported_symbols(LOCAL_CRATE));
-    for &cnum in tcx.crates().iter() {
-        exported_symbols.insert(cnum, tcx.exported_symbols(cnum));
-    }
-    let exported_symbols = Arc::new(exported_symbols);
     let sess = tcx.sess;
+
+    let exported_symbols = match sess.lto() {
+        Lto::No => None,
+        Lto::ThinLocal => {
+            let mut exported_symbols = FxHashMap();
+            exported_symbols.insert(LOCAL_CRATE, tcx.exported_symbols(LOCAL_CRATE));
+            Some(Arc::new(exported_symbols))
+        }
+        Lto::Yes | Lto::Fat | Lto::Thin => {
+            let mut exported_symbols = FxHashMap();
+            exported_symbols.insert(LOCAL_CRATE, tcx.exported_symbols(LOCAL_CRATE));
+            for &cnum in tcx.crates().iter() {
+                exported_symbols.insert(cnum, tcx.exported_symbols(cnum));
+            }
+            Some(Arc::new(exported_symbols))
+        }
+    };
 
     // First up, convert our jobserver into a helper thread so we can use normal
     // mpsc channels to manage our messages and such.

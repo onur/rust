@@ -779,9 +779,9 @@ impl<'tcx> CommonTypes<'tcx> {
 /// The central data structure of the compiler. It stores references
 /// to the various **arenas** and also houses the results of the
 /// various **compiler queries** that have been performed. See the
-/// module-level [README] for more details.
+/// [rustc guide] for more details.
 ///
-/// [README]: https://github.com/rust-lang/rust/blob/master/src/librustc/ty/README.md
+/// [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/ty.html
 #[derive(Copy, Clone)]
 pub struct TyCtxt<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     gcx: &'a GlobalCtxt<'gcx>,
@@ -2234,7 +2234,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             let sets = self.lint_levels(LOCAL_CRATE);
             loop {
                 let hir_id = self.hir.definitions().node_to_hir_id(id);
-                if let Some(pair) = sets.level_and_source(lint, hir_id) {
+                if let Some(pair) = sets.level_and_source(lint, hir_id, self.sess) {
                     return pair
                 }
                 let next = self.hir.get_parent_node(id);

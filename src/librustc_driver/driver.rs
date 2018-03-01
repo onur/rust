@@ -24,7 +24,7 @@ use rustc::middle::cstore::CrateStore;
 use rustc::middle::privacy::AccessLevels;
 use rustc::ty::{self, TyCtxt, Resolutions, AllArenas};
 use rustc::traits;
-use rustc::util::common::{ErrorReported, time};
+use rustc::util::common::{ErrorReported, time, install_panic_hook};
 use rustc_allocator as allocator;
 use rustc_borrowck as borrowck;
 use rustc_incremental;
@@ -36,7 +36,7 @@ use rustc_typeck as typeck;
 use rustc_privacy;
 use rustc_plugin::registry::Registry;
 use rustc_plugin as plugin;
-use rustc_passes::{self, ast_validation, loops, consts, static_recursion, hir_stats};
+use rustc_passes::{self, ast_validation, loops, consts, hir_stats};
 use rustc_const_eval::{self, check_match};
 use super::Compilation;
 
@@ -123,6 +123,8 @@ pub fn compile_input(trans: Box<TransCrate>,
         let outputs = build_output_filenames(input, outdir, output, &krate.attrs, sess);
         let crate_name =
             ::rustc_trans_utils::link::find_crate_name(Some(sess), &krate.attrs, input);
+        install_panic_hook();
+
         let ExpansionResult { expanded_crate, defs, analysis, resolutions, mut hir_forest } = {
             phase_2_configure_and_expand(
                 sess,
@@ -168,6 +170,13 @@ pub fn compile_input(trans: Box<TransCrate>,
         if sess.opts.output_types.contains_key(&OutputType::DepInfo) &&
             sess.opts.output_types.keys().count() == 1 {
             return Ok(())
+        }
+
+        if let &Some(ref dir) = outdir {
+            if fs::create_dir_all(dir).is_err() {
+                sess.err("failed to find or create the directory specified by --out-dir");
+                return Err(CompileIncomplete::Stopped);
+            }
         }
 
         let arenas = AllArenas::new();
@@ -653,6 +662,15 @@ pub fn phase_2_configure_and_expand_inner<'a, F>(sess: &'a Session,
         disambiguator,
     );
 
+    if sess.opts.incremental.is_some() {
+        time(time_passes, "garbage collect incremental cache directory", || {
+            if let Err(e) = rustc_incremental::garbage_collect_session_directories(sess) {
+                warn!("Error while trying to garbage collect incremental \
+                       compilation cache directory: {}", e);
+            }
+        });
+    }
+
     // If necessary, compute the dependency graph (in the background).
     let future_dep_graph = if sess.opts.build_dep_graph() {
         Some(rustc_incremental::load_dep_graph(sess, time_passes))
@@ -719,7 +737,7 @@ pub fn phase_2_configure_and_expand_inner<'a, F>(sess: &'a Session,
 
     // Lint plugins are registered; now we can process command line flags.
     if sess.opts.describe_lints {
-        super::describe_lints(&sess.lint_store.borrow(), true);
+        super::describe_lints(&sess, &sess.lint_store.borrow(), true);
         return Err(CompileIncomplete::Stopped);
     }
 
@@ -800,7 +818,8 @@ pub fn phase_2_configure_and_expand_inner<'a, F>(sess: &'a Session,
                                          &mut resolver,
                                          sess.opts.test,
                                          krate,
-                                         sess.diagnostic())
+                                         sess.diagnostic(),
+                                         &sess.features.borrow())
     });
 
     // If we're actually rustdoc then there's no need to actually compile
@@ -913,6 +932,7 @@ pub fn phase_2_configure_and_expand_inner<'a, F>(sess: &'a Session,
 }
 
 pub fn default_provide(providers: &mut ty::maps::Providers) {
+    hir::provide(providers);
     borrowck::provide(providers);
     mir::provide(providers);
     reachable::provide(providers);
@@ -971,10 +991,6 @@ pub fn phase_3_run_analysis_passes<'tcx, F, R>(trans: &TransCrate,
     time(time_passes,
          "loop checking",
          || loops::check_crate(sess, &hir_map));
-
-    time(time_passes,
-              "static item recursion checking",
-              || static_recursion::check_crate(sess, &hir_map))?;
 
     let mut local_providers = ty::maps::Providers::default();
     default_provide(&mut local_providers);

@@ -13,11 +13,11 @@
 //! This module implements parsing `config.toml` configuration files to tweak
 //! how the build runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::cmp;
 
@@ -52,9 +52,12 @@ pub struct Config {
     pub target_config: HashMap<Interned<String>, Target>,
     pub full_bootstrap: bool,
     pub extended: bool,
+    pub tools: Option<HashSet<String>>,
     pub sanitizers: bool,
     pub profiler: bool,
     pub ignore_git: bool,
+    pub exclude: Vec<PathBuf>,
+    pub rustc_error_format: Option<String>,
 
     pub run_host_only: bool,
 
@@ -191,6 +194,7 @@ struct Build {
     python: Option<String>,
     full_bootstrap: Option<bool>,
     extended: Option<bool>,
+    tools: Option<HashSet<String>>,
     verbose: Option<usize>,
     sanitizers: Option<bool>,
     profiler: Option<bool>,
@@ -309,6 +313,7 @@ impl Config {
         let flags = Flags::parse(&args);
         let file = flags.config.clone();
         let mut config = Config::default();
+        config.exclude = flags.exclude;
         config.llvm_enabled = true;
         config.llvm_optimize = true;
         config.llvm_version_check = true;
@@ -326,6 +331,7 @@ impl Config {
         config.test_miri = false;
         config.rust_codegen_backends = vec![INTERNER.intern_str("llvm")];
 
+        config.rustc_error_format = flags.rustc_error_format;
         config.on_fail = flags.on_fail;
         config.stage = flags.stage;
         config.src = flags.src;
@@ -395,6 +401,7 @@ impl Config {
         set(&mut config.vendor, build.vendor);
         set(&mut config.full_bootstrap, build.full_bootstrap);
         set(&mut config.extended, build.extended);
+        config.tools = build.tools;
         set(&mut config.verbose, build.verbose);
         set(&mut config.sanitizers, build.sanitizers);
         set(&mut config.profiler, build.profiler);
@@ -557,6 +564,17 @@ impl Config {
         config.ignore_git = ignore_git.unwrap_or(default);
 
         config
+    }
+
+    /// Try to find the relative path of `libdir`.
+    pub fn libdir_relative(&self) -> Option<&Path> {
+        let libdir = self.libdir.as_ref()?;
+        if libdir.is_relative() {
+            Some(libdir)
+        } else {
+            // Try to make it relative to the prefix.
+            libdir.strip_prefix(self.prefix.as_ref()?).ok()
+        }
     }
 
     pub fn verbose(&self) -> bool {

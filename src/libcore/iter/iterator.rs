@@ -12,7 +12,8 @@ use cmp::Ordering;
 use ops::Try;
 
 use super::{AlwaysOk, LoopState};
-use super::{Chain, Cycle, Cloned, Enumerate, Filter, FilterMap, FlatMap, Fuse};
+use super::{Chain, Cycle, Cloned, Enumerate, Filter, FilterMap, Fuse};
+use super::{Flatten, FlatMap, flatten_compat};
 use super::{Inspect, Map, Peekable, Scan, Skip, SkipWhile, StepBy, Take, TakeWhile, Rev};
 use super::{Zip, Sum, Product};
 use super::{ChainState, FromIterator, ZipImpl};
@@ -28,8 +29,13 @@ fn _assert_is_object_safe(_: &Iterator<Item=()>) {}
 /// [module-level documentation]: index.html
 /// [impl]: index.html#implementing-iterator
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented = "`{Self}` is not an iterator; maybe try calling \
-                            `.iter()` or a similar method"]
+#[rustc_on_unimplemented(
+    on(
+        _Self="&str",
+        label="`{Self}` is not an iterator; try calling `.chars()` or `.bytes()`"
+    ),
+    label="`{Self}` is not an iterator; maybe try calling `.iter()` or a similar method"
+)]
 #[doc(spotlight)]
 pub trait Iterator {
     /// The type of the elements being iterated over.
@@ -163,7 +169,7 @@ pub trait Iterator {
     /// This function might panic if the iterator has more than [`usize::MAX`]
     /// elements.
     ///
-    /// [`usize::MAX`]: ../../std/isize/constant.MAX.html
+    /// [`usize::MAX`]: ../../std/usize/constant.MAX.html
     ///
     /// # Examples
     ///
@@ -992,11 +998,15 @@ pub trait Iterator {
     /// an extra layer of indirection. `flat_map()` will remove this extra layer
     /// on its own.
     ///
+    /// You can think of [`flat_map(f)`][flat_map] as the semantic equivalent
+    /// of [`map`]ping, and then [`flatten`]ing as in `map(f).flatten()`.
+    ///
     /// Another way of thinking about `flat_map()`: [`map`]'s closure returns
     /// one item for each element, and `flat_map()`'s closure returns an
     /// iterator for each element.
     ///
     /// [`map`]: #method.map
+    /// [`flatten`]: #method.flatten
     ///
     /// # Examples
     ///
@@ -1016,7 +1026,79 @@ pub trait Iterator {
     fn flat_map<U, F>(self, f: F) -> FlatMap<Self, U, F>
         where Self: Sized, U: IntoIterator, F: FnMut(Self::Item) -> U,
     {
-        FlatMap{iter: self, f: f, frontiter: None, backiter: None }
+        FlatMap { inner: flatten_compat(self.map(f)) }
+    }
+
+    /// Creates an iterator that flattens nested structure.
+    ///
+    /// This is useful when you have an iterator of iterators or an iterator of
+    /// things that can be turned into iterators and you want to remove one
+    /// level of indirection.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(iterator_flatten)]
+    ///
+    /// let data = vec![vec![1, 2, 3, 4], vec![5, 6]];
+    /// let flattened = data.into_iter().flatten().collect::<Vec<u8>>();
+    /// assert_eq!(flattened, &[1, 2, 3, 4, 5, 6]);
+    /// ```
+    ///
+    /// Mapping and then flattening:
+    ///
+    /// ```
+    /// #![feature(iterator_flatten)]
+    ///
+    /// let words = ["alpha", "beta", "gamma"];
+    ///
+    /// // chars() returns an iterator
+    /// let merged: String = words.iter()
+    ///                           .map(|s| s.chars())
+    ///                           .flatten()
+    ///                           .collect();
+    /// assert_eq!(merged, "alphabetagamma");
+    /// ```
+    ///
+    /// You can also rewrite this in terms of [`flat_map()`], which is preferable
+    /// in this case since it conveys intent more clearly:
+    ///
+    /// ```
+    /// let words = ["alpha", "beta", "gamma"];
+    ///
+    /// // chars() returns an iterator
+    /// let merged: String = words.iter()
+    ///                           .flat_map(|s| s.chars())
+    ///                           .collect();
+    /// assert_eq!(merged, "alphabetagamma");
+    /// ```
+    ///
+    /// Flattening once only removes one level of nesting:
+    ///
+    /// ```
+    /// #![feature(iterator_flatten)]
+    ///
+    /// let d3 = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]];
+    ///
+    /// let d2 = d3.iter().flatten().collect::<Vec<_>>();
+    /// assert_eq!(d2, [&[1, 2], &[3, 4], &[5, 6], &[7, 8]]);
+    ///
+    /// let d1 = d3.iter().flatten().flatten().collect::<Vec<_>>();
+    /// assert_eq!(d1, [&1, &2, &3, &4, &5, &6, &7, &8]);
+    /// ```
+    ///
+    /// Here we see that `flatten()` does not perform a "deep" flatten.
+    /// Instead, only one level of nesting is removed. That is, if you
+    /// `flatten()` a three-dimensional array the result will be
+    /// two-dimensional and not one-dimensional. To get a one-dimensional
+    /// structure, you have to `flatten()` again.
+    #[inline]
+    #[unstable(feature = "iterator_flatten", issue = "48213")]
+    fn flatten(self) -> Flatten<Self>
+    where Self: Sized, Self::Item: IntoIterator {
+        Flatten { inner: flatten_compat(self) }
     }
 
     /// Creates an iterator which ends after the first [`None`].
@@ -1361,9 +1443,9 @@ pub trait Iterator {
     ///
     /// In particular, try to have this call `try_fold()` on the internal parts
     /// from which this iterator is composed.  If multiple calls are needed,
-    /// the `?` operator be convenient for chaining the accumulator value along,
-    /// but beware any invariants that need to be upheld before those early
-    /// returns.  This is a `&mut self` method, so iteration needs to be
+    /// the `?` operator may be convenient for chaining the accumulator value
+    /// along, but beware any invariants that need to be upheld before those
+    /// early returns.  This is a `&mut self` method, so iteration needs to be
     /// resumable after hitting an error here.
     ///
     /// # Examples
@@ -1409,6 +1491,42 @@ pub trait Iterator {
         Try::from_ok(accum)
     }
 
+    /// An iterator method that applies a fallible function to each item in the
+    /// iterator, stopping at the first error and returning that error.
+    ///
+    /// This can also be thought of as the fallible form of [`for_each()`]
+    /// or as the stateless version of [`try_fold()`].
+    ///
+    /// [`for_each()`]: #method.for_each
+    /// [`try_fold()`]: #method.try_fold
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(iterator_try_fold)]
+    /// use std::fs::rename;
+    /// use std::io::{stdout, Write};
+    /// use std::path::Path;
+    ///
+    /// let data = ["no_tea.txt", "stale_bread.json", "torrential_rain.png"];
+    ///
+    /// let res = data.iter().try_for_each(|x| writeln!(stdout(), "{}", x));
+    /// assert!(res.is_ok());
+    ///
+    /// let mut it = data.iter().cloned();
+    /// let res = it.try_for_each(|x| rename(x, Path::new(x).with_extension("old")));
+    /// assert!(res.is_err());
+    /// // It short-circuited, so the remaining items are still in the iterator:
+    /// assert_eq!(it.next(), Some("stale_bread.json"));
+    /// ```
+    #[inline]
+    #[unstable(feature = "iterator_try_fold", issue = "45594")]
+    fn try_for_each<F, R>(&mut self, mut f: F) -> R where
+        Self: Sized, F: FnMut(Self::Item) -> R, R: Try<Ok=()>
+    {
+        self.try_fold((), move |(), x| f(x))
+    }
+
     /// An iterator method that applies a function, producing a single, final value.
     ///
     /// `fold()` takes two arguments: an initial value, and a closure with two
@@ -1425,6 +1543,10 @@ pub trait Iterator {
     ///
     /// Folding is useful whenever you have a collection of something, and want
     /// to produce a single value from it.
+    ///
+    /// Note: `fold()`, and similar methods that traverse the entire iterator,
+    /// may not terminate for infinite iterators, even on traits for which a
+    /// result is determinable in finite time.
     ///
     /// # Examples
     ///
@@ -1523,7 +1645,7 @@ pub trait Iterator {
     fn all<F>(&mut self, mut f: F) -> bool where
         Self: Sized, F: FnMut(Self::Item) -> bool
     {
-        self.try_fold((), move |(), x| {
+        self.try_for_each(move |x| {
             if f(x) { LoopState::Continue(()) }
             else { LoopState::Break(()) }
         }) == LoopState::Continue(())
@@ -1572,7 +1694,7 @@ pub trait Iterator {
         Self: Sized,
         F: FnMut(Self::Item) -> bool
     {
-        self.try_fold((), move |(), x| {
+        self.try_for_each(move |x| {
             if f(x) { LoopState::Break(()) }
             else { LoopState::Continue(()) }
         }) == LoopState::Break(())
@@ -1626,7 +1748,7 @@ pub trait Iterator {
         Self: Sized,
         P: FnMut(&Self::Item) -> bool,
     {
-        self.try_fold((), move |(), x| {
+        self.try_for_each(move |x| {
             if predicate(&x) { LoopState::Break(x) }
             else { LoopState::Continue(()) }
         }).break_value()

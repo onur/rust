@@ -8,7 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! See `README.md` for high-level documentation
+//! See [rustc guide] for more info on how this works.
+//!
+//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/trait-resolution.html#selection
 
 use self::SelectionCandidate::*;
 use self::EvaluationResult::*;
@@ -53,7 +55,7 @@ use std::rc::Rc;
 use syntax::abi::Abi;
 use hir;
 use lint;
-use util::nodemap::FxHashMap;
+use util::nodemap::{FxHashMap, FxHashSet};
 
 struct InferredObligationsSnapshotVecDelegate<'tcx> {
     phantom: PhantomData<&'tcx i32>,
@@ -93,6 +95,11 @@ pub struct SelectionContext<'cx, 'gcx: 'cx+'tcx, 'tcx: 'cx> {
     inferred_obligations: SnapshotVec<InferredObligationsSnapshotVecDelegate<'tcx>>,
 
     intercrate_ambiguity_causes: Option<Vec<IntercrateAmbiguityCause>>,
+
+    /// Controls whether or not to filter out negative impls when selecting.
+    /// This is used in librustdoc to distinguish between the lack of an impl
+    /// and a negative impl
+    allow_negative_impls: bool
 }
 
 #[derive(Clone, Debug)]
@@ -424,6 +431,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
             intercrate: None,
             inferred_obligations: SnapshotVec::new(),
             intercrate_ambiguity_causes: None,
+            allow_negative_impls: false,
         }
     }
 
@@ -436,6 +444,20 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
             intercrate: Some(mode),
             inferred_obligations: SnapshotVec::new(),
             intercrate_ambiguity_causes: None,
+            allow_negative_impls: false,
+        }
+    }
+
+    pub fn with_negative(infcx: &'cx InferCtxt<'cx, 'gcx, 'tcx>,
+                         allow_negative_impls: bool) -> SelectionContext<'cx, 'gcx, 'tcx> {
+        debug!("with_negative({:?})", allow_negative_impls);
+        SelectionContext {
+            infcx,
+            freshener: infcx.freshener(),
+            intercrate: None,
+            inferred_obligations: SnapshotVec::new(),
+            intercrate_ambiguity_causes: None,
+            allow_negative_impls,
         }
     }
 
@@ -564,7 +586,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                     let trait_ref = &mut trait_pred.trait_ref;
                     let unit_substs = trait_ref.substs;
                     let mut never_substs = Vec::with_capacity(unit_substs.len());
-                    never_substs.push(From::from(tcx.types.never));
+                    never_substs.push(tcx.types.never.into());
                     never_substs.extend(&unit_substs[1..]);
                     trait_ref.substs = tcx.intern_substs(&never_substs);
                 }
@@ -1025,8 +1047,10 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
     //
     // The selection process begins by examining all in-scope impls,
     // caller obligations, and so forth and assembling a list of
-    // candidates. See `README.md` and the `Candidate` type for more
-    // details.
+    // candidates. See [rustc guide] for more details.
+    //
+    // [rustc guide]:
+    // https://rust-lang-nursery.github.io/rustc-guide/trait-resolution.html#candidate-assembly
 
     fn candidate_from_obligation<'o>(&mut self,
                                      stack: &TraitObligationStack<'o, 'tcx>)
@@ -1086,7 +1110,8 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
     fn filter_negative_impls(&self, candidate: SelectionCandidate<'tcx>)
                              -> SelectionResult<'tcx, SelectionCandidate<'tcx>> {
         if let ImplCandidate(def_id) = candidate {
-            if self.tcx().impl_polarity(def_id) == hir::ImplPolarity::Negative {
+            if !self.allow_negative_impls &&
+                self.tcx().impl_polarity(def_id) == hir::ImplPolarity::Negative {
                 return Err(Unimplemented)
             }
         }
@@ -2312,7 +2337,10 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
     //
     // Confirmation unifies the output type parameters of the trait
     // with the values found in the obligation, possibly yielding a
-    // type error.  See `README.md` for more details.
+    // type error.  See [rustc guide] for more details.
+    //
+    // [rustc guide]:
+    // https://rust-lang-nursery.github.io/rustc-guide/trait-resolution.html#confirmation
 
     fn confirm_candidate(&mut self,
                          obligation: &TraitObligation<'tcx>,
@@ -2976,7 +3004,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                 // unsized parameters is equal to the target.
                 let params = substs_a.iter().enumerate().map(|(i, &k)| {
                     if ty_params.contains(i) {
-                        Kind::from(substs_b.type_at(i))
+                        substs_b.type_at(i).into()
                     } else {
                         k
                     }
@@ -3282,7 +3310,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         // that order.
         let predicates = tcx.predicates_of(def_id);
         assert_eq!(predicates.parent, None);
-        let predicates = predicates.predicates.iter().flat_map(|predicate| {
+        let mut predicates: Vec<_> = predicates.predicates.iter().flat_map(|predicate| {
             let predicate = normalize_with_depth(self, param_env, cause.clone(), recursion_depth,
                                                  &predicate.subst(tcx, substs));
             predicate.obligations.into_iter().chain(
@@ -3293,6 +3321,13 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                     predicate: predicate.value
                 }))
         }).collect();
+        // We are performing deduplication here to avoid exponential blowups
+        // (#38528) from happening, but the real cause of the duplication is
+        // unknown. What we know is that the deduplication avoids exponential
+        // amount of predicates being propogated when processing deeply nested
+        // types.
+        let mut seen = FxHashSet();
+        predicates.retain(|i| seen.insert(i.clone()));
         self.infcx().plug_leaks(skol_map, snapshot, predicates)
     }
 }
@@ -3337,6 +3372,10 @@ impl<'tcx> SelectionCache<'tcx> {
             hashmap: RefCell::new(FxHashMap())
         }
     }
+
+    pub fn clear(&self) {
+        *self.hashmap.borrow_mut() = FxHashMap()
+    }
 }
 
 impl<'tcx> EvaluationCache<'tcx> {
@@ -3344,6 +3383,10 @@ impl<'tcx> EvaluationCache<'tcx> {
         EvaluationCache {
             hashmap: RefCell::new(FxHashMap())
         }
+    }
+
+    pub fn clear(&self) {
+        *self.hashmap.borrow_mut() = FxHashMap()
     }
 }
 

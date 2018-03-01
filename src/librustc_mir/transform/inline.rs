@@ -426,7 +426,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
                     debug!("Creating temp for return destination");
                     let dest = Rvalue::Ref(
                         self.tcx.types.re_erased,
-                        BorrowKind::Mut,
+                        BorrowKind::Mut { allow_two_phase_borrow: false },
                         destination.0);
 
                     let ty = dest.ty(caller_mir, self.tcx);
@@ -511,7 +511,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
                          callsite: &CallSite<'tcx>, caller_mir: &mut Mir<'tcx>) -> Local {
         let arg = Rvalue::Ref(
             self.tcx.types.re_erased,
-            BorrowKind::Mut,
+            BorrowKind::Mut { allow_two_phase_borrow: false },
             arg.deref());
 
         let ty = arg.ty(caller_mir, self.tcx);
@@ -813,6 +813,9 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
                     *target = self.update_target(*target);
                 }
             }
+            TerminatorKind::FalseUnwind { real_target: _ , unwind: _ } =>
+                // see the ordering of passes in the optimized_mir query.
+                bug!("False unwinds should have been removed before inlining")
         }
     }
 

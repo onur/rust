@@ -1080,6 +1080,15 @@ impl fmt::Display for ExitStatus {
     }
 }
 
+/// This is ridiculously unstable, as it's a completely-punted-upon part
+/// of the `?`-in-`main` RFC.  It's here only to allow experimenting with
+/// returning a code directly from main.  It will definitely change
+/// drastically before being stabilized, if it doesn't just get deleted.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+#[unstable(feature = "process_exitcode_placeholder", issue = "43301")]
+pub struct ExitCode(pub i32);
+
 impl Child {
     /// Forces the child to exit. This is equivalent to sending a
     /// SIGKILL on unix platforms.
@@ -1390,6 +1399,76 @@ pub fn abort() -> ! {
 #[unstable(feature = "getpid", issue = "44971", reason = "recently added")]
 pub fn id() -> u32 {
     ::sys::os::getpid()
+}
+
+#[cfg(target_arch = "wasm32")]
+mod exit {
+    pub const SUCCESS: i32 = 0;
+    pub const FAILURE: i32 = 1;
+}
+#[cfg(not(target_arch = "wasm32"))]
+mod exit {
+    use libc;
+    pub const SUCCESS: i32 = libc::EXIT_SUCCESS;
+    pub const FAILURE: i32 = libc::EXIT_FAILURE;
+}
+
+/// A trait for implementing arbitrary return types in the `main` function.
+///
+/// The c-main function only supports to return integers as return type.
+/// So, every type implementing the `Termination` trait has to be converted
+/// to an integer.
+///
+/// The default implementations are returning `libc::EXIT_SUCCESS` to indicate
+/// a successful execution. In case of a failure, `libc::EXIT_FAILURE` is returned.
+#[cfg_attr(not(test), lang = "termination")]
+#[unstable(feature = "termination_trait_lib", issue = "43301")]
+#[rustc_on_unimplemented =
+  "`main` can only return types that implement {Termination}, not `{Self}`"]
+pub trait Termination {
+    /// Is called to get the representation of the value as status code.
+    /// This status code is returned to the operating system.
+    fn report(self) -> i32;
+}
+
+#[unstable(feature = "termination_trait_lib", issue = "43301")]
+impl Termination for () {
+    fn report(self) -> i32 { exit::SUCCESS }
+}
+
+#[unstable(feature = "termination_trait_lib", issue = "43301")]
+impl<E: fmt::Debug> Termination for Result<(), E> {
+    fn report(self) -> i32 {
+        match self {
+            Ok(val) => val.report(),
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                exit::FAILURE
+            }
+        }
+    }
+}
+
+#[unstable(feature = "termination_trait_lib", issue = "43301")]
+impl Termination for ! {
+    fn report(self) -> i32 { self }
+}
+
+#[unstable(feature = "termination_trait_lib", issue = "43301")]
+impl<E: fmt::Debug> Termination for Result<!, E> {
+    fn report(self) -> i32 {
+        let Err(err) = self;
+        eprintln!("Error: {:?}", err);
+        exit::FAILURE
+    }
+}
+
+#[unstable(feature = "termination_trait_lib", issue = "43301")]
+impl Termination for ExitCode {
+    fn report(self) -> i32 {
+        let ExitCode(code) = self;
+        code
+    }
 }
 
 #[cfg(all(test, not(any(target_os = "cloudabi", target_os = "emscripten"))))]

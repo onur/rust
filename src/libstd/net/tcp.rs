@@ -262,7 +262,7 @@ impl TcpStream {
     /// indefinitely. It is an error to pass the zero `Duration` to this
     /// method.
     ///
-    /// # Note
+    /// # Platform-specific behavior
     ///
     /// Platforms may return a different error code whenever a read times out as
     /// a result of setting this option. For example Unix typically returns an
@@ -293,7 +293,7 @@ impl TcpStream {
     /// indefinitely. It is an error to pass the zero [`Duration`] to this
     /// method.
     ///
-    /// # Note
+    /// # Platform-specific behavior
     ///
     /// Platforms may return a different error code whenever a write times out
     /// as a result of setting this option. For example Unix typically returns
@@ -323,7 +323,7 @@ impl TcpStream {
     ///
     /// If the timeout is [`None`], then [`read`] calls will block indefinitely.
     ///
-    /// # Note
+    /// # Platform-specific behavior
     ///
     /// Some platforms do not provide access to the current timeout.
     ///
@@ -349,7 +349,7 @@ impl TcpStream {
     ///
     /// If the timeout is [`None`], then [`write`] calls will block indefinitely.
     ///
-    /// # Note
+    /// # Platform-specific behavior
     ///
     /// Some platforms do not provide access to the current timeout.
     ///
@@ -1542,6 +1542,26 @@ mod tests {
         let kind = stream.read(&mut buf).err().expect("expected error").kind();
         assert!(kind == ErrorKind::WouldBlock || kind == ErrorKind::TimedOut);
         assert!(start.elapsed() > Duration::from_millis(400));
+        drop(listener);
+    }
+
+    // Ensure the `set_read_timeout` and `set_write_timeout` calls return errors
+    // when passed zero Durations
+    #[test]
+    fn test_timeout_zero_duration() {
+        let addr = next_test_ip4();
+
+        let listener = t!(TcpListener::bind(&addr));
+        let stream = t!(TcpStream::connect(&addr));
+
+        let result = stream.set_write_timeout(Some(Duration::new(0, 0)));
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let result = stream.set_read_timeout(Some(Duration::new(0, 0)));
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
         drop(listener);
     }
 

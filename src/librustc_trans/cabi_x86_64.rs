@@ -134,12 +134,13 @@ fn reg_component(cls: &[Option<Class>], i: &mut usize, size: Size) -> Option<Reg
         None => None,
         Some(Class::Int) => {
             *i += 1;
-            Some(match size.bytes() {
-                1 => Reg::i8(),
-                2 => Reg::i16(),
-                3 |
-                4 => Reg::i32(),
-                _ => Reg::i64()
+            Some(if size.bytes() < 8 {
+                Reg {
+                    kind: RegKind::Integer,
+                    size
+                }
+            } else {
+                Reg::i64()
             })
         }
         Some(Class::Sse) => {
@@ -170,7 +171,7 @@ fn cast_target(cls: &[Option<Class>], size: Size) -> CastTarget {
     let mut target = CastTarget::from(lo);
     if size > offset {
         if let Some(hi) = reg_component(cls, &mut i, size - offset) {
-            target = CastTarget::Pair(lo, hi);
+            target = CastTarget::pair(lo, hi);
         }
     }
     assert_eq!(reg_component(cls, &mut i, Size::from_bytes(0)), None);

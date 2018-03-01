@@ -92,6 +92,8 @@
 #![feature(unwind_attributes)]
 #![feature(doc_spotlight)]
 #![feature(rustc_const_unstable)]
+#![feature(iterator_repeat_with)]
+#![feature(iterator_flatten)]
 
 #[prelude_import]
 #[allow(unused)]
@@ -159,6 +161,7 @@ pub mod array;
 pub mod sync;
 pub mod cell;
 pub mod char;
+pub mod panic;
 pub mod panicking;
 pub mod iter;
 pub mod option;

@@ -129,7 +129,7 @@ pub struct CodeMap {
     pub(super) files: RefCell<Vec<Rc<FileMap>>>,
     file_loader: Box<FileLoader>,
     // This is used to apply the file path remapping as specified via
-    // -Zremap-path-prefix to all FileMaps allocated within this CodeMap.
+    // --remap-path-prefix to all FileMaps allocated within this CodeMap.
     path_mapping: FilePathMapping,
     stable_id_to_filemap: RefCell<FxHashMap<StableFilemapId, Rc<FileMap>>>,
     /// In case we are in a doctest, replace all file names with the PathBuf,
@@ -317,10 +317,10 @@ impl CodeMap {
 
     pub fn mk_substr_filename(&self, sp: Span) -> String {
         let pos = self.lookup_char_pos(sp.lo());
-        (format!("<{}:{}:{}>",
+        format!("<{}:{}:{}>",
                  pos.file.name,
                  pos.line,
-                 pos.col.to_usize() + 1)).to_string()
+                 pos.col.to_usize() + 1)
     }
 
     // If there is a doctest_offset, apply it to the line
@@ -462,12 +462,12 @@ impl CodeMap {
 
         let lo = self.lookup_char_pos_adj(sp.lo());
         let hi = self.lookup_char_pos_adj(sp.hi());
-        return (format!("{}:{}:{}: {}:{}",
+        format!("{}:{}:{}: {}:{}",
                         lo.filename,
                         lo.line,
                         lo.col.to_usize() + 1,
                         hi.line,
-                        hi.col.to_usize() + 1)).to_string()
+                        hi.col.to_usize() + 1)
     }
 
     pub fn span_to_filename(&self, sp: Span) -> FileName {
@@ -690,14 +690,16 @@ impl CodeMap {
             return 1;
         }
 
+        let src = local_begin.fm.external_src.borrow();
+
         // We need to extend the snippet to the end of the src rather than to end_index so when
         // searching forwards for boundaries we've got somewhere to search.
         let snippet = if let Some(ref src) = local_begin.fm.src {
             let len = src.len();
-            (&src[start_index..len]).to_string()
-        } else if let Some(src) = local_begin.fm.external_src.borrow().get_source() {
+            (&src[start_index..len])
+        } else if let Some(src) = src.get_source() {
             let len = src.len();
-            (&src[start_index..len]).to_string()
+            (&src[start_index..len])
         } else {
             return 1;
         };

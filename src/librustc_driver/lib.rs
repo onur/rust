@@ -139,6 +139,19 @@ pub mod target_features {
 const BUG_REPORT_URL: &'static str = "https://github.com/rust-lang/rust/blob/master/CONTRIBUTING.\
                                       md#bug-reports";
 
+const ICE_REPORT_COMPILER_FLAGS: &'static [&'static str] = &[
+    "Z",
+    "C",
+    "crate-type",
+];
+const ICE_REPORT_COMPILER_FLAGS_EXCLUDE: &'static [&'static str] = &[
+    "metadata",
+    "extra-filename",
+];
+const ICE_REPORT_COMPILER_FLAGS_STRIP_VALUE: &'static [&'static str] = &[
+    "incremental",
+];
+
 pub fn abort_on_err<T>(result: Result<T, CompileIncomplete>, sess: &Session) -> T {
     match result {
         Err(CompileIncomplete::Errored(ErrorReported)) => {
@@ -774,15 +787,15 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                 -> Option<(Input, Option<PathBuf>)> {
         match matches.free.len() {
             0 => {
-                if sopts.describe_lints {
-                    let mut ls = lint::LintStore::new();
-                    rustc_lint::register_builtins(&mut ls, None);
-                    describe_lints(&ls, false);
-                    return None;
-                }
                 let mut sess = build_session(sopts.clone(),
                     None,
                     descriptions.clone());
+                if sopts.describe_lints {
+                    let mut ls = lint::LintStore::new();
+                    rustc_lint::register_builtins(&mut ls, Some(&sess));
+                    describe_lints(&sess, &ls, false);
+                    return None;
+                }
                 rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
                 let mut cfg = config::build_configuration(&sess, cfg.clone());
                 let trans = get_trans(&sess);
@@ -1121,7 +1134,7 @@ fn usage(verbose: bool, include_unstable_options: bool) {
              verbose_help);
 }
 
-fn describe_lints(lint_store: &lint::LintStore, loaded_plugins: bool) {
+fn describe_lints(sess: &Session, lint_store: &lint::LintStore, loaded_plugins: bool) {
     println!("
 Available lint options:
     -W <foo>           Warn about <foo>
@@ -1133,10 +1146,10 @@ Available lint options:
 
 ");
 
-    fn sort_lints(lints: Vec<(&'static Lint, bool)>) -> Vec<&'static Lint> {
+    fn sort_lints(sess: &Session, lints: Vec<(&'static Lint, bool)>) -> Vec<&'static Lint> {
         let mut lints: Vec<_> = lints.into_iter().map(|(x, _)| x).collect();
         lints.sort_by(|x: &&Lint, y: &&Lint| {
-            match x.default_level.cmp(&y.default_level) {
+            match x.default_level(sess).cmp(&y.default_level(sess)) {
                 // The sort doesn't case-fold but it's doubtful we care.
                 Equal => x.name.cmp(y.name),
                 r => r,
@@ -1159,8 +1172,8 @@ Available lint options:
                                                    .iter()
                                                    .cloned()
                                                    .partition(|&(_, p)| p);
-    let plugin = sort_lints(plugin);
-    let builtin = sort_lints(builtin);
+    let plugin = sort_lints(sess, plugin);
+    let builtin = sort_lints(sess, builtin);
 
     let (plugin_groups, builtin_groups): (Vec<_>, _) = lint_store.get_lint_groups()
                                                                  .iter()
@@ -1431,6 +1444,57 @@ pub fn in_rustc_thread<F, R>(f: F) -> Result<R, Box<Any + Send>>
     thread.unwrap().join()
 }
 
+/// Get a list of extra command-line flags provided by the user, as strings.
+///
+/// This function is used during ICEs to show more information useful for
+/// debugging, since some ICEs only happens with non-default compiler flags
+/// (and the users don't always report them).
+fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
+    let mut args = Vec::new();
+    for arg in env::args_os() {
+        args.push(arg.to_string_lossy().to_string());
+    }
+
+    let matches = if let Some(matches) = handle_options(&args) {
+        matches
+    } else {
+        return None;
+    };
+
+    let mut result = Vec::new();
+    let mut excluded_cargo_defaults = false;
+    for flag in ICE_REPORT_COMPILER_FLAGS {
+        let prefix = if flag.len() == 1 { "-" } else { "--" };
+
+        for content in &matches.opt_strs(flag) {
+            // Split always returns the first element
+            let name = if let Some(first) = content.split('=').next() {
+                first
+            } else {
+                &content
+            };
+
+            let content = if ICE_REPORT_COMPILER_FLAGS_STRIP_VALUE.contains(&name) {
+                name
+            } else {
+                content
+            };
+
+            if !ICE_REPORT_COMPILER_FLAGS_EXCLUDE.contains(&name) {
+                result.push(format!("{}{} {}", prefix, flag, content));
+            } else {
+                excluded_cargo_defaults = true;
+            }
+        }
+    }
+
+    if result.len() > 0 {
+        Some((result, excluded_cargo_defaults))
+    } else {
+        None
+    }
+}
+
 /// Run a procedure which will detect panics in the compiler and print nicer
 /// error messages rather than just failing the test.
 ///
@@ -1462,11 +1526,22 @@ pub fn monitor<F: FnOnce() + Send + 'static>(f: F) {
                              errors::Level::Bug);
             }
 
-            let xs = ["the compiler unexpectedly panicked. this is a bug.".to_string(),
-                      format!("we would appreciate a bug report: {}", BUG_REPORT_URL),
-                      format!("rustc {} running on {}",
-                              option_env!("CFG_VERSION").unwrap_or("unknown_version"),
-                              config::host_triple())];
+            let mut xs = vec![
+                "the compiler unexpectedly panicked. this is a bug.".to_string(),
+                format!("we would appreciate a bug report: {}", BUG_REPORT_URL),
+                format!("rustc {} running on {}",
+                        option_env!("CFG_VERSION").unwrap_or("unknown_version"),
+                        config::host_triple()),
+            ];
+
+            if let Some((flags, excluded_cargo_defaults)) = extra_compiler_flags() {
+                xs.push(format!("compiler flags: {}", flags.join(" ")));
+
+                if excluded_cargo_defaults {
+                    xs.push("some of the compiler flags provided by cargo are hidden".to_string());
+                }
+            }
+
             for note in &xs {
                 handler.emit(&MultiSpan::new(),
                              &note,
@@ -1478,14 +1553,6 @@ pub fn monitor<F: FnOnce() + Send + 'static>(f: F) {
     }
 }
 
-#[cfg(stage0)]
-pub fn diagnostics_registry() -> errors::registry::Registry {
-    use errors::registry::Registry;
-
-    Registry::new(&[])
-}
-
-#[cfg(not(stage0))]
 pub fn diagnostics_registry() -> errors::registry::Registry {
     use errors::registry::Registry;
 

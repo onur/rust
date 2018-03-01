@@ -706,7 +706,7 @@ pub trait ExactSizeIterator: Iterator {
     /// ```
     /// #![feature(exact_size_is_empty)]
     ///
-    /// let mut one_element = 0..1;
+    /// let mut one_element = std::iter::once(0);
     /// assert!(!one_element.is_empty());
     ///
     /// assert_eq!(one_element.next(), Some(0));
@@ -970,9 +970,11 @@ impl<'a, I: FusedIterator + ?Sized> FusedIterator for &'a mut I {}
 /// The iterator reports a size hint where it is either exact
 /// (lower bound is equal to upper bound), or the upper bound is [`None`].
 /// The upper bound must only be [`None`] if the actual iterator length is
-/// larger than [`usize::MAX`].
+/// larger than [`usize::MAX`]. In that case, the lower bound must be
+/// [`usize::MAX`], resulting in a [`.size_hint`] of `(usize::MAX, None)`.
 ///
-/// The iterator must produce exactly the number of elements it reported.
+/// The iterator must produce exactly the number of elements it reported
+/// or diverge before reaching the end.
 ///
 /// # Safety
 ///

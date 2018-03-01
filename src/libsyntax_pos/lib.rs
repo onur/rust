@@ -216,6 +216,12 @@ impl Span {
         self.data().with_ctxt(ctxt)
     }
 
+    /// Returns a new span representing an empty span at the beginning of this span
+    #[inline]
+    pub fn empty(self) -> Span {
+        self.with_hi(self.lo())
+    }
+
     /// Returns `self` if `self` is not the dummy span, and `other` otherwise.
     pub fn substitute_dummy(self, other: Span) -> Span {
         if self.source_equal(&DUMMY_SP) { other } else { self }
@@ -664,7 +670,7 @@ pub struct FileMap {
     /// originate from files has names between angle brackets by convention,
     /// e.g. `<anon>`
     pub name: FileName,
-    /// True if the `name` field above has been modified by -Zremap-path-prefix
+    /// True if the `name` field above has been modified by --remap-path-prefix
     pub name_was_remapped: bool,
     /// The unmapped path of the file that the source came from.
     /// Set to `None` if the FileMap was imported from an external crate.

@@ -377,7 +377,7 @@ pub fn fun_to_string(decl: &ast::FnDecl,
     to_string(|s| {
         s.head("")?;
         s.print_fn(decl, unsafety, constness, Abi::Rust, Some(name),
-                   generics, &ast::Visibility::Inherited)?;
+                   generics, &codemap::dummy_spanned(ast::VisibilityKind::Inherited))?;
         s.end()?; // Close the head box
         s.end() // Close the outer box
     })
@@ -1458,13 +1458,13 @@ impl<'a> State<'a> {
     }
 
     pub fn print_visibility(&mut self, vis: &ast::Visibility) -> io::Result<()> {
-        match *vis {
-            ast::Visibility::Public => self.word_nbsp("pub"),
-            ast::Visibility::Crate(_, sugar) => match sugar {
+        match vis.node {
+            ast::VisibilityKind::Public => self.word_nbsp("pub"),
+            ast::VisibilityKind::Crate(sugar) => match sugar {
                 ast::CrateSugar::PubCrate => self.word_nbsp("pub(crate)"),
                 ast::CrateSugar::JustCrate => self.word_nbsp("crate")
             }
-            ast::Visibility::Restricted { ref path, .. } => {
+            ast::VisibilityKind::Restricted { ref path, .. } => {
                 let path = to_string(|s| s.print_path(path, false, 0, true));
                 if path == "self" || path == "super" {
                     self.word_nbsp(&format!("pub({})", path))
@@ -1472,7 +1472,7 @@ impl<'a> State<'a> {
                     self.word_nbsp(&format!("pub(in {})", path))
                 }
             }
-            ast::Visibility::Inherited => Ok(())
+            ast::VisibilityKind::Inherited => Ok(())
         }
     }
 
@@ -1569,15 +1569,23 @@ impl<'a> State<'a> {
         self.print_outer_attributes(&ti.attrs)?;
         match ti.node {
             ast::TraitItemKind::Const(ref ty, ref default) => {
-                self.print_associated_const(ti.ident, ty,
-                                            default.as_ref().map(|expr| &**expr),
-                                            &ast::Visibility::Inherited)?;
+                self.print_associated_const(
+                    ti.ident,
+                    ty,
+                    default.as_ref().map(|expr| &**expr),
+                    &codemap::respan(ti.span.empty(), ast::VisibilityKind::Inherited),
+                )?;
             }
             ast::TraitItemKind::Method(ref sig, ref body) => {
                 if body.is_some() {
                     self.head("")?;
                 }
-                self.print_method_sig(ti.ident, &ti.generics, sig, &ast::Visibility::Inherited)?;
+                self.print_method_sig(
+                    ti.ident,
+                    &ti.generics,
+                    sig,
+                    &codemap::respan(ti.span.empty(), ast::VisibilityKind::Inherited),
+                )?;
                 if let Some(ref body) = *body {
                     self.nbsp()?;
                     self.print_block_with_attrs(body, &ti.attrs)?;
@@ -1759,11 +1767,11 @@ impl<'a> State<'a> {
                         self.print_else(e.as_ref().map(|e| &**e))
                     }
                     // "another else-if-let"
-                    ast::ExprKind::IfLet(ref pat, ref expr, ref then, ref e) => {
+                    ast::ExprKind::IfLet(ref pats, ref expr, ref then, ref e) => {
                         self.cbox(INDENT_UNIT - 1)?;
                         self.ibox(0)?;
                         self.s.word(" else if let ")?;
-                        self.print_pat(pat)?;
+                        self.print_pats(pats)?;
                         self.s.space()?;
                         self.word_space("=")?;
                         self.print_expr_as_cond(expr)?;
@@ -1797,10 +1805,10 @@ impl<'a> State<'a> {
         self.print_else(elseopt)
     }
 
-    pub fn print_if_let(&mut self, pat: &ast::Pat, expr: &ast::Expr, blk: &ast::Block,
+    pub fn print_if_let(&mut self, pats: &[P<ast::Pat>], expr: &ast::Expr, blk: &ast::Block,
                         elseopt: Option<&ast::Expr>) -> io::Result<()> {
         self.head("if let")?;
-        self.print_pat(pat)?;
+        self.print_pats(pats)?;
         self.s.space()?;
         self.word_space("=")?;
         self.print_expr_as_cond(expr)?;
@@ -2101,8 +2109,8 @@ impl<'a> State<'a> {
             ast::ExprKind::If(ref test, ref blk, ref elseopt) => {
                 self.print_if(test, blk, elseopt.as_ref().map(|e| &**e))?;
             }
-            ast::ExprKind::IfLet(ref pat, ref expr, ref blk, ref elseopt) => {
-                self.print_if_let(pat, expr, blk, elseopt.as_ref().map(|e| &**e))?;
+            ast::ExprKind::IfLet(ref pats, ref expr, ref blk, ref elseopt) => {
+                self.print_if_let(pats, expr, blk, elseopt.as_ref().map(|e| &**e))?;
             }
             ast::ExprKind::While(ref test, ref blk, opt_label) => {
                 if let Some(label) = opt_label {
@@ -2114,13 +2122,13 @@ impl<'a> State<'a> {
                 self.s.space()?;
                 self.print_block_with_attrs(blk, attrs)?;
             }
-            ast::ExprKind::WhileLet(ref pat, ref expr, ref blk, opt_label) => {
+            ast::ExprKind::WhileLet(ref pats, ref expr, ref blk, opt_label) => {
                 if let Some(label) = opt_label {
                     self.print_ident(label.ident)?;
                     self.word_space(":")?;
                 }
                 self.head("while let")?;
-                self.print_pat(pat)?;
+                self.print_pats(pats)?;
                 self.s.space()?;
                 self.word_space("=")?;
                 self.print_expr_as_cond(expr)?;
@@ -2656,6 +2664,20 @@ impl<'a> State<'a> {
         self.ann.post(self, NodePat(pat))
     }
 
+    fn print_pats(&mut self, pats: &[P<ast::Pat>]) -> io::Result<()> {
+        let mut first = true;
+        for p in pats {
+            if first {
+                first = false;
+            } else {
+                self.s.space()?;
+                self.word_space("|")?;
+            }
+            self.print_pat(p)?;
+        }
+        Ok(())
+    }
+
     fn print_arm(&mut self, arm: &ast::Arm) -> io::Result<()> {
         // I have no idea why this check is necessary, but here it
         // is :(
@@ -2666,16 +2688,7 @@ impl<'a> State<'a> {
         self.ibox(0)?;
         self.maybe_print_comment(arm.pats[0].span.lo())?;
         self.print_outer_attributes(&arm.attrs)?;
-        let mut first = true;
-        for p in &arm.pats {
-            if first {
-                first = false;
-            } else {
-                self.s.space()?;
-                self.word_space("|")?;
-            }
-            self.print_pat(p)?;
-        }
+        self.print_pats(&arm.pats)?;
         self.s.space()?;
         if let Some(ref e) = arm.guard {
             self.word_space("if")?;
@@ -3055,7 +3068,7 @@ impl<'a> State<'a> {
                       abi,
                       name,
                       &generics,
-                      &ast::Visibility::Inherited)?;
+                      &codemap::dummy_spanned(ast::VisibilityKind::Inherited))?;
         self.end()
     }
 

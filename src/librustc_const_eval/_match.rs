@@ -607,7 +607,7 @@ pub fn is_useful<'p, 'a: 'p, 'tcx: 'a>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
         // be able to observe whether the types of the struct's fields are
         // inhabited.
         //
-        // If the field is truely inaccessible, then all the patterns
+        // If the field is truly inaccessible, then all the patterns
         // matching against it must be wildcard patterns, so its type
         // does not matter.
         //
@@ -878,7 +878,7 @@ fn constructor_sub_pattern_tys<'a, 'tcx: 'a>(cx: &MatchCheckCtxt<'a, 'tcx>,
         ty::TyAdt(adt, substs) => {
             if adt.is_box() {
                 // Use T as the sub pattern type of Box<T>.
-                vec![substs[0].as_type().unwrap()]
+                vec![substs.type_at(0)]
             } else {
                 adt.variants[ctor.variant_index_for_adt(adt)].fields.iter().map(|field| {
                     let is_visible = adt.is_enum()

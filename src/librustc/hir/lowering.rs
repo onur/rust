@@ -46,7 +46,7 @@ use hir::HirVec;
 use hir::map::{Definitions, DefKey, DefPathData};
 use hir::def_id::{DefIndex, DefId, CRATE_DEF_INDEX, DefIndexAddressSpace};
 use hir::def::{Def, PathResolution};
-use lint::builtin::PARENTHESIZED_PARAMS_IN_TYPES_AND_MODULES;
+use lint::builtin::{self, PARENTHESIZED_PARAMS_IN_TYPES_AND_MODULES};
 use middle::cstore::CrateStore;
 use rustc_data_structures::indexed_vec::IndexVec;
 use session::Session;
@@ -912,7 +912,11 @@ impl<'a> LoweringContext<'a> {
             TyKind::Path(ref qself, ref path) => {
                 let id = self.lower_node_id(t.id);
                 let qpath = self.lower_qpath(t.id, qself, path, ParamMode::Explicit, itctx);
-                return self.ty_path(id, t.span, qpath);
+                let ty = self.ty_path(id, t.span, qpath);
+                if let hir::TyTraitObject(..) = ty.node {
+                    self.maybe_lint_bare_trait(t.span, t.id, qself.is_none() && path.is_global());
+                }
+                return ty;
             }
             TyKind::ImplicitSelf => {
                 hir::TyPath(hir::QPath::Resolved(None, P(hir::Path {
@@ -931,7 +935,7 @@ impl<'a> LoweringContext<'a> {
                 let expr = self.lower_body(None, |this| this.lower_expr(expr));
                 hir::TyTypeof(expr)
             }
-            TyKind::TraitObject(ref bounds, ..) => {
+            TyKind::TraitObject(ref bounds, kind) => {
                 let mut lifetime_bound = None;
                 let bounds = bounds.iter().filter_map(|bound| {
                     match *bound {
@@ -950,6 +954,9 @@ impl<'a> LoweringContext<'a> {
                 let lifetime_bound = lifetime_bound.unwrap_or_else(|| {
                     self.elided_lifetime(t.span)
                 });
+                if kind != TraitObjectSyntax::Dyn {
+                    self.maybe_lint_bare_trait(t.span, t.id, false);
+                }
                 hir::TyTraitObject(bounds, lifetime_bound)
             }
             TyKind::ImplTrait(ref bounds) => {
@@ -2956,7 +2963,7 @@ impl<'a> LoweringContext<'a> {
 
             // Desugar ExprIfLet
             // From: `if let <pat> = <sub_expr> <body> [<else_opt>]`
-            ExprKind::IfLet(ref pat, ref sub_expr, ref body, ref else_opt) => {
+            ExprKind::IfLet(ref pats, ref sub_expr, ref body, ref else_opt) => {
                 // to:
                 //
                 //   match <sub_expr> {
@@ -2970,8 +2977,8 @@ impl<'a> LoweringContext<'a> {
                 {
                     let body = self.lower_block(body, false);
                     let body_expr = P(self.expr_block(body, ThinVec::new()));
-                    let pat = self.lower_pat(pat);
-                    arms.push(self.arm(hir_vec![pat], body_expr));
+                    let pats = pats.iter().map(|pat| self.lower_pat(pat)).collect();
+                    arms.push(self.arm(pats, body_expr));
                 }
 
                 // _ => [<else_opt>|()]
@@ -3000,7 +3007,7 @@ impl<'a> LoweringContext<'a> {
 
             // Desugar ExprWhileLet
             // From: `[opt_ident]: while let <pat> = <sub_expr> <body>`
-            ExprKind::WhileLet(ref pat, ref sub_expr, ref body, opt_label) => {
+            ExprKind::WhileLet(ref pats, ref sub_expr, ref body, opt_label) => {
                 // to:
                 //
                 //   [opt_ident]: loop {
@@ -3021,8 +3028,8 @@ impl<'a> LoweringContext<'a> {
                 // `<pat> => <body>`
                 let pat_arm = {
                     let body_expr = P(self.expr_block(body, ThinVec::new()));
-                    let pat = self.lower_pat(pat);
-                    self.arm(hir_vec![pat], body_expr)
+                    let pats = pats.iter().map(|pat| self.lower_pat(pat)).collect();
+                    self.arm(pats, body_expr)
                 };
 
                 // `_ => break`
@@ -3362,10 +3369,10 @@ impl<'a> LoweringContext<'a> {
                         v: &Visibility,
                         explicit_owner: Option<NodeId>)
                         -> hir::Visibility {
-        match *v {
-            Visibility::Public => hir::Public,
-            Visibility::Crate(..) => hir::Visibility::Crate,
-            Visibility::Restricted { ref path, id } => {
+        match v.node {
+            VisibilityKind::Public => hir::Public,
+            VisibilityKind::Crate(..) => hir::Visibility::Crate,
+            VisibilityKind::Restricted { ref path, id, .. } => {
                 hir::Visibility::Restricted {
                     path: P(self.lower_path(id, path, ParamMode::Explicit, true)),
                     id: if let Some(owner) = explicit_owner {
@@ -3375,7 +3382,7 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
             }
-            Visibility::Inherited => hir::Inherited,
+            VisibilityKind::Inherited => hir::Inherited,
         }
     }
 
@@ -3685,7 +3692,6 @@ impl<'a> LoweringContext<'a> {
                     // The original ID is taken by the `PolyTraitRef`,
                     // so the `Ty` itself needs a different one.
                     id = self.next_id();
-
                     hir::TyTraitObject(hir_vec![principal], self.elided_lifetime(span))
                 } else {
                     hir::TyPath(hir::QPath::Resolved(None, path))
@@ -3701,6 +3707,16 @@ impl<'a> LoweringContext<'a> {
             id: self.next_id().node_id,
             span,
             name: hir::LifetimeName::Implicit,
+        }
+    }
+
+    fn maybe_lint_bare_trait(&self, span: Span, id: NodeId, is_global: bool) {
+        if self.sess.features.borrow().dyn_trait {
+            self.sess.buffer_lint_with_diagnostic(
+                builtin::BARE_TRAIT_OBJECT, id, span,
+                "trait objects without an explicit `dyn` are deprecated",
+                builtin::BuiltinLintDiagnostics::BareTraitObject(span, is_global)
+            )
         }
     }
 }

@@ -84,7 +84,7 @@ impl LtoModuleTranslation {
         }
     }
 
-    /// A "guage" of how costly it is to optimize this module, used to sort
+    /// A "gauge" of how costly it is to optimize this module, used to sort
     /// biggest modules first.
     pub fn cost(&self) -> u64 {
         match *self {
@@ -122,8 +122,9 @@ pub(crate) fn run(cgcx: &CodegenContext,
             None
         }
     };
-
-    let mut symbol_white_list = cgcx.exported_symbols[&LOCAL_CRATE]
+    let exported_symbols = cgcx.exported_symbols
+        .as_ref().expect("needs exported symbols for LTO");
+    let mut symbol_white_list = exported_symbols[&LOCAL_CRATE]
         .iter()
         .filter_map(symbol_filter)
         .collect::<Vec<CString>>();
@@ -156,8 +157,10 @@ pub(crate) fn run(cgcx: &CodegenContext,
         }
 
         for &(cnum, ref path) in cgcx.each_linked_rlib_for_lto.iter() {
+            let exported_symbols = cgcx.exported_symbols
+                .as_ref().expect("needs exported symbols for LTO");
             symbol_white_list.extend(
-                cgcx.exported_symbols[&cnum]
+                exported_symbols[&cnum]
                     .iter()
                     .filter_map(symbol_filter));
 
@@ -247,22 +250,20 @@ fn fat_lto(cgcx: &CodegenContext,
     // know much about the memory management here so we err on the side of being
     // save and persist everything with the original module.
     let mut serialized_bitcode = Vec::new();
+    let mut linker = Linker::new(llmod);
     for (bc_decoded, name) in serialized_modules {
         info!("linking {:?}", name);
-        time(cgcx.time_passes, &format!("ll link {:?}", name), || unsafe {
+        time(cgcx.time_passes, &format!("ll link {:?}", name), || {
             let data = bc_decoded.data();
-            if llvm::LLVMRustLinkInExternalBitcode(llmod,
-                                                   data.as_ptr() as *const libc::c_char,
-                                                   data.len() as libc::size_t) {
-                Ok(())
-            } else {
+            linker.add(&data).map_err(|()| {
                 let msg = format!("failed to load bc of {:?}", name);
-                Err(write::llvm_err(&diag_handler, msg))
-            }
+                write::llvm_err(&diag_handler, msg)
+            })
         })?;
         timeline.record(&format!("link {:?}", name));
         serialized_bitcode.push(bc_decoded);
     }
+    drop(linker);
     cgcx.save_temp_bitcode(&module, "lto.input");
 
     // Internalize everything that *isn't* in our whitelist to help strip out
@@ -287,6 +288,32 @@ fn fat_lto(cgcx: &CodegenContext,
         module: Some(module),
         _serialized_bitcode: serialized_bitcode,
     }])
+}
+
+struct Linker(llvm::LinkerRef);
+
+impl Linker {
+    fn new(llmod: ModuleRef) -> Linker {
+        unsafe { Linker(llvm::LLVMRustLinkerNew(llmod)) }
+    }
+
+    fn add(&mut self, bytecode: &[u8]) -> Result<(), ()> {
+        unsafe {
+            if llvm::LLVMRustLinkerAdd(self.0,
+                                       bytecode.as_ptr() as *const libc::c_char,
+                                       bytecode.len()) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
+impl Drop for Linker {
+    fn drop(&mut self) {
+        unsafe { llvm::LLVMRustLinkerFree(self.0); }
+    }
 }
 
 /// Prepare "thin" LTO to get run on these modules.
@@ -702,7 +729,7 @@ impl ThinModule {
         // which was basically a resurgence of #45511 after LLVM's bug 35212 was
         // fixed.
         //
-        // This function below is a huge hack around tihs problem. The function
+        // This function below is a huge hack around this problem. The function
         // below is defined in `PassWrapper.cpp` and will basically "merge"
         // all `DICompileUnit` instances in a module. Basically it'll take all
         // the objects, rewrite all pointers of `DISubprogram` to point to the

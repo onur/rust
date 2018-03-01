@@ -237,10 +237,20 @@ impl<'a, 'tcx> Visitor<'tcx> for CheckCrateVisitor<'a, 'tcx> {
                     Ok(Ordering::Less) |
                     Ok(Ordering::Equal) => {}
                     Ok(Ordering::Greater) => {
-                        struct_span_err!(self.tcx.sess, start.span, E0030,
-                            "lower range bound must be less than or equal to upper")
-                            .span_label(start.span, "lower bound larger than upper bound")
-                            .emit();
+                        let mut err = struct_span_err!(
+                            self.tcx.sess,
+                            start.span,
+                            E0030,
+                            "lower range bound must be less than or equal to upper"
+                        );
+                        err.span_label(start.span, "lower bound larger than upper bound");
+                        if self.tcx.sess.teach(&err.get_code().unwrap()) {
+                            err.note("When matching against a range, the compiler verifies that \
+                                      the range is non-empty. Range patterns include both \
+                                      end-points, so this is equivalent to requiring the start of \
+                                      the range to be less than or equal to the end of the range.");
+                        }
+                        err.emit();
                     }
                     Err(ErrorReported) => {}
                 }
@@ -352,14 +362,9 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
         hir::ExprBox(_) => {
             v.promotable = false;
         }
-        hir::ExprUnary(op, ref inner) => {
-            match v.tables.node_id_to_type(inner.hir_id).sty {
-                ty::TyRawPtr(_) => {
-                    assert!(op == hir::UnDeref);
-
-                    v.promotable = false;
-                }
-                _ => {}
+        hir::ExprUnary(op, _) => {
+            if op == hir::UnDeref {
+                v.promotable = false;
             }
         }
         hir::ExprBinary(op, ref lhs, _) => {
@@ -548,7 +553,8 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
 fn check_adjustments<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr) {
     use rustc::ty::adjustment::*;
 
-    for adjustment in v.tables.expr_adjustments(e) {
+    let mut adjustments = v.tables.expr_adjustments(e).iter().peekable();
+    while let Some(adjustment) = adjustments.next() {
         match adjustment.kind {
             Adjust::NeverToAny |
             Adjust::ReifyFnPointer |
@@ -558,11 +564,14 @@ fn check_adjustments<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Exp
             Adjust::Borrow(_) |
             Adjust::Unsize => {}
 
-            Adjust::Deref(ref overloaded) => {
-                if overloaded.is_some() {
-                    v.promotable = false;
-                    break;
+            Adjust::Deref(_) => {
+                if let Some(next_adjustment) = adjustments.peek() {
+                    if let Adjust::Borrow(_) = next_adjustment.kind {
+                        continue;
+                    }
                 }
+                v.promotable = false;
+                break;
             }
         }
     }

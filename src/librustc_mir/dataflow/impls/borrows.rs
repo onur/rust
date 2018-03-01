@@ -80,14 +80,14 @@ pub struct Borrows<'a, 'gcx: 'tcx, 'tcx: 'a> {
 /// tracking (phased) borrows. It computes where a borrow is reserved;
 /// i.e. where it can reach in the control flow starting from its
 /// initial `assigned = &'rgn borrowed` statement, and ending
-/// whereever `'rgn` itself ends.
+/// wherever `'rgn` itself ends.
 pub(crate) struct Reservations<'a, 'gcx: 'tcx, 'tcx: 'a>(pub(crate) Borrows<'a, 'gcx, 'tcx>);
 
 /// The `ActiveBorrows` analysis is the second of the two flow
 /// analyses tracking (phased) borrows. It computes where any given
 /// borrow `&assigned = &'rgn borrowed` is *active*, which starts at
 /// the first use of `assigned` after the reservation has started, and
-/// ends whereever `'rgn` itself ends.
+/// ends wherever `'rgn` itself ends.
 pub(crate) struct ActiveBorrows<'a, 'gcx: 'tcx, 'tcx: 'a>(pub(crate) Borrows<'a, 'gcx, 'tcx>);
 
 impl<'a, 'gcx, 'tcx> Reservations<'a, 'gcx, 'tcx> {
@@ -122,7 +122,7 @@ impl<'tcx> fmt::Display for BorrowData<'tcx> {
         let kind = match self.kind {
             mir::BorrowKind::Shared => "",
             mir::BorrowKind::Unique => "uniq ",
-            mir::BorrowKind::Mut => "mut ",
+            mir::BorrowKind::Mut { .. } => "mut ",
         };
         let region = format!("{}", self.region);
         let region = if region.len() > 0 { format!("{} ", region) } else { region };
@@ -517,6 +517,7 @@ impl<'a, 'gcx, 'tcx> Borrows<'a, 'gcx, 'tcx> {
             mir::TerminatorKind::Yield {..} |
             mir::TerminatorKind::Goto {..} |
             mir::TerminatorKind::FalseEdges {..} |
+            mir::TerminatorKind::FalseUnwind {..} |
             mir::TerminatorKind::Unreachable => {}
         }
     }

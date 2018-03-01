@@ -84,7 +84,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             let span = self.sess.codemap().def_span(span);
             let mut err =
                 struct_span_err!(self.sess, span, E0391,
-                                 "unsupported cyclic reference between types/traits detected");
+                                 "cyclic dependency detected");
             err.span_label(span, "cyclic reference");
 
             err.span_note(self.sess.codemap().def_span(stack[0].0),
@@ -147,7 +147,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 }
                 match self.dep_graph.try_mark_green(self.global_tcx(), &dep_node) {
                     Some(dep_node_index) => {
-                        debug_assert!(self.dep_graph.is_green(dep_node_index));
+                        debug_assert!(self.dep_graph.is_green(&dep_node));
                         self.dep_graph.read_index(dep_node_index);
                         Some(dep_node_index)
                     }
@@ -181,6 +181,19 @@ macro_rules! profq_key {
             } else { None }
         } else { None }
     }
+}
+
+macro_rules! handle_cycle_error {
+    ([][$this: expr]) => {{
+        Value::from_cycle_error($this.global_tcx())
+    }};
+    ([fatal_cycle$(, $modifiers:ident)*][$this:expr]) => {{
+        $this.tcx.sess.abort_if_errors();
+        unreachable!();
+    }};
+    ([$other:ident$(, $modifiers:ident)*][$($args:tt)*]) => {
+        handle_cycle_error!([$($modifiers),*][$($args)*])
+    };
 }
 
 macro_rules! define_maps {
@@ -390,7 +403,7 @@ macro_rules! define_maps {
                                                   dep_node: &DepNode)
                                                   -> Result<$V, CycleError<'a, $tcx>>
             {
-                debug_assert!(tcx.dep_graph.is_green(dep_node_index));
+                debug_assert!(tcx.dep_graph.is_green(dep_node));
 
                 // First we try to load the result from the on-disk cache
                 let result = if Self::cache_on_disk(key) &&
@@ -478,7 +491,7 @@ macro_rules! define_maps {
                      span: Span,
                      dep_node: DepNode)
                      -> Result<($V, DepNodeIndex), CycleError<'a, $tcx>> {
-                debug_assert!(tcx.dep_graph.node_color(&dep_node).is_none());
+                debug_assert!(!tcx.dep_graph.dep_node_exists(&dep_node));
 
                 profq_msg!(tcx, ProfileQueriesMsg::ProviderBegin);
                 let res = tcx.cycle_check(span, Query::$name(key), || {
@@ -564,7 +577,7 @@ macro_rules! define_maps {
             pub fn $name(self, key: $K) -> $V {
                 queries::$name::try_get(self.tcx, self.span, key).unwrap_or_else(|mut e| {
                     e.emit();
-                    Value::from_cycle_error(self.global_tcx())
+                    handle_cycle_error!([$($modifiers)*][self])
                 })
             })*
         }
@@ -583,7 +596,7 @@ macro_rules! define_maps {
 
 macro_rules! define_map_struct {
     (tcx: $tcx:tt,
-     input: ($(([$(modifiers:tt)*] [$($attr:tt)*] [$name:ident]))*)) => {
+     input: ($(([$($modifiers:tt)*] [$($attr:tt)*] [$name:ident]))*)) => {
         pub struct Maps<$tcx> {
             providers: IndexVec<CrateNum, Providers<$tcx>>,
             query_stack: RefCell<Vec<(Span, Query<$tcx>)>>,
@@ -916,7 +929,7 @@ pub fn force_from_dep_node<'a, 'gcx, 'lcx>(tcx: TyCtxt<'a, 'gcx, 'lcx>,
         DepKind::ContainsExternIndicator => {
             force!(contains_extern_indicator, def_id!());
         }
-        DepKind::IsTranslatedFunction => { force!(is_translated_function, def_id!()); }
+        DepKind::IsTranslatedItem => { force!(is_translated_item, def_id!()); }
         DepKind::OutputFilenames => { force!(output_filenames, LOCAL_CRATE); }
 
         DepKind::TargetFeaturesWhitelist => { force!(target_features_whitelist, LOCAL_CRATE); }

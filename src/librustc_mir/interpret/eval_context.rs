@@ -7,7 +7,7 @@ use rustc::middle::const_val::ConstVal;
 use rustc::mir;
 use rustc::traits::Reveal;
 use rustc::ty::layout::{self, Size, Align, HasDataLayout, LayoutOf, TyLayout};
-use rustc::ty::subst::{Subst, Substs, Kind};
+use rustc::ty::subst::{Subst, Substs};
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc_data_structures::indexed_vec::Idx;
 use syntax::codemap::{self, DUMMY_SP};
@@ -84,7 +84,7 @@ pub struct Frame<'tcx> {
     /// return).
     pub block: mir::BasicBlock,
 
-    /// The index of the currently evaluated statment.
+    /// The index of the currently evaluated statement.
     pub stmt: usize,
 }
 
@@ -716,6 +716,10 @@ impl<'a, 'tcx, M: Machine<'tcx>> EvalContext<'a, 'tcx, M> {
                     ReifyFnPointer => {
                         match self.eval_operand(operand)?.ty.sty {
                             ty::TyFnDef(def_id, substs) => {
+                                if self.tcx.has_attr(def_id, "rustc_args_required_const") {
+                                    bug!("reifying a fn ptr that requires \
+                                          const arguments");
+                                }
                                 let instance = self.resolve(def_id, substs)?;
                                 let fn_ptr = self.memory.create_fn_alloc(instance);
                                 let valty = ValTy {
@@ -1659,6 +1663,6 @@ pub fn resolve_drop_in_place<'a, 'tcx>(
     ty: Ty<'tcx>,
 ) -> ty::Instance<'tcx> {
     let def_id = tcx.require_lang_item(::rustc::middle::lang_items::DropInPlaceFnLangItem);
-    let substs = tcx.intern_substs(&[Kind::from(ty)]);
+    let substs = tcx.intern_substs(&[ty.into()]);
     ty::Instance::resolve(tcx, ty::ParamEnv::empty(Reveal::All), def_id, substs).unwrap()
 }

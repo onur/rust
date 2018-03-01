@@ -68,7 +68,7 @@ pub enum InstantiationMode {
         /// however, our local copy may conflict with other crates also
         /// inlining the same function.
         ///
-        /// This flag indicates that this situation is occuring, and informs
+        /// This flag indicates that this situation is occurring, and informs
         /// symbol name calculation that some extra mangling is needed to
         /// avoid conflicts. Note that this may eventually go away entirely if
         /// ThinLTO enables us to *always* have a globally shared instance of a
@@ -97,8 +97,7 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug {
     fn symbol_name(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>) -> ty::SymbolName {
         match *self.as_mono_item() {
             MonoItem::Fn(instance) => tcx.symbol_name(instance),
-            MonoItem::Static(node_id) => {
-                let def_id = tcx.hir.local_def_id(node_id);
+            MonoItem::Static(def_id) => {
                 tcx.symbol_name(Instance::mono(tcx, def_id))
             }
             MonoItem::GlobalAsm(node_id) => {
@@ -119,10 +118,13 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug {
 
         match *self.as_mono_item() {
             MonoItem::Fn(ref instance) => {
+                let entry_def_id =
+                    tcx.sess.entry_fn.borrow().map(|(id, _)| tcx.hir.local_def_id(id));
                 // If this function isn't inlined or otherwise has explicit
                 // linkage, then we'll be creating a globally shared version.
                 if self.explicit_linkage(tcx).is_some() ||
-                    !instance.def.requires_local(tcx)
+                    !instance.def.requires_local(tcx) ||
+                    Some(instance.def_id()) == entry_def_id
                 {
                     return InstantiationMode::GloballyShared  { may_conflict: false }
                 }
@@ -159,7 +161,7 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug {
     fn explicit_linkage(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>) -> Option<Linkage> {
         let def_id = match *self.as_mono_item() {
             MonoItem::Fn(ref instance) => instance.def_id(),
-            MonoItem::Static(node_id) => tcx.hir.local_def_id(node_id),
+            MonoItem::Static(def_id) => def_id,
             MonoItem::GlobalAsm(..) => return None,
         };
 
@@ -209,7 +211,7 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug {
         debug!("is_instantiable({:?})", self);
         let (def_id, substs) = match *self.as_mono_item() {
             MonoItem::Fn(ref instance) => (instance.def_id(), instance.substs),
-            MonoItem::Static(node_id) => (tcx.hir.local_def_id(node_id), Substs::empty()),
+            MonoItem::Static(def_id) => (def_id, Substs::empty()),
             // global asm never has predicates
             MonoItem::GlobalAsm(..) => return true
         };
@@ -218,14 +220,11 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug {
     }
 
     fn to_string(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>) -> String {
-        let hir_map = &tcx.hir;
-
         return match *self.as_mono_item() {
             MonoItem::Fn(instance) => {
                 to_string_internal(tcx, "fn ", instance)
             },
-            MonoItem::Static(node_id) => {
-                let def_id = hir_map.local_def_id(node_id);
+            MonoItem::Static(def_id) => {
                 let instance = Instance::new(def_id, tcx.intern_substs(&[]));
                 to_string_internal(tcx, "static ", instance)
             },
@@ -251,7 +250,9 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug {
             MonoItem::Fn(Instance { def, .. }) => {
                 tcx.hir.as_local_node_id(def.def_id())
             }
-            MonoItem::Static(node_id) |
+            MonoItem::Static(def_id) => {
+                tcx.hir.as_local_node_id(def_id)
+            }
             MonoItem::GlobalAsm(node_id) => {
                 Some(node_id)
             }

@@ -51,9 +51,7 @@ impl Step for Llvm {
     }
 
     fn make_run(run: RunConfig) {
-        let emscripten = run.path.map(|p| {
-            p.ends_with("llvm-emscripten")
-        }).unwrap_or(false);
+        let emscripten = run.path.ends_with("llvm-emscripten");
         run.builder.ensure(Llvm {
             target: run.target,
             emscripten,
@@ -159,6 +157,14 @@ impl Step for Llvm {
            .define("LLVM_TARGET_ARCH", target.split('-').next().unwrap())
            .define("LLVM_DEFAULT_TARGET_TRIPLE", target);
 
+        // By default, LLVM will automatically find OCaml and, if it finds it,
+        // install the LLVM bindings in LLVM_OCAML_INSTALL_PATH, which defaults
+        // to /usr/bin/ocaml.
+        // This causes problem for non-root builds of Rust. Side-step the issue
+        // by setting LLVM_OCAML_INSTALL_PATH to a relative path, so it installs
+        // in the prefix.
+        cfg.define("LLVM_OCAML_INSTALL_PATH",
+            env::var_os("LLVM_OCAML_INSTALL_PATH").unwrap_or_else(|| "usr/lib/ocaml".into()));
 
         // This setting makes the LLVM tools link to the dynamic LLVM library,
         // which saves both memory during parallel links and overall disk space
@@ -186,7 +192,7 @@ impl Step for Llvm {
         }
 
         // http://llvm.org/docs/HowToCrossCompileLLVM.html
-        if target != build.build {
+        if target != build.build && !emscripten {
             builder.ensure(Llvm {
                 target: build.build,
                 emscripten: false,
@@ -307,7 +313,7 @@ impl Step for TestHelpers {
     type Output = ();
 
     fn should_run(run: ShouldRun) -> ShouldRun {
-        run.path("src/rt/rust_test_helpers.c")
+        run.path("src/test/auxiliary/rust_test_helpers.c")
     }
 
     fn make_run(run: RunConfig) {
@@ -320,7 +326,7 @@ impl Step for TestHelpers {
         let build = builder.build;
         let target = self.target;
         let dst = build.test_helpers_out(target);
-        let src = build.src.join("src/rt/rust_test_helpers.c");
+        let src = build.src.join("src/test/auxiliary/rust_test_helpers.c");
         if up_to_date(&src, &dst.join("librust_test_helpers.a")) {
             return
         }
@@ -347,7 +353,7 @@ impl Step for TestHelpers {
            .opt_level(0)
            .warnings(false)
            .debug(false)
-           .file(build.src.join("src/rt/rust_test_helpers.c"))
+           .file(build.src.join("src/test/auxiliary/rust_test_helpers.c"))
            .compile("rust_test_helpers");
     }
 }
@@ -474,9 +480,12 @@ impl Step for Openssl {
             "mips64el-unknown-linux-gnuabi64" => "linux64-mips64",
             "mipsel-unknown-linux-gnu" => "linux-mips32",
             "powerpc-unknown-linux-gnu" => "linux-ppc",
+            "powerpc-unknown-linux-gnuspe" => "linux-ppc",
+            "powerpc-unknown-netbsd" => "BSD-generic32",
             "powerpc64-unknown-linux-gnu" => "linux-ppc64",
             "powerpc64le-unknown-linux-gnu" => "linux-ppc64le",
             "s390x-unknown-linux-gnu" => "linux64-s390x",
+            "sparc-unknown-linux-gnu" => "linux-sparcv9",
             "sparc64-unknown-linux-gnu" => "linux64-sparcv9",
             "sparc64-unknown-netbsd" => "BSD-sparc64",
             "x86_64-apple-darwin" => "darwin64-x86_64-cc",
@@ -484,6 +493,7 @@ impl Step for Openssl {
             "x86_64-unknown-freebsd" => "BSD-x86_64",
             "x86_64-unknown-dragonfly" => "BSD-x86_64",
             "x86_64-unknown-linux-gnu" => "linux-x86_64",
+            "x86_64-unknown-linux-gnux32" => "linux-x32",
             "x86_64-unknown-linux-musl" => "linux-x86_64",
             "x86_64-unknown-netbsd" => "BSD-x86_64",
             _ => panic!("don't know how to configure OpenSSL for {}", target),

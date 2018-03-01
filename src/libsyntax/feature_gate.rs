@@ -186,7 +186,7 @@ declare_features! (
     (active, rustc_attrs, "1.0.0", Some(29642)),
 
     // Allows the use of non lexical lifetimes; RFC 2094
-    (active, nll, "1.0.0", Some(44928)),
+    (active, nll, "1.0.0", Some(43234)),
 
     // Allows the use of #[allow_internal_unstable]. This is an
     // attribute on macro_rules! and can't use the attribute handling
@@ -233,7 +233,7 @@ declare_features! (
     // allow `extern "platform-intrinsic" { ... }`
     (active, platform_intrinsics, "1.4.0", Some(27731)),
 
-    // allow `#[unwind]`
+    // allow `#[unwind(..)]`
     // rust runtime internal
     (active, unwind_attributes, "1.4.0", None),
 
@@ -432,9 +432,6 @@ declare_features! (
     // `foo.rs` as an alternative to `foo/mod.rs`
     (active, non_modrs_mods, "1.24.0", Some(44660)),
 
-    // Nested `impl Trait`
-    (active, nested_impl_trait, "1.24.0", Some(34511)),
-
     // Termination trait in main (RFC 1937)
     (active, termination_trait, "1.24.0", Some(43301)),
 
@@ -446,6 +443,12 @@ declare_features! (
 
     // Allows `#[repr(transparent)]` attribute on newtype structs
     (active, repr_transparent, "1.25.0", Some(43036)),
+
+    // Use `?` as the Kleene "at most one" operator
+    (active, macro_at_most_once_rep, "1.25.0", Some(48075)),
+
+    // Multiple patterns with `|` in `if let` and `while let`
+    (active, if_while_or_patterns, "1.26.0", Some(48215)),
 );
 
 declare_features! (
@@ -538,7 +541,7 @@ declare_features! (
     // instead of just the platforms on which it is the C ABI
     (accepted, abi_sysv64, "1.24.0", Some(36167)),
     // Allows `repr(align(16))` struct attribute (RFC 1358)
-    (accepted, repr_align, "1.24.0", Some(33626)),
+    (accepted, repr_align, "1.25.0", Some(33626)),
     // allow '|' at beginning of match arms (RFC 1925)
     (accepted, match_beginning_vert, "1.25.0", Some(44101)),
     // Nested groups in `use` (RFC 2128)
@@ -984,6 +987,11 @@ pub const BUILTIN_ATTRIBUTES: &'static [(&'static str, AttributeType, AttributeG
                                  "wasm_import_memory attribute is currently unstable",
                                  cfg_fn!(wasm_import_memory))),
 
+    ("rustc_args_required_const", Whitelisted, Gated(Stability::Unstable,
+                                 "rustc_attrs",
+                                 "never will be stable",
+                                 cfg_fn!(rustc_attrs))),
+
     // Crate level attributes
     ("crate_name", CrateLevel, Ungated),
     ("crate_type", CrateLevel, Ungated),
@@ -1253,6 +1261,9 @@ pub const EXPLAIN_PLACEMENT_IN: &'static str =
 pub const EXPLAIN_UNSIZED_TUPLE_COERCION: &'static str =
     "Unsized tuple coercion is not stable enough for use and is subject to change";
 
+pub const EXPLAIN_MACRO_AT_MOST_ONCE_REP: &'static str =
+    "Using the `?` macro Kleene operator for \"at most one\" repetition is unstable";
+
 struct PostExpansionVisitor<'a> {
     context: &'a Context<'a>,
 }
@@ -1341,73 +1352,8 @@ fn contains_novel_literal(item: &ast::MetaItem) -> bool {
     }
 }
 
-// Bans nested `impl Trait`, e.g. `impl Into<impl Debug>`.
-// Nested `impl Trait` _is_ allowed in associated type position,
-// e.g `impl Iterator<Item=impl Debug>`
-struct NestedImplTraitVisitor<'a> {
-    context: &'a Context<'a>,
-    is_in_impl_trait: bool,
-}
-
-impl<'a> NestedImplTraitVisitor<'a> {
-    fn with_impl_trait<F>(&mut self, is_in_impl_trait: bool, f: F)
-        where F: FnOnce(&mut NestedImplTraitVisitor<'a>)
-    {
-        let old_is_in_impl_trait = self.is_in_impl_trait;
-        self.is_in_impl_trait = is_in_impl_trait;
-        f(self);
-        self.is_in_impl_trait = old_is_in_impl_trait;
-    }
-}
-
-
-impl<'a> Visitor<'a> for NestedImplTraitVisitor<'a> {
-    fn visit_ty(&mut self, t: &'a ast::Ty) {
-        if let ast::TyKind::ImplTrait(_) = t.node {
-            if self.is_in_impl_trait {
-                gate_feature_post!(&self, nested_impl_trait, t.span,
-                    "nested `impl Trait` is experimental"
-                );
-            }
-            self.with_impl_trait(true, |this| visit::walk_ty(this, t));
-        } else {
-            visit::walk_ty(self, t);
-        }
-    }
-    fn visit_path_parameters(&mut self, _: Span, path_parameters: &'a ast::PathParameters) {
-        match *path_parameters {
-            ast::PathParameters::AngleBracketed(ref params) => {
-                for type_ in &params.types {
-                    self.visit_ty(type_);
-                }
-                for type_binding in &params.bindings {
-                    // Type bindings such as `Item=impl Debug` in `Iterator<Item=Debug>`
-                    // are allowed to contain nested `impl Trait`.
-                    self.with_impl_trait(false, |this| visit::walk_ty(this, &type_binding.ty));
-                }
-            }
-            ast::PathParameters::Parenthesized(ref params) => {
-                for type_ in &params.inputs {
-                    self.visit_ty(type_);
-                }
-                if let Some(ref type_) = params.output {
-                    // `-> Foo` syntax is essentially an associated type binding,
-                    // so it is also allowed to contain nested `impl Trait`.
-                    self.with_impl_trait(false, |this| visit::walk_ty(this, type_));
-                }
-            }
-        }
-    }
-}
-
 impl<'a> PostExpansionVisitor<'a> {
-    fn whole_crate_feature_gates(&mut self, krate: &ast::Crate) {
-        visit::walk_crate(
-            &mut NestedImplTraitVisitor {
-                context: self.context,
-                is_in_impl_trait: false,
-            }, krate);
-
+    fn whole_crate_feature_gates(&mut self, _krate: &ast::Crate) {
         for &(ident, span) in &*self.context.parse_sess.non_modrs_mods.borrow() {
             if !span.allows_unstable() {
                 let cx = &self.context;
@@ -1675,6 +1621,12 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             ast::ExprKind::Catch(_) => {
                 gate_feature_post!(&self, catch_expr, e.span, "`catch` expression is experimental");
             }
+            ast::ExprKind::IfLet(ref pats, ..) | ast::ExprKind::WhileLet(ref pats, ..) => {
+                if pats.len() > 1 {
+                    gate_feature_post!(&self, if_while_or_patterns, e.span,
+                                    "multiple patterns in `if let` and `while let` are unstable");
+                }
+            }
             _ => {}
         }
         visit::walk_expr(self, e);
@@ -1805,8 +1757,8 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     }
 
     fn visit_vis(&mut self, vis: &'a ast::Visibility) {
-        if let ast::Visibility::Crate(span, ast::CrateSugar::JustCrate) = *vis {
-            gate_feature_post!(&self, crate_visibility_modifier, span,
+        if let ast::VisibilityKind::Crate(ast::CrateSugar::JustCrate) = vis.node {
+            gate_feature_post!(&self, crate_visibility_modifier, vis.span,
                                "`crate` visibility modifier is experimental");
         }
         visit::walk_vis(self, vis);

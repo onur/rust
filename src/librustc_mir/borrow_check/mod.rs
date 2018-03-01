@@ -117,7 +117,7 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
             for move_error in move_errors {
                 let (span, kind): (Span, IllegalMoveOriginKind) = match move_error {
                     MoveError::UnionMove { .. } => {
-                        unimplemented!("dont know how to report union move errors yet.")
+                        unimplemented!("don't know how to report union move errors yet.")
                     }
                     MoveError::IllegalMove {
                         cannot_move_out_of: o,
@@ -463,13 +463,20 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
                 target: _,
                 unwind: _,
             } => {
-                self.access_place(
-                    ContextKind::Drop.new(loc),
-                    (drop_place, span),
-                    (Deep, Write(WriteKind::StorageDeadOrDrop)),
-                    LocalMutationIsAllowed::Yes,
-                    flow_state,
-                );
+                let gcx = self.tcx.global_tcx();
+
+                // Compute the type with accurate region information.
+                let drop_place_ty = drop_place.ty(self.mir, self.tcx);
+
+                // Erase the regions.
+                let drop_place_ty = self.tcx.erase_regions(&drop_place_ty).to_ty(self.tcx);
+
+                // "Lift" into the gcx -- once regions are erased, this type should be in the
+                // global arenas; this "lift" operation basically just asserts that is true, but
+                // that is useful later.
+                let drop_place_ty = gcx.lift(&drop_place_ty).unwrap();
+
+                self.visit_terminator_drop(loc, term, flow_state, drop_place, drop_place_ty, span);
             }
             TerminatorKind::DropAndReplace {
                 location: ref drop_place,
@@ -575,7 +582,8 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
             TerminatorKind::Goto { target: _ }
             | TerminatorKind::Abort
             | TerminatorKind::Unreachable
-            | TerminatorKind::FalseEdges { .. } => {
+            | TerminatorKind::FalseEdges { real_target: _, imaginary_targets: _ }
+            | TerminatorKind::FalseUnwind { real_target: _, unwind: _ } => {
                 // no data used, thus irrelevant to borrowck
             }
         }
@@ -707,6 +715,74 @@ impl InitializationRequiringAction {
 }
 
 impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
+    /// Returns true if the borrow represented by `kind` is
+    /// allowed to be split into separate Reservation and
+    /// Activation phases.
+    fn allow_two_phase_borrow(&self, kind: BorrowKind) -> bool {
+        self.tcx.sess.two_phase_borrows() &&
+            (kind.allows_two_phase_borrow() ||
+             self.tcx.sess.opts.debugging_opts.two_phase_beyond_autoref)
+    }
+
+    /// Invokes `access_place` as appropriate for dropping the value
+    /// at `drop_place`. Note that the *actual* `Drop` in the MIR is
+    /// always for a variable (e.g., `Drop(x)`) -- but we recursively
+    /// break this variable down into subpaths (e.g., `Drop(x.foo)`)
+    /// to indicate more precisely which fields might actually be
+    /// accessed by a destructor.
+    fn visit_terminator_drop(
+        &mut self,
+        loc: Location,
+        term: &Terminator<'tcx>,
+        flow_state: &Flows<'cx, 'gcx, 'tcx>,
+        drop_place: &Place<'tcx>,
+        erased_drop_place_ty: ty::Ty<'gcx>,
+        span: Span,
+    ) {
+        match erased_drop_place_ty.sty {
+            // When a struct is being dropped, we need to check
+            // whether it has a destructor, if it does, then we can
+            // call it, if it does not then we need to check the
+            // individual fields instead. This way if `foo` has a
+            // destructor but `bar` does not, we will only check for
+            // borrows of `x.foo` and not `x.bar`. See #47703.
+            ty::TyAdt(def, substs) if def.is_struct() && !def.has_dtor(self.tcx) => {
+                for (index, field) in def.all_fields().enumerate() {
+                    let gcx = self.tcx.global_tcx();
+                    let field_ty = field.ty(gcx, substs);
+                    let field_ty = gcx.normalize_associated_type_in_env(&field_ty, self.param_env);
+                    let place = drop_place.clone().field(Field::new(index), field_ty);
+
+                    self.visit_terminator_drop(
+                        loc,
+                        term,
+                        flow_state,
+                        &place,
+                        field_ty,
+                        span,
+                    );
+                }
+            },
+            _ => {
+                // We have now refined the type of the value being
+                // dropped (potentially) to just the type of a
+                // subfield; so check whether that field's type still
+                // "needs drop". If so, we assume that the destructor
+                // may access any data it likes (i.e., a Deep Write).
+                let gcx = self.tcx.global_tcx();
+                if erased_drop_place_ty.needs_drop(gcx, self.param_env) {
+                    self.access_place(
+                        ContextKind::Drop.new(loc),
+                        (drop_place, span),
+                        (Deep, Write(WriteKind::StorageDeadOrDrop)),
+                        LocalMutationIsAllowed::Yes,
+                        flow_state,
+                    );
+                }
+            },
+        }
+    }
+
     /// Checks an access to the given place to see if it is allowed. Examines the set of borrows
     /// that are in scope, as well as which paths have been initialized, to ensure that (a) the
     /// place is initialized and (b) it is not borrowed in some way that would prevent this
@@ -797,9 +873,9 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     Control::Continue
                 }
 
-                (Read(kind), BorrowKind::Unique) | (Read(kind), BorrowKind::Mut) => {
+                (Read(kind), BorrowKind::Unique) | (Read(kind), BorrowKind::Mut { .. }) => {
                     // Reading from mere reservations of mutable-borrows is OK.
-                    if this.tcx.sess.two_phase_borrows() && index.is_reservation()
+                    if this.allow_two_phase_borrow(borrow.kind) && index.is_reservation()
                     {
                         return Control::Continue;
                     }
@@ -828,7 +904,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 }
 
                 (Reservation(kind), BorrowKind::Unique)
-                | (Reservation(kind), BorrowKind::Mut)
+                | (Reservation(kind), BorrowKind::Mut { .. })
                 | (Activation(kind, _), _)
                 | (Write(kind), _) => {
                     match rw {
@@ -945,9 +1021,9 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
             Rvalue::Ref(_ /*rgn*/, bk, ref place) => {
                 let access_kind = match bk {
                     BorrowKind::Shared => (Deep, Read(ReadKind::Borrow(bk))),
-                    BorrowKind::Unique | BorrowKind::Mut => {
+                    BorrowKind::Unique | BorrowKind::Mut { .. } => {
                         let wk = WriteKind::MutableBorrow(bk);
-                        if self.tcx.sess.two_phase_borrows() {
+                        if self.allow_two_phase_borrow(bk) {
                             (Deep, Reservation(wk))
                         } else {
                             (Deep, Write(wk))
@@ -1196,7 +1272,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 // mutable borrow before we check it.
                 match borrow.kind {
                     BorrowKind::Shared => return,
-                    BorrowKind::Unique | BorrowKind::Mut => {}
+                    BorrowKind::Unique | BorrowKind::Mut { .. } => {}
                 }
 
                 self.access_place(
@@ -1348,7 +1424,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
     /// tracked in the MoveData.
     ///
     /// An Err result includes a tag indicated why the search failed.
-    /// Currenly this can only occur if the place is built off of a
+    /// Currently this can only occur if the place is built off of a
     /// static variable, as we do not track those in the MoveData.
     fn move_path_closest_to(
         &mut self,
@@ -1363,7 +1439,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         }
         match *last_prefix {
             Place::Local(_) => panic!("should have move path for every Local"),
-            Place::Projection(_) => panic!("PrefixSet::All meant dont stop for Projection"),
+            Place::Projection(_) => panic!("PrefixSet::All meant don't stop for Projection"),
             Place::Static(_) => return Err(NoMovePathFound::ReachedStatic),
         }
     }
@@ -1408,7 +1484,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                         { }
 
                         ProjectionElem::Subslice { .. } => {
-                            panic!("we dont allow assignments to subslices, context: {:?}",
+                            panic!("we don't allow assignments to subslices, context: {:?}",
                                    context);
                         }
 
@@ -1467,8 +1543,8 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     span_bug!(span, "&unique borrow for {:?} should not fail", place);
                 }
             }
-            Reservation(WriteKind::MutableBorrow(BorrowKind::Mut))
-            | Write(WriteKind::MutableBorrow(BorrowKind::Mut)) => if let Err(place_err) =
+            Reservation(WriteKind::MutableBorrow(BorrowKind::Mut { .. }))
+            | Write(WriteKind::MutableBorrow(BorrowKind::Mut { .. })) => if let Err(place_err) =
                 self.is_mutable(place, is_local_mutation_allowed)
             {
                 error_reported = true;
@@ -1532,7 +1608,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
             Activation(..) => {} // permission checks are done at Reservation point.
 
             Read(ReadKind::Borrow(BorrowKind::Unique))
-            | Read(ReadKind::Borrow(BorrowKind::Mut))
+            | Read(ReadKind::Borrow(BorrowKind::Mut { .. }))
             | Read(ReadKind::Borrow(BorrowKind::Shared))
             | Read(ReadKind::Copy) => {} // Access authorized
         }

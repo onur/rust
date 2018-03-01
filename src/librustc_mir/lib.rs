@@ -15,6 +15,7 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 */
 
 #![deny(warnings)]
+#![cfg_attr(not(stage0), allow(bare_trait_object))]
 
 #![feature(box_patterns)]
 #![feature(box_syntax)]
@@ -79,5 +80,4 @@ pub fn provide(providers: &mut Providers) {
     providers.const_eval = interpret::const_eval_provider;
 }
 
-#[cfg(not(stage0))] // remove after the next snapshot
 __build_diagnostic_array! { librustc_mir, DIAGNOSTICS }

@@ -34,13 +34,13 @@ use std::ascii;
 use std::borrow::{Cow};
 use std::cell::Ref;
 use std::fmt::{self, Debug, Formatter, Write};
-use std::{iter, u32};
+use std::{iter, mem, u32};
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
 use std::vec::IntoIter;
 use syntax::ast::{self, Name};
 use syntax::symbol::InternedString;
-use syntax_pos::Span;
+use syntax_pos::{Span, DUMMY_SP};
 
 mod cache;
 pub mod tcx;
@@ -413,7 +413,20 @@ pub enum BorrowKind {
     Unique,
 
     /// Data is mutable and not aliasable.
-    Mut,
+    Mut {
+        /// True if this borrow arose from method-call auto-ref
+        /// (i.e. `adjustment::Adjust::Borrow`)
+        allow_two_phase_borrow: bool
+    }
+}
+
+impl BorrowKind {
+    pub fn allows_two_phase_borrow(&self) -> bool {
+        match *self {
+            BorrowKind::Shared | BorrowKind::Unique => false,
+            BorrowKind::Mut { allow_two_phase_borrow } => allow_two_phase_borrow,
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -803,9 +816,28 @@ pub enum TerminatorKind<'tcx> {
     /// Indicates the end of the dropping of a generator
     GeneratorDrop,
 
+    /// A block where control flow only ever takes one real path, but borrowck
+    /// needs to be more conservative.
     FalseEdges {
+        /// The target normal control flow will take
         real_target: BasicBlock,
-        imaginary_targets: Vec<BasicBlock>
+        /// The list of blocks control flow could conceptually take, but won't
+        /// in practice
+        imaginary_targets: Vec<BasicBlock>,
+    },
+    /// A terminator for blocks that only take one path in reality, but where we
+    /// reserve the right to unwind in borrowck, even if it won't happen in practice.
+    /// This can arise in infinite loops with no function calls for example.
+    FalseUnwind {
+        /// The target normal control flow will take
+        real_target: BasicBlock,
+        /// The imaginary cleanup block link. This particular path will never be taken
+        /// in practice, but in order to avoid fragility we want to always
+        /// consider it in borrowck. We don't want to accept programs which
+        /// pass borrowck only when panic=abort or some assertions are disabled
+        /// due to release vs. debug mode builds. This needs to be an Option because
+        /// of the remove_noop_landing_pads and no_landing_pads passes
+        unwind: Option<BasicBlock>,
     },
 }
 
@@ -865,6 +897,8 @@ impl<'tcx> TerminatorKind<'tcx> {
                 s.extend_from_slice(imaginary_targets);
                 s.into_cow()
             }
+            FalseUnwind { real_target: t, unwind: Some(u) } => vec![t, u].into_cow(),
+            FalseUnwind { real_target: ref t, unwind: None } => slice::from_ref(t).into_cow(),
         }
     }
 
@@ -897,6 +931,8 @@ impl<'tcx> TerminatorKind<'tcx> {
                 s.extend(imaginary_targets.iter_mut());
                 s
             }
+            FalseUnwind { real_target: ref mut t, unwind: Some(ref mut u) } => vec![t, u],
+            FalseUnwind { ref mut real_target, unwind: None } => vec![real_target],
         }
     }
 
@@ -916,7 +952,8 @@ impl<'tcx> TerminatorKind<'tcx> {
             TerminatorKind::Call { cleanup: ref mut unwind, .. } |
             TerminatorKind::Assert { cleanup: ref mut unwind, .. } |
             TerminatorKind::DropAndReplace { ref mut unwind, .. } |
-            TerminatorKind::Drop { ref mut unwind, .. } => {
+            TerminatorKind::Drop { ref mut unwind, .. } |
+            TerminatorKind::FalseUnwind { ref mut unwind, .. } => {
                 Some(unwind)
             }
         }
@@ -947,8 +984,59 @@ impl<'tcx> BasicBlockData<'tcx> {
     pub fn retain_statements<F>(&mut self, mut f: F) where F: FnMut(&mut Statement) -> bool {
         for s in &mut self.statements {
             if !f(s) {
-                s.kind = StatementKind::Nop;
+                s.make_nop();
             }
+        }
+    }
+
+    pub fn expand_statements<F, I>(&mut self, mut f: F)
+        where F: FnMut(&mut Statement<'tcx>) -> Option<I>,
+              I: iter::TrustedLen<Item = Statement<'tcx>>
+    {
+        // Gather all the iterators we'll need to splice in, and their positions.
+        let mut splices: Vec<(usize, I)> = vec![];
+        let mut extra_stmts = 0;
+        for (i, s) in self.statements.iter_mut().enumerate() {
+            if let Some(mut new_stmts) = f(s) {
+                if let Some(first) = new_stmts.next() {
+                    // We can already store the first new statement.
+                    *s = first;
+
+                    // Save the other statements for optimized splicing.
+                    let remaining = new_stmts.size_hint().0;
+                    if remaining > 0 {
+                        splices.push((i + 1 + extra_stmts, new_stmts));
+                        extra_stmts += remaining;
+                    }
+                } else {
+                    s.make_nop();
+                }
+            }
+        }
+
+        // Splice in the new statements, from the end of the block.
+        // FIXME(eddyb) This could be more efficient with a "gap buffer"
+        // where a range of elements ("gap") is left uninitialized, with
+        // splicing adding new elements to the end of that gap and moving
+        // existing elements from before the gap to the end of the gap.
+        // For now, this is safe code, emulating a gap but initializing it.
+        let mut gap = self.statements.len()..self.statements.len()+extra_stmts;
+        self.statements.resize(gap.end, Statement {
+            source_info: SourceInfo {
+                span: DUMMY_SP,
+                scope: ARGUMENT_VISIBILITY_SCOPE
+            },
+            kind: StatementKind::Nop
+        });
+        for (splice_start, new_stmts) in splices.into_iter().rev() {
+            let splice_end = splice_start + new_stmts.size_hint().0;
+            while gap.end > splice_end {
+                gap.start -= 1;
+                gap.end -= 1;
+                self.statements.swap(gap.start, gap.end);
+            }
+            self.statements.splice(splice_start..splice_end, new_stmts);
+            gap.end = splice_start;
         }
     }
 
@@ -1045,7 +1133,8 @@ impl<'tcx> TerminatorKind<'tcx> {
 
                 write!(fmt, ")")
             },
-            FalseEdges { .. } => write!(fmt, "falseEdges")
+            FalseEdges { .. } => write!(fmt, "falseEdges"),
+            FalseUnwind { .. } => write!(fmt, "falseUnwind"),
         }
     }
 
@@ -1087,6 +1176,8 @@ impl<'tcx> TerminatorKind<'tcx> {
                 l.resize(imaginary_targets.len() + 1, "imaginary".into());
                 l
             }
+            FalseUnwind { unwind: Some(_), .. } => vec!["real".into(), "cleanup".into()],
+            FalseUnwind { unwind: None, .. } => vec!["real".into()],
         }
     }
 }
@@ -1116,6 +1207,14 @@ impl<'tcx> Statement<'tcx> {
     /// invalidating statement indices in `Location`s.
     pub fn make_nop(&mut self) {
         self.kind = StatementKind::Nop
+    }
+
+    /// Changes a statement to a nop and returns the original statement.
+    pub fn replace_nop(&mut self) -> Self {
+        Statement {
+            source_info: self.source_info,
+            kind: mem::replace(&mut self.kind, StatementKind::Nop)
+        }
     }
 }
 
@@ -1611,7 +1710,7 @@ impl<'tcx> Debug for Rvalue<'tcx> {
             Ref(region, borrow_kind, ref place) => {
                 let kind_str = match borrow_kind {
                     BorrowKind::Shared => "",
-                    BorrowKind::Mut | BorrowKind::Unique => "mut ",
+                    BorrowKind::Mut { .. } | BorrowKind::Unique => "mut ",
                 };
 
                 // When printing regions, add trailing space if necessary.
@@ -1910,7 +2009,7 @@ pub struct GeneratorLayout<'tcx> {
 /// ```
 ///
 /// here, there is one unique free region (`'a`) but it appears
-/// twice. We would "renumber" each occurence to a unique vid, as follows:
+/// twice. We would "renumber" each occurrence to a unique vid, as follows:
 ///
 /// ```text
 /// ClosureSubsts = [
@@ -2189,7 +2288,8 @@ impl<'tcx> TypeFoldable<'tcx> for Terminator<'tcx> {
             Return => Return,
             Unreachable => Unreachable,
             FalseEdges { real_target, ref imaginary_targets } =>
-                FalseEdges { real_target, imaginary_targets: imaginary_targets.clone() }
+                FalseEdges { real_target, imaginary_targets: imaginary_targets.clone() },
+            FalseUnwind { real_target, unwind } => FalseUnwind { real_target, unwind },
         };
         Terminator {
             source_info: self.source_info,
@@ -2231,7 +2331,8 @@ impl<'tcx> TypeFoldable<'tcx> for Terminator<'tcx> {
             Return |
             GeneratorDrop |
             Unreachable |
-            FalseEdges { .. } => false
+            FalseEdges { .. } |
+            FalseUnwind { .. } => false
         }
     }
 }

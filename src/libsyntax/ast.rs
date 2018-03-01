@@ -918,7 +918,7 @@ pub struct Expr {
 }
 
 impl Expr {
-    /// Wether this expression would be valid somewhere that expects a value, for example, an `if`
+    /// Whether this expression would be valid somewhere that expects a value, for example, an `if`
     /// condition.
     pub fn returns(&self) -> bool {
         if let ExprKind::Block(ref block) = self.node {
@@ -1085,7 +1085,7 @@ pub enum ExprKind {
     /// `if let pat = expr { block } else { expr }`
     ///
     /// This is desugared to a `match` expression.
-    IfLet(P<Pat>, P<Expr>, P<Block>, Option<P<Expr>>),
+    IfLet(Vec<P<Pat>>, P<Expr>, P<Block>, Option<P<Expr>>),
     /// A while loop, with an optional label
     ///
     /// `'label: while expr { block }`
@@ -1095,7 +1095,7 @@ pub enum ExprKind {
     /// `'label: while let pat = expr { block }`
     ///
     /// This is desugared to a combination of `loop` and `match` expressions.
-    WhileLet(P<Pat>, P<Expr>, P<Block>, Option<Label>),
+    WhileLet(Vec<P<Pat>>, P<Expr>, P<Block>, Option<Label>),
     /// A for loop, with an optional label
     ///
     /// `'label: for pat in expr { block }`
@@ -1937,10 +1937,12 @@ pub enum CrateSugar {
     JustCrate,
 }
 
+pub type Visibility = Spanned<VisibilityKind>;
+
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
-pub enum Visibility {
+pub enum VisibilityKind {
     Public,
-    Crate(Span, CrateSugar),
+    Crate(CrateSugar),
     Restricted { path: P<Path>, id: NodeId },
     Inherited,
 }

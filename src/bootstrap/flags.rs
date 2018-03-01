@@ -42,6 +42,8 @@ pub struct Flags {
     pub jobs: Option<u32>,
     pub cmd: Subcommand,
     pub incremental: bool,
+    pub exclude: Vec<PathBuf>,
+    pub rustc_error_format: Option<String>,
 }
 
 pub enum Subcommand {
@@ -59,6 +61,7 @@ pub enum Subcommand {
         test_args: Vec<String>,
         rustc_args: Vec<String>,
         fail_fast: bool,
+        doc_tests: bool,
     },
     Bench {
         paths: Vec<PathBuf>,
@@ -109,12 +112,14 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`");
         opts.optopt("", "build", "build target of the stage0 compiler", "BUILD");
         opts.optmulti("", "host", "host targets to build", "HOST");
         opts.optmulti("", "target", "target targets to build", "TARGET");
+        opts.optmulti("", "exclude", "build paths to exclude", "PATH");
         opts.optopt("", "on-fail", "command to run on failure", "CMD");
         opts.optopt("", "stage", "stage to build", "N");
         opts.optopt("", "keep-stage", "stage to keep without recompiling", "N");
         opts.optopt("", "src", "path to the root of the rust checkout", "DIR");
         opts.optopt("j", "jobs", "number of jobs to run in parallel", "JOBS");
         opts.optflag("h", "help", "print this help message");
+        opts.optopt("", "error-format", "rustc error format", "FORMAT");
 
         // fn usage()
         let usage = |exit_code: i32, opts: &Options, subcommand_help: &str, extra_help: &str| -> ! {
@@ -162,6 +167,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`");
                     "extra options to pass the compiler when running tests",
                     "ARGS",
                 );
+                opts.optflag("", "doc", "run doc tests");
             },
             "bench" => { opts.optmulti("", "test-args", "extra arguments", "ARGS"); },
             "clean" => { opts.optflag("", "all", "clean all build artifacts"); },
@@ -273,7 +279,10 @@ Arguments:
         };
         // Get any optional paths which occur after the subcommand
         let cwd = t!(env::current_dir());
-        let paths = matches.free[1..].iter().map(|p| cwd.join(p)).collect::<Vec<_>>();
+        let src = matches.opt_str("src").map(PathBuf::from)
+            .or_else(|| env::var_os("SRC").map(PathBuf::from))
+            .unwrap_or(cwd.clone());
+        let paths = matches.free[1..].iter().map(|p| p.into()).collect::<Vec<PathBuf>>();
 
         let cfg_file = matches.opt_str("config").map(PathBuf::from).or_else(|| {
             if fs::metadata("config.toml").is_ok() {
@@ -315,6 +324,7 @@ Arguments:
                     test_args: matches.opt_strs("test-args"),
                     rustc_args: matches.opt_strs("rustc-args"),
                     fail_fast: !matches.opt_present("no-fail-fast"),
+                    doc_tests: matches.opt_present("doc"),
                 }
             }
             "bench" => {
@@ -358,15 +368,11 @@ Arguments:
             stage = Some(1);
         }
 
-        let cwd = t!(env::current_dir());
-        let src = matches.opt_str("src").map(PathBuf::from)
-            .or_else(|| env::var_os("SRC").map(PathBuf::from))
-            .unwrap_or(cwd);
-
         Flags {
             verbose: matches.opt_count("verbose"),
             stage,
             on_fail: matches.opt_str("on-fail"),
+            rustc_error_format: matches.opt_str("error-format"),
             keep_stage: matches.opt_str("keep-stage").map(|j| j.parse().unwrap()),
             build: matches.opt_str("build").map(|s| INTERNER.intern_string(s)),
             host: split(matches.opt_strs("host"))
@@ -374,10 +380,12 @@ Arguments:
             target: split(matches.opt_strs("target"))
                 .into_iter().map(|x| INTERNER.intern_string(x)).collect::<Vec<_>>(),
             config: cfg_file,
-            src,
             jobs: matches.opt_str("jobs").map(|j| j.parse().unwrap()),
             cmd,
             incremental: matches.opt_present("incremental"),
+            exclude: split(matches.opt_strs("exclude"))
+                .into_iter().map(|p| p.into()).collect::<Vec<_>>(),
+            src,
         }
     }
 }
@@ -405,6 +413,13 @@ impl Subcommand {
     pub fn fail_fast(&self) -> bool {
         match *self {
             Subcommand::Test { fail_fast, .. } => fail_fast,
+            _ => false,
+        }
+    }
+
+    pub fn doc_tests(&self) -> bool {
+        match *self {
+            Subcommand::Test { doc_tests, .. } => doc_tests,
             _ => false,
         }
     }

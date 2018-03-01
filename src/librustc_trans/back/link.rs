@@ -166,7 +166,9 @@ pub(crate) fn link_binary(sess: &Session,
 
     // Remove the temporary object file and metadata if we aren't saving temps
     if !sess.opts.cg.save_temps {
-        if sess.opts.output_types.should_trans() {
+        if sess.opts.output_types.should_trans() &&
+            !preserve_objects_for_their_debuginfo(sess)
+        {
             for obj in trans.modules.iter().filter_map(|m| m.object.as_ref()) {
                 remove(sess, obj);
             }
@@ -188,6 +190,52 @@ pub(crate) fn link_binary(sess: &Session,
     }
 
     out_filenames
+}
+
+/// Returns a boolean indicating whether we should preserve the object files on
+/// the filesystem for their debug information. This is often useful with
+/// split-dwarf like schemes.
+fn preserve_objects_for_their_debuginfo(sess: &Session) -> bool {
+    // If the objects don't have debuginfo there's nothing to preserve.
+    if sess.opts.debuginfo == NoDebugInfo {
+        return false
+    }
+
+    // If we're only producing artifacts that are archives, no need to preserve
+    // the objects as they're losslessly contained inside the archives.
+    let output_linked = sess.crate_types.borrow()
+        .iter()
+        .any(|x| *x != config::CrateTypeRlib && *x != config::CrateTypeStaticlib);
+    if !output_linked {
+        return false
+    }
+
+    // If we're on OSX then the equivalent of split dwarf is turned on by
+    // default. The final executable won't actually have any debug information
+    // except it'll have pointers to elsewhere. Historically we've always run
+    // `dsymutil` to "link all the dwarf together" but this is actually sort of
+    // a bummer for incremental compilation! (the whole point of split dwarf is
+    // that you don't do this sort of dwarf link).
+    //
+    // Basically as a result this just means that if we're on OSX and we're
+    // *not* running dsymutil then the object files are the only source of truth
+    // for debug information, so we must preserve them.
+    if sess.target.target.options.is_like_osx {
+        match sess.opts.debugging_opts.run_dsymutil {
+            // dsymutil is not being run, preserve objects
+            Some(false) => return true,
+
+            // dsymutil is being run, no need to preserve the objects
+            Some(true) => return false,
+
+            // The default historical behavior was to always run dsymutil, so
+            // we're preserving that temporarily, but we're likely to switch the
+            // default soon.
+            None => return false,
+        }
+    }
+
+    false
 }
 
 fn filename_for_metadata(sess: &Session, crate_name: &str, outputs: &OutputFilenames) -> PathBuf {
@@ -652,9 +700,6 @@ fn link_natively(sess: &Session,
         prog = time(sess.time_passes(), "running linker", || {
             exec_linker(sess, &mut cmd, tmpdir)
         });
-        if !retry_on_segfault || i > 3 {
-            break
-        }
         let output = match prog {
             Ok(ref output) => output,
             Err(_) => break,
@@ -665,6 +710,31 @@ fn link_natively(sess: &Session,
         let mut out = output.stderr.clone();
         out.extend(&output.stdout);
         let out = String::from_utf8_lossy(&out);
+
+        // Check to see if the link failed with "unrecognized command line option:
+        // '-no-pie'" for gcc or "unknown argument: '-no-pie'" for clang. If so,
+        // reperform the link step without the -no-pie option. This is safe because
+        // if the linker doesn't support -no-pie then it should not default to
+        // linking executables as pie. Different versions of gcc seem to use
+        // different quotes in the error message so don't check for them.
+        if sess.target.target.options.linker_is_gnu &&
+           (out.contains("unrecognized command line option") ||
+            out.contains("unknown argument")) &&
+           out.contains("-no-pie") &&
+           cmd.get_args().iter().any(|e| e.to_string_lossy() == "-no-pie") {
+            info!("linker output: {:?}", out);
+            warn!("Linker does not support -no-pie command line option. Retrying without.");
+            for arg in cmd.take_args() {
+                if arg.to_string_lossy() != "-no-pie" {
+                    cmd.arg(arg);
+                }
+            }
+            info!("{:?}", &cmd);
+            continue;
+        }
+        if !retry_on_segfault || i > 3 {
+            break
+        }
         let msg_segv = "clang: error: unable to execute command: Segmentation fault: 11";
         let msg_bus  = "clang: error: unable to execute command: Bus error: 10";
         if !(out.contains(msg_segv) || out.contains(msg_bus)) {
@@ -736,8 +806,12 @@ fn link_natively(sess: &Session,
 
 
     // On macOS, debuggers need this utility to get run to do some munging of
-    // the symbols
-    if sess.target.target.options.is_like_osx && sess.opts.debuginfo != NoDebugInfo {
+    // the symbols. Note, though, that if the object files are being preserved
+    // for their debug information there's no need for us to run dsymutil.
+    if sess.target.target.options.is_like_osx &&
+        sess.opts.debuginfo != NoDebugInfo &&
+        !preserve_objects_for_their_debuginfo(sess)
+    {
         match Command::new("dsymutil").arg(out_filename).output() {
             Ok(..) => {}
             Err(e) => sess.fatal(&format!("failed to run dsymutil: {}", e)),
@@ -775,7 +849,19 @@ fn exec_linker(sess: &Session, cmd: &mut Command, tmpdir: &Path)
         args.push_str("\n");
     }
     let file = tmpdir.join("linker-arguments");
-    fs::write(&file, args.as_bytes())?;
+    let bytes = if sess.target.target.options.is_like_msvc {
+        let mut out = vec![];
+        // start the stream with a UTF-16 BOM
+        for c in vec![0xFEFF].into_iter().chain(args.encode_utf16()) {
+            // encode in little endian
+            out.push(c as u8);
+            out.push((c >> 8) as u8);
+        }
+        out
+    } else {
+        args.into_bytes()
+    };
+    fs::write(&file, &bytes)?;
     cmd2.arg(format!("@{}", file.display()));
     return cmd2.output();
 
@@ -897,16 +983,30 @@ fn link_args(cmd: &mut Linker,
 
     let used_link_args = &trans.crate_info.link_args;
 
-    if crate_type == config::CrateTypeExecutable &&
-       t.options.position_independent_executables {
-        let empty_vec = Vec::new();
-        let args = sess.opts.cg.link_args.as_ref().unwrap_or(&empty_vec);
-        let more_args = &sess.opts.cg.link_arg;
-        let mut args = args.iter().chain(more_args.iter()).chain(used_link_args.iter());
+    if crate_type == config::CrateTypeExecutable {
+        let mut position_independent_executable = false;
 
-        if get_reloc_model(sess) == llvm::RelocMode::PIC
-            && !sess.crt_static() && !args.any(|x| *x == "-static") {
+        if t.options.position_independent_executables {
+            let empty_vec = Vec::new();
+            let args = sess.opts.cg.link_args.as_ref().unwrap_or(&empty_vec);
+            let more_args = &sess.opts.cg.link_arg;
+            let mut args = args.iter().chain(more_args.iter()).chain(used_link_args.iter());
+
+            if get_reloc_model(sess) == llvm::RelocMode::PIC
+                && !sess.crt_static() && !args.any(|x| *x == "-static") {
+                position_independent_executable = true;
+            }
+        }
+
+        if position_independent_executable {
             cmd.position_independent_executable();
+        } else {
+            // recent versions of gcc can be configured to generate position
+            // independent executables by default. We have to pass -no-pie to
+            // explicitly turn that off.
+            if sess.target.target.options.linker_is_gnu {
+                cmd.no_position_independent_executable();
+            }
         }
     }
 

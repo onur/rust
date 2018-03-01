@@ -355,31 +355,26 @@ fn is_param<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     }
 }
 
-fn ensure_no_ty_param_bounds(tcx: TyCtxt,
-                             span: Span,
-                             generics: &hir::Generics,
-                             thing: &'static str) {
+fn ensure_no_param_bounds(tcx: TyCtxt,
+                          span: Span,
+                          generics: &hir::Generics,
+                          thing: &'static str) {
     let mut warn = false;
 
     for ty_param in generics.ty_params() {
-        for bound in ty_param.bounds.iter() {
-            match *bound {
-                hir::TraitTyParamBound(..) => {
-                    warn = true;
-                }
-                hir::RegionTyParamBound(..) => { }
-            }
+        if !ty_param.bounds.is_empty() {
+            warn = true;
         }
     }
 
-    for predicate in generics.where_clause.predicates.iter() {
-        match *predicate {
-            hir::WherePredicate::BoundPredicate(..) => {
-                warn = true;
-            }
-            hir::WherePredicate::RegionPredicate(..) => { }
-            hir::WherePredicate::EqPredicate(..) => { }
+    for lft_param in generics.lifetimes() {
+        if !lft_param.bounds.is_empty() {
+            warn = true;
         }
+    }
+
+    if !generics.where_clause.predicates.is_empty() {
+        warn = true;
     }
 
     if warn {
@@ -388,8 +383,7 @@ fn ensure_no_ty_param_bounds(tcx: TyCtxt,
         // part of this PR. Still, convert to warning to
         // make bootstrapping easier.
         span_warn!(tcx.sess, span, E0122,
-                   "trait bounds are not (yet) enforced \
-                   in {} definitions",
+                   "generic bounds are ignored in {}",
                    thing);
     }
 }
@@ -455,7 +449,7 @@ fn convert_item<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, item_id: ast::NodeId) {
             }
         },
         hir::ItemTy(_, ref generics) => {
-            ensure_no_ty_param_bounds(tcx, it.span, generics, "type");
+            ensure_no_param_bounds(tcx, it.span, generics, "type aliases");
             tcx.generics_of(def_id);
             tcx.type_of(def_id);
             tcx.predicates_of(def_id);
@@ -1370,6 +1364,7 @@ fn explicit_predicates_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let node = tcx.hir.get(node_id);
 
     let mut is_trait = None;
+    let mut is_default_impl_trait = None;
 
     let icx = ItemCtxt::new(tcx, def_id);
     let no_generics = hir::Generics::empty();
@@ -1379,8 +1374,13 @@ fn explicit_predicates_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
         NodeItem(item) => {
             match item.node {
+                ItemImpl(_, _, defaultness, ref generics, ..) => {
+                    if defaultness.is_default() {
+                        is_default_impl_trait = tcx.impl_trait_ref(def_id);
+                    }
+                    generics
+                }
                 ItemFn(.., ref generics, _) |
-                ItemImpl(_, _, _, ref generics, ..) |
                 ItemTy(_, ref generics) |
                 ItemEnum(_, ref generics) |
                 ItemStruct(_, ref generics) |
@@ -1449,6 +1449,18 @@ fn explicit_predicates_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
         // Add in a predicate that `Self:Trait` (where `Trait` is the
         // current trait).  This is needed for builtin bounds.
+        predicates.push(trait_ref.to_poly_trait_ref().to_predicate());
+    }
+
+    // In default impls, we can assume that the self type implements
+    // the trait. So in:
+    //
+    //     default impl Foo for Bar { .. }
+    //
+    // we add a default where clause `Foo: Bar`. We do a similar thing for traits
+    // (see below). Recall that a default impl is not itself an impl, but rather a
+    // set of defaults that can be incorporated into another impl.
+    if let Some(trait_ref) = is_default_impl_trait {
         predicates.push(trait_ref.to_poly_trait_ref().to_predicate());
     }
 

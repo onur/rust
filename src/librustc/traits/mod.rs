@@ -8,7 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! Trait Resolution. See README.md for an overview of how this works.
+//! Trait Resolution. See [rustc guide] for more info on how this works.
+//!
+//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/trait-resolution.html
 
 pub use self::SelectionError::*;
 pub use self::FulfillmentErrorCode::*;
@@ -32,8 +34,8 @@ use syntax_pos::{Span, DUMMY_SP};
 pub use self::coherence::{orphan_check, overlapping_impls, OrphanCheckErr, OverlapResult};
 pub use self::fulfill::FulfillmentContext;
 pub use self::project::MismatchedProjectionTypes;
-pub use self::project::{normalize, normalize_projection_type, Normalized};
-pub use self::project::{ProjectionCache, ProjectionCacheSnapshot, Reveal};
+pub use self::project::{normalize, normalize_projection_type, poly_project_and_unify_type};
+pub use self::project::{ProjectionCache, ProjectionCacheSnapshot, Reveal, Normalized};
 pub use self::object_safety::ObjectSafetyViolation;
 pub use self::object_safety::MethodViolationCode;
 pub use self::on_unimplemented::{OnUnimplementedDirective, OnUnimplementedNote};
@@ -49,7 +51,7 @@ pub use self::util::SupertraitDefIds;
 pub use self::util::transitive_bounds;
 
 mod coherence;
-mod error_reporting;
+pub mod error_reporting;
 mod fulfill;
 mod project;
 mod object_safety;
@@ -73,7 +75,7 @@ pub enum IntercrateMode {
 /// either identifying an `impl` (e.g., `impl Eq for int`) that
 /// provides the required vtable, or else finding a bound that is in
 /// scope. The eventual result is usually a `Selection` (defined below).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Obligation<'tcx, T> {
     pub cause: ObligationCause<'tcx>,
     pub param_env: ty::ParamEnv<'tcx>,
@@ -85,7 +87,7 @@ pub type PredicateObligation<'tcx> = Obligation<'tcx, ty::Predicate<'tcx>>;
 pub type TraitObligation<'tcx> = Obligation<'tcx, ty::PolyTraitPredicate<'tcx>>;
 
 /// Why did we incur this obligation? Used for error reporting.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ObligationCause<'tcx> {
     pub span: Span,
 
@@ -113,7 +115,7 @@ impl<'tcx> ObligationCause<'tcx> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ObligationCauseCode<'tcx> {
     /// Not well classified or should be obvious from span.
     MiscObligation,
@@ -215,7 +217,7 @@ pub enum ObligationCauseCode<'tcx> {
     BlockTailExpression(ast::NodeId),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DerivedObligationCause<'tcx> {
     /// The trait reference of the parent obligation that led to the
     /// current obligation. Note that only trait obligations lead to
@@ -304,7 +306,7 @@ pub type SelectionResult<'tcx, T> = Result<Option<T>, SelectionError<'tcx>>;
 /// ### The type parameter `N`
 ///
 /// See explanation on `VtableImplData`.
-#[derive(Clone, RustcEncodable, RustcDecodable)]
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum Vtable<'tcx, N> {
     /// Vtable identifying a particular impl.
     VtableImpl(VtableImplData<'tcx, N>),
@@ -374,13 +376,13 @@ pub struct VtableClosureData<'tcx, N> {
     pub nested: Vec<N>
 }
 
-#[derive(Clone, RustcEncodable, RustcDecodable)]
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub struct VtableAutoImplData<N> {
     pub trait_def_id: DefId,
     pub nested: Vec<N>
 }
 
-#[derive(Clone, RustcEncodable, RustcDecodable)]
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub struct VtableBuiltinData<N> {
     pub nested: Vec<N>
 }
@@ -621,7 +623,7 @@ pub fn fully_normalize<'a, 'gcx, 'tcx, T>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
     // FIXME (@jroesch) ISSUE 26721
     // I'm not sure if this is a bug or not, needs further investigation.
     // It appears that by reusing the fulfillment_cx here we incur more
-    // obligations and later trip an asssertion on regionck.rs line 337.
+    // obligations and later trip an assertion on regionck.rs line 337.
     //
     // The two possibilities I see is:
     //      - normalization is not actually fully happening and we
