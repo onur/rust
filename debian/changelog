@@ -1,4 +1,4 @@
-rustc (1.25.0-dev-20180207-1) unstable; urgency=low
+rustc (1.26.0-dev-20180302-1) unstable; urgency=low
 
   * New upstream release.
 
