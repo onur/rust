@@ -80,13 +80,13 @@ pub struct LoweringContext<'a> {
     // Use to assign ids to hir nodes that do not directly correspond to an ast node
     sess: &'a Session,
 
-    cstore: &'a CrateStore,
+    cstore: &'a dyn CrateStore,
 
     // As we walk the AST we must keep track of the current 'parent' def id (in
     // the form of a DefIndex) so that if we create a new node which introduces
     // a definition, then we can properly create the def id.
     parent_def: Option<DefIndex>,
-    resolver: &'a mut Resolver,
+    resolver: &'a mut dyn Resolver,
     name_map: FxHashMap<Ident, Name>,
 
     /// The items being lowered are collected here.
@@ -177,10 +177,10 @@ enum ImplTraitContext {
 }
 
 pub fn lower_crate(sess: &Session,
-                   cstore: &CrateStore,
+                   cstore: &dyn CrateStore,
                    dep_graph: &DepGraph,
                    krate: &Crate,
-                   resolver: &mut Resolver)
+                   resolver: &mut dyn Resolver)
                    -> hir::Crate {
     // We're constructing the HIR here; we don't care what we will
     // read, since we haven't even constructed the *input* to
@@ -2472,86 +2472,88 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn lower_pat(&mut self, p: &Pat) -> P<hir::Pat> {
-        let LoweredNodeId { node_id, hir_id } = self.lower_node_id(p.id);
+        let node = match p.node {
+            PatKind::Wild => hir::PatKind::Wild,
+            PatKind::Ident(ref binding_mode, pth1, ref sub) => {
+                match self.resolver.get_resolution(p.id).map(|d| d.base_def()) {
+                    // `None` can occur in body-less function signatures
+                    def @ None | def @ Some(Def::Local(_)) => {
+                        let canonical_id = match def {
+                            Some(Def::Local(id)) => id,
+                            _ => p.id
+                        };
+                        hir::PatKind::Binding(self.lower_binding_mode(binding_mode),
+                                                canonical_id,
+                                                respan(pth1.span, pth1.node.name),
+                                                sub.as_ref().map(|x| self.lower_pat(x)))
+                    }
+                    Some(def) => {
+                        hir::PatKind::Path(hir::QPath::Resolved(None, P(hir::Path {
+                            span: pth1.span,
+                            def,
+                            segments: hir_vec![
+                                hir::PathSegment::from_name(pth1.node.name)
+                            ],
+                        })))
+                    }
+                }
+            }
+            PatKind::Lit(ref e) => hir::PatKind::Lit(P(self.lower_expr(e))),
+            PatKind::TupleStruct(ref path, ref pats, ddpos) => {
+                let qpath = self.lower_qpath(p.id, &None, path, ParamMode::Optional,
+                                                ImplTraitContext::Disallowed);
+                hir::PatKind::TupleStruct(qpath,
+                                            pats.iter().map(|x| self.lower_pat(x)).collect(),
+                                            ddpos)
+            }
+            PatKind::Path(ref qself, ref path) => {
+                hir::PatKind::Path(self.lower_qpath(p.id, qself, path, ParamMode::Optional,
+                                                    ImplTraitContext::Disallowed))
+            }
+            PatKind::Struct(ref path, ref fields, etc) => {
+                let qpath = self.lower_qpath(p.id, &None, path, ParamMode::Optional,
+                                                ImplTraitContext::Disallowed);
 
+                let fs = fields.iter()
+                                .map(|f| {
+                                    Spanned {
+                                        span: f.span,
+                                        node: hir::FieldPat {
+                                            name: self.lower_ident(f.node.ident),
+                                            pat: self.lower_pat(&f.node.pat),
+                                            is_shorthand: f.node.is_shorthand,
+                                        },
+                                    }
+                                })
+                                .collect();
+                hir::PatKind::Struct(qpath, fs, etc)
+            }
+            PatKind::Tuple(ref elts, ddpos) => {
+                hir::PatKind::Tuple(elts.iter().map(|x| self.lower_pat(x)).collect(), ddpos)
+            }
+            PatKind::Box(ref inner) => hir::PatKind::Box(self.lower_pat(inner)),
+            PatKind::Ref(ref inner, mutbl) => {
+                hir::PatKind::Ref(self.lower_pat(inner), self.lower_mutability(mutbl))
+            }
+            PatKind::Range(ref e1, ref e2, ref end) => {
+                hir::PatKind::Range(P(self.lower_expr(e1)),
+                                    P(self.lower_expr(e2)),
+                                    self.lower_range_end(end))
+            }
+            PatKind::Slice(ref before, ref slice, ref after) => {
+                hir::PatKind::Slice(before.iter().map(|x| self.lower_pat(x)).collect(),
+                            slice.as_ref().map(|x| self.lower_pat(x)),
+                            after.iter().map(|x| self.lower_pat(x)).collect())
+            }
+            PatKind::Paren(ref inner) => return self.lower_pat(inner),
+            PatKind::Mac(_) => panic!("Shouldn't exist here"),
+        };
+
+        let LoweredNodeId { node_id, hir_id } = self.lower_node_id(p.id);
         P(hir::Pat {
             id: node_id,
             hir_id,
-            node: match p.node {
-                PatKind::Wild => hir::PatKind::Wild,
-                PatKind::Ident(ref binding_mode, pth1, ref sub) => {
-                    match self.resolver.get_resolution(p.id).map(|d| d.base_def()) {
-                        // `None` can occur in body-less function signatures
-                        def @ None | def @ Some(Def::Local(_)) => {
-                            let canonical_id = match def {
-                                Some(Def::Local(id)) => id,
-                                _ => p.id
-                            };
-                            hir::PatKind::Binding(self.lower_binding_mode(binding_mode),
-                                                  canonical_id,
-                                                  respan(pth1.span, pth1.node.name),
-                                                  sub.as_ref().map(|x| self.lower_pat(x)))
-                        }
-                        Some(def) => {
-                            hir::PatKind::Path(hir::QPath::Resolved(None, P(hir::Path {
-                                span: pth1.span,
-                                def,
-                                segments: hir_vec![
-                                    hir::PathSegment::from_name(pth1.node.name)
-                                ],
-                            })))
-                        }
-                    }
-                }
-                PatKind::Lit(ref e) => hir::PatKind::Lit(P(self.lower_expr(e))),
-                PatKind::TupleStruct(ref path, ref pats, ddpos) => {
-                    let qpath = self.lower_qpath(p.id, &None, path, ParamMode::Optional,
-                                                 ImplTraitContext::Disallowed);
-                    hir::PatKind::TupleStruct(qpath,
-                                              pats.iter().map(|x| self.lower_pat(x)).collect(),
-                                              ddpos)
-                }
-                PatKind::Path(ref qself, ref path) => {
-                    hir::PatKind::Path(self.lower_qpath(p.id, qself, path, ParamMode::Optional,
-                                                        ImplTraitContext::Disallowed))
-                }
-                PatKind::Struct(ref path, ref fields, etc) => {
-                    let qpath = self.lower_qpath(p.id, &None, path, ParamMode::Optional,
-                                                 ImplTraitContext::Disallowed);
-
-                    let fs = fields.iter()
-                                   .map(|f| {
-                                       Spanned {
-                                           span: f.span,
-                                           node: hir::FieldPat {
-                                               name: self.lower_ident(f.node.ident),
-                                               pat: self.lower_pat(&f.node.pat),
-                                               is_shorthand: f.node.is_shorthand,
-                                           },
-                                       }
-                                   })
-                                   .collect();
-                    hir::PatKind::Struct(qpath, fs, etc)
-                }
-                PatKind::Tuple(ref elts, ddpos) => {
-                    hir::PatKind::Tuple(elts.iter().map(|x| self.lower_pat(x)).collect(), ddpos)
-                }
-                PatKind::Box(ref inner) => hir::PatKind::Box(self.lower_pat(inner)),
-                PatKind::Ref(ref inner, mutbl) => {
-                    hir::PatKind::Ref(self.lower_pat(inner), self.lower_mutability(mutbl))
-                }
-                PatKind::Range(ref e1, ref e2, ref end) => {
-                    hir::PatKind::Range(P(self.lower_expr(e1)),
-                                        P(self.lower_expr(e2)),
-                                        self.lower_range_end(end))
-                }
-                PatKind::Slice(ref before, ref slice, ref after) => {
-                    hir::PatKind::Slice(before.iter().map(|x| self.lower_pat(x)).collect(),
-                                slice.as_ref().map(|x| self.lower_pat(x)),
-                                after.iter().map(|x| self.lower_pat(x)).collect())
-                }
-                PatKind::Mac(_) => panic!("Shouldn't exist here"),
-            },
+            node,
             span: p.span,
         })
     }

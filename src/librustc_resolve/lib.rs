@@ -70,7 +70,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::iter;
 use std::mem::replace;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 
 use resolve_imports::{ImportDirective, ImportDirectiveSubclass, NameResolution, ImportResolver};
 use macros::{InvocationData, LegacyBinding, LegacyScope, MacroBinding};
@@ -1118,7 +1118,7 @@ impl<'a> NameBinding<'a> {
         }
     }
 
-    fn get_macro(&self, resolver: &mut Resolver<'a>) -> Rc<SyntaxExtension> {
+    fn get_macro(&self, resolver: &mut Resolver<'a>) -> Lrc<SyntaxExtension> {
         resolver.get_macro(self.def_ignoring_ambiguity())
     }
 
@@ -1324,7 +1324,7 @@ pub struct Resolver<'a> {
     global_macros: FxHashMap<Name, &'a NameBinding<'a>>,
     pub all_macros: FxHashMap<Name, Def>,
     lexical_macro_resolutions: Vec<(Ident, &'a Cell<LegacyScope<'a>>)>,
-    macro_map: FxHashMap<DefId, Rc<SyntaxExtension>>,
+    macro_map: FxHashMap<DefId, Lrc<SyntaxExtension>>,
     macro_defs: FxHashMap<Mark, DefId>,
     local_macro_def_scopes: FxHashMap<NodeId, Module<'a>>,
     macro_exports: Vec<Export>,
@@ -2163,6 +2163,7 @@ impl<'a> Resolver<'a> {
         result
     }
 
+    /// This is called to resolve a trait reference from an `impl` (i.e. `impl Trait for Foo`)
     fn with_optional_trait_ref<T, F>(&mut self, opt_trait_ref: Option<&TraitRef>, f: F) -> T
         where F: FnOnce(&mut Resolver, Option<DefId>) -> T
     {
@@ -2172,13 +2173,14 @@ impl<'a> Resolver<'a> {
             let path: Vec<_> = trait_ref.path.segments.iter()
                 .map(|seg| respan(seg.span, seg.identifier))
                 .collect();
-            let def = self.smart_resolve_path_fragment(trait_ref.ref_id,
-                                                       None,
-                                                       &path,
-                                                       trait_ref.path.span,
-                                                       trait_ref.path.segments.last().unwrap().span,
-                                                       PathSource::Trait(AliasPossibility::No))
-                .base_def();
+            let def = self.smart_resolve_path_fragment(
+                trait_ref.ref_id,
+                None,
+                &path,
+                trait_ref.path.span,
+                trait_ref.path.segments.last().unwrap().span,
+                PathSource::Trait(AliasPossibility::No)
+            ).base_def();
             if def != Def::Err {
                 new_id = Some(def.def_id());
                 let span = trait_ref.path.span;

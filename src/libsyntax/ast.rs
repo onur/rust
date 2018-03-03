@@ -30,7 +30,7 @@ use tokenstream::{ThinTokenStream, TokenStream};
 use serialize::{self, Encoder, Decoder};
 use std::collections::HashSet;
 use std::fmt;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 use std::u32;
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
@@ -562,7 +562,7 @@ impl Pat {
             PatKind::TupleStruct(_, ref s, _) | PatKind::Tuple(ref s, _) => {
                 s.iter().all(|p| p.walk(it))
             }
-            PatKind::Box(ref s) | PatKind::Ref(ref s, _) => {
+            PatKind::Box(ref s) | PatKind::Ref(ref s, _) | PatKind::Paren(ref s) => {
                 s.walk(it)
             }
             PatKind::Slice(ref before, ref slice, ref after) => {
@@ -656,6 +656,8 @@ pub enum PatKind {
     /// `[a, b, ..i, y, z]` is represented as:
     ///     `PatKind::Slice(box [a, b], Some(i), box [y, z])`
     Slice(Vec<P<Pat>>, Option<P<Pat>>, Vec<P<Pat>>),
+    /// Parentheses in patters used for grouping, i.e. `(PAT)`.
+    Paren(P<Pat>),
     /// A macro pattern; pre-expansion
     Mac(Mac),
 }
@@ -1272,7 +1274,7 @@ pub enum LitKind {
     /// A string literal (`"foo"`)
     Str(Symbol, StrStyle),
     /// A byte string (`b"foo"`)
-    ByteStr(Rc<Vec<u8>>),
+    ByteStr(Lrc<Vec<u8>>),
     /// A byte char (`b'f'`)
     Byte(u8),
     /// A character literal (`'a'`)
