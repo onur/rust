@@ -161,7 +161,6 @@ r##"<!DOCTYPE html>
 </html>"##,
     css_extension = if css_file_extension {
         format!("<link rel=\"stylesheet\" type=\"text/css\" href=\"/theme{suffix}.css\">",
-                root_path = page.root_path,
                 suffix=page.resource_suffix)
     } else {
         "".to_owned()
