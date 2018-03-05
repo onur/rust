@@ -9,8 +9,11 @@
 // except according to those terms.
 
 use cmp::Ordering;
+use ops::Try;
 
-use super::{Chain, Cycle, Cloned, Enumerate, Filter, FilterMap, FlatMap, Fuse};
+use super::{AlwaysOk, LoopState};
+use super::{Chain, Cycle, Cloned, Enumerate, Filter, FilterMap, Fuse};
+use super::{Flatten, FlatMap, flatten_compat};
 use super::{Inspect, Map, Peekable, Scan, Skip, SkipWhile, StepBy, Take, TakeWhile, Rev};
 use super::{Zip, Sum, Product};
 use super::{ChainState, FromIterator, ZipImpl};
@@ -26,8 +29,14 @@ fn _assert_is_object_safe(_: &Iterator<Item=()>) {}
 /// [module-level documentation]: index.html
 /// [impl]: index.html#implementing-iterator
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented = "`{Self}` is not an iterator; maybe try calling \
-                            `.iter()` or a similar method"]
+#[rustc_on_unimplemented(
+    on(
+        _Self="&str",
+        label="`{Self}` is not an iterator; try calling `.chars()` or `.bytes()`"
+    ),
+    label="`{Self}` is not an iterator; maybe try calling `.iter()` or a similar method"
+)]
+#[doc(spotlight)]
 pub trait Iterator {
     /// The type of the elements being iterated over.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -160,7 +169,7 @@ pub trait Iterator {
     /// This function might panic if the iterator has more than [`usize::MAX`]
     /// elements.
     ///
-    /// [`usize::MAX`]: ../../std/isize/constant.MAX.html
+    /// [`usize::MAX`]: ../../std/usize/constant.MAX.html
     ///
     /// # Examples
     ///
@@ -518,7 +527,7 @@ pub trait Iterator {
     ///       .for_each(|(i, x)| println!("{}:{}", i, x));
     /// ```
     #[inline]
-    #[stable(feature = "iterator_for_each", since = "1.22.0")]
+    #[stable(feature = "iterator_for_each", since = "1.21.0")]
     fn for_each<F>(self, mut f: F) where
         Self: Sized, F: FnMut(Self::Item),
     {
@@ -618,27 +627,24 @@ pub trait Iterator {
     /// Basic usage:
     ///
     /// ```
-    /// let a = ["1", "2", "lol"];
+    /// let a = ["1", "lol", "3", "NaN", "5"];
     ///
     /// let mut iter = a.iter().filter_map(|s| s.parse().ok());
     ///
     /// assert_eq!(iter.next(), Some(1));
-    /// assert_eq!(iter.next(), Some(2));
+    /// assert_eq!(iter.next(), Some(3));
+    /// assert_eq!(iter.next(), Some(5));
     /// assert_eq!(iter.next(), None);
     /// ```
     ///
     /// Here's the same example, but with [`filter`] and [`map`]:
     ///
     /// ```
-    /// let a = ["1", "2", "lol"];
-    ///
-    /// let mut iter = a.iter()
-    ///                 .map(|s| s.parse())
-    ///                 .filter(|s| s.is_ok())
-    ///                 .map(|s| s.unwrap());
-    ///
+    /// let a = ["1", "lol", "3", "NaN", "5"];
+    /// let mut iter = a.iter().map(|s| s.parse()).filter(|s| s.is_ok()).map(|s| s.unwrap());
     /// assert_eq!(iter.next(), Some(1));
-    /// assert_eq!(iter.next(), Some(2));
+    /// assert_eq!(iter.next(), Some(3));
+    /// assert_eq!(iter.next(), Some(5));
     /// assert_eq!(iter.next(), None);
     /// ```
     ///
@@ -992,11 +998,15 @@ pub trait Iterator {
     /// an extra layer of indirection. `flat_map()` will remove this extra layer
     /// on its own.
     ///
+    /// You can think of [`flat_map(f)`][flat_map] as the semantic equivalent
+    /// of [`map`]ping, and then [`flatten`]ing as in `map(f).flatten()`.
+    ///
     /// Another way of thinking about `flat_map()`: [`map`]'s closure returns
     /// one item for each element, and `flat_map()`'s closure returns an
     /// iterator for each element.
     ///
     /// [`map`]: #method.map
+    /// [`flatten`]: #method.flatten
     ///
     /// # Examples
     ///
@@ -1016,7 +1026,79 @@ pub trait Iterator {
     fn flat_map<U, F>(self, f: F) -> FlatMap<Self, U, F>
         where Self: Sized, U: IntoIterator, F: FnMut(Self::Item) -> U,
     {
-        FlatMap{iter: self, f: f, frontiter: None, backiter: None }
+        FlatMap { inner: flatten_compat(self.map(f)) }
+    }
+
+    /// Creates an iterator that flattens nested structure.
+    ///
+    /// This is useful when you have an iterator of iterators or an iterator of
+    /// things that can be turned into iterators and you want to remove one
+    /// level of indirection.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(iterator_flatten)]
+    ///
+    /// let data = vec![vec![1, 2, 3, 4], vec![5, 6]];
+    /// let flattened = data.into_iter().flatten().collect::<Vec<u8>>();
+    /// assert_eq!(flattened, &[1, 2, 3, 4, 5, 6]);
+    /// ```
+    ///
+    /// Mapping and then flattening:
+    ///
+    /// ```
+    /// #![feature(iterator_flatten)]
+    ///
+    /// let words = ["alpha", "beta", "gamma"];
+    ///
+    /// // chars() returns an iterator
+    /// let merged: String = words.iter()
+    ///                           .map(|s| s.chars())
+    ///                           .flatten()
+    ///                           .collect();
+    /// assert_eq!(merged, "alphabetagamma");
+    /// ```
+    ///
+    /// You can also rewrite this in terms of [`flat_map()`], which is preferable
+    /// in this case since it conveys intent more clearly:
+    ///
+    /// ```
+    /// let words = ["alpha", "beta", "gamma"];
+    ///
+    /// // chars() returns an iterator
+    /// let merged: String = words.iter()
+    ///                           .flat_map(|s| s.chars())
+    ///                           .collect();
+    /// assert_eq!(merged, "alphabetagamma");
+    /// ```
+    ///
+    /// Flattening once only removes one level of nesting:
+    ///
+    /// ```
+    /// #![feature(iterator_flatten)]
+    ///
+    /// let d3 = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]];
+    ///
+    /// let d2 = d3.iter().flatten().collect::<Vec<_>>();
+    /// assert_eq!(d2, [&[1, 2], &[3, 4], &[5, 6], &[7, 8]]);
+    ///
+    /// let d1 = d3.iter().flatten().flatten().collect::<Vec<_>>();
+    /// assert_eq!(d1, [&1, &2, &3, &4, &5, &6, &7, &8]);
+    /// ```
+    ///
+    /// Here we see that `flatten()` does not perform a "deep" flatten.
+    /// Instead, only one level of nesting is removed. That is, if you
+    /// `flatten()` a three-dimensional array the result will be
+    /// two-dimensional and not one-dimensional. To get a one-dimensional
+    /// structure, you have to `flatten()` again.
+    #[inline]
+    #[unstable(feature = "iterator_flatten", issue = "48213")]
+    fn flatten(self) -> Flatten<Self>
+    where Self: Sized, Self::Item: IntoIterator {
+        Flatten { inner: flatten_compat(self) }
     }
 
     /// Creates an iterator which ends after the first [`None`].
@@ -1337,7 +1419,115 @@ pub trait Iterator {
         (left, right)
     }
 
-    /// An iterator adaptor that applies a function, producing a single, final value.
+    /// An iterator method that applies a function as long as it returns
+    /// successfully, producing a single, final value.
+    ///
+    /// `try_fold()` takes two arguments: an initial value, and a closure with
+    /// two arguments: an 'accumulator', and an element. The closure either
+    /// returns successfully, with the value that the accumulator should have
+    /// for the next iteration, or it returns failure, with an error value that
+    /// is propagated back to the caller immediately (short-circuiting).
+    ///
+    /// The initial value is the value the accumulator will have on the first
+    /// call.  If applying the closure succeeded against every element of the
+    /// iterator, `try_fold()` returns the final accumulator as success.
+    ///
+    /// Folding is useful whenever you have a collection of something, and want
+    /// to produce a single value from it.
+    ///
+    /// # Note to Implementors
+    ///
+    /// Most of the other (forward) methods have default implementations in
+    /// terms of this one, so try to implement this explicitly if it can
+    /// do something better than the default `for` loop implementation.
+    ///
+    /// In particular, try to have this call `try_fold()` on the internal parts
+    /// from which this iterator is composed.  If multiple calls are needed,
+    /// the `?` operator may be convenient for chaining the accumulator value
+    /// along, but beware any invariants that need to be upheld before those
+    /// early returns.  This is a `&mut self` method, so iteration needs to be
+    /// resumable after hitting an error here.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(iterator_try_fold)]
+    /// let a = [1, 2, 3];
+    ///
+    /// // the checked sum of all of the elements of the array
+    /// let sum = a.iter()
+    ///            .try_fold(0i8, |acc, &x| acc.checked_add(x));
+    ///
+    /// assert_eq!(sum, Some(6));
+    /// ```
+    ///
+    /// Short-circuiting:
+    ///
+    /// ```
+    /// #![feature(iterator_try_fold)]
+    /// let a = [10, 20, 30, 100, 40, 50];
+    /// let mut it = a.iter();
+    ///
+    /// // This sum overflows when adding the 100 element
+    /// let sum = it.try_fold(0i8, |acc, &x| acc.checked_add(x));
+    /// assert_eq!(sum, None);
+    ///
+    /// // Because it short-circuited, the remaining elements are still
+    /// // available through the iterator.
+    /// assert_eq!(it.len(), 2);
+    /// assert_eq!(it.next(), Some(&40));
+    /// ```
+    #[inline]
+    #[unstable(feature = "iterator_try_fold", issue = "45594")]
+    fn try_fold<B, F, R>(&mut self, init: B, mut f: F) -> R where
+        Self: Sized, F: FnMut(B, Self::Item) -> R, R: Try<Ok=B>
+    {
+        let mut accum = init;
+        while let Some(x) = self.next() {
+            accum = f(accum, x)?;
+        }
+        Try::from_ok(accum)
+    }
+
+    /// An iterator method that applies a fallible function to each item in the
+    /// iterator, stopping at the first error and returning that error.
+    ///
+    /// This can also be thought of as the fallible form of [`for_each()`]
+    /// or as the stateless version of [`try_fold()`].
+    ///
+    /// [`for_each()`]: #method.for_each
+    /// [`try_fold()`]: #method.try_fold
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(iterator_try_fold)]
+    /// use std::fs::rename;
+    /// use std::io::{stdout, Write};
+    /// use std::path::Path;
+    ///
+    /// let data = ["no_tea.txt", "stale_bread.json", "torrential_rain.png"];
+    ///
+    /// let res = data.iter().try_for_each(|x| writeln!(stdout(), "{}", x));
+    /// assert!(res.is_ok());
+    ///
+    /// let mut it = data.iter().cloned();
+    /// let res = it.try_for_each(|x| rename(x, Path::new(x).with_extension("old")));
+    /// assert!(res.is_err());
+    /// // It short-circuited, so the remaining items are still in the iterator:
+    /// assert_eq!(it.next(), Some("stale_bread.json"));
+    /// ```
+    #[inline]
+    #[unstable(feature = "iterator_try_fold", issue = "45594")]
+    fn try_for_each<F, R>(&mut self, mut f: F) -> R where
+        Self: Sized, F: FnMut(Self::Item) -> R, R: Try<Ok=()>
+    {
+        self.try_fold((), move |(), x| f(x))
+    }
+
+    /// An iterator method that applies a function, producing a single, final value.
     ///
     /// `fold()` takes two arguments: an initial value, and a closure with two
     /// arguments: an 'accumulator', and an element. The closure returns the value that
@@ -1354,6 +1544,10 @@ pub trait Iterator {
     /// Folding is useful whenever you have a collection of something, and want
     /// to produce a single value from it.
     ///
+    /// Note: `fold()`, and similar methods that traverse the entire iterator,
+    /// may not terminate for infinite iterators, even on traits for which a
+    /// result is determinable in finite time.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -1361,7 +1555,7 @@ pub trait Iterator {
     /// ```
     /// let a = [1, 2, 3];
     ///
-    /// // the sum of all of the elements of a
+    /// // the sum of all of the elements of the array
     /// let sum = a.iter()
     ///            .fold(0, |acc, &x| acc + x);
     ///
@@ -1403,14 +1597,10 @@ pub trait Iterator {
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    fn fold<B, F>(self, init: B, mut f: F) -> B where
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B where
         Self: Sized, F: FnMut(B, Self::Item) -> B,
     {
-        let mut accum = init;
-        for x in self {
-            accum = f(accum, x);
-        }
-        accum
+        self.try_fold(init, move |acc, x| AlwaysOk(f(acc, x))).0
     }
 
     /// Tests if every element of the iterator matches a predicate.
@@ -1455,12 +1645,10 @@ pub trait Iterator {
     fn all<F>(&mut self, mut f: F) -> bool where
         Self: Sized, F: FnMut(Self::Item) -> bool
     {
-        for x in self {
-            if !f(x) {
-                return false;
-            }
-        }
-        true
+        self.try_for_each(move |x| {
+            if f(x) { LoopState::Continue(()) }
+            else { LoopState::Break(()) }
+        }) == LoopState::Continue(())
     }
 
     /// Tests if any element of the iterator matches a predicate.
@@ -1506,12 +1694,10 @@ pub trait Iterator {
         Self: Sized,
         F: FnMut(Self::Item) -> bool
     {
-        for x in self {
-            if f(x) {
-                return true;
-            }
-        }
-        false
+        self.try_for_each(move |x| {
+            if f(x) { LoopState::Break(()) }
+            else { LoopState::Continue(()) }
+        }) == LoopState::Break(())
     }
 
     /// Searches for an element of an iterator that satisfies a predicate.
@@ -1562,10 +1748,10 @@ pub trait Iterator {
         Self: Sized,
         P: FnMut(&Self::Item) -> bool,
     {
-        for x in self {
-            if predicate(&x) { return Some(x) }
-        }
-        None
+        self.try_for_each(move |x| {
+            if predicate(&x) { LoopState::Break(x) }
+            else { LoopState::Continue(()) }
+        }).break_value()
     }
 
     /// Searches for an element in an iterator, returning its index.
@@ -1623,18 +1809,17 @@ pub trait Iterator {
     ///
     /// ```
     #[inline]
+    #[rustc_inherit_overflow_checks]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn position<P>(&mut self, mut predicate: P) -> Option<usize> where
         Self: Sized,
         P: FnMut(Self::Item) -> bool,
     {
-        // `enumerate` might overflow.
-        for (i, x) in self.enumerate() {
-            if predicate(x) {
-                return Some(i);
-            }
-        }
-        None
+        // The addition might panic on overflow
+        self.try_fold(0, move |i, x| {
+            if predicate(x) { LoopState::Break(i) }
+            else { LoopState::Continue(i + 1) }
+        }).break_value()
     }
 
     /// Searches for an element in an iterator from the right, returning its
@@ -1681,17 +1866,14 @@ pub trait Iterator {
         P: FnMut(Self::Item) -> bool,
         Self: Sized + ExactSizeIterator + DoubleEndedIterator
     {
-        let mut i = self.len();
-
-        while let Some(v) = self.next_back() {
-            // No need for an overflow check here, because `ExactSizeIterator`
-            // implies that the number of elements fits into a `usize`.
-            i -= 1;
-            if predicate(v) {
-                return Some(i);
-            }
-        }
-        None
+        // No need for an overflow check here, because `ExactSizeIterator`
+        // implies that the number of elements fits into a `usize`.
+        let n = self.len();
+        self.try_rfold(n, move |i, x| {
+            let i = i - 1;
+            if predicate(x) { LoopState::Break(i) }
+            else { LoopState::Continue(i) }
+        }).break_value()
     }
 
     /// Returns the maximum element of an iterator.
@@ -1922,10 +2104,10 @@ pub trait Iterator {
         let mut ts: FromA = Default::default();
         let mut us: FromB = Default::default();
 
-        for (t, u) in self {
+        self.for_each(|(t, u)| {
             ts.extend(Some(t));
             us.extend(Some(u));
-        }
+        });
 
         (ts, us)
     }
@@ -2059,14 +2241,23 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return Ordering::Equal,
-                (None, _   ) => return Ordering::Less,
-                (_   , None) => return Ordering::Greater,
-                (Some(x), Some(y)) => match x.cmp(&y) {
-                    Ordering::Equal => (),
-                    non_eq => return non_eq,
+            let x = match self.next() {
+                None => if other.next().is_none() {
+                    return Ordering::Equal
+                } else {
+                    return Ordering::Less
                 },
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return Ordering::Greater,
+                Some(val) => val,
+            };
+
+            match x.cmp(&y) {
+                Ordering::Equal => (),
+                non_eq => return non_eq,
             }
         }
     }
@@ -2082,14 +2273,23 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return Some(Ordering::Equal),
-                (None, _   ) => return Some(Ordering::Less),
-                (_   , None) => return Some(Ordering::Greater),
-                (Some(x), Some(y)) => match x.partial_cmp(&y) {
-                    Some(Ordering::Equal) => (),
-                    non_eq => return non_eq,
+            let x = match self.next() {
+                None => if other.next().is_none() {
+                    return Some(Ordering::Equal)
+                } else {
+                    return Some(Ordering::Less)
                 },
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return Some(Ordering::Greater),
+                Some(val) => val,
+            };
+
+            match x.partial_cmp(&y) {
+                Some(Ordering::Equal) => (),
+                non_eq => return non_eq,
             }
         }
     }
@@ -2105,11 +2305,17 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return true,
-                (None, _) | (_, None) => return false,
-                (Some(x), Some(y)) => if x != y { return false },
-            }
+            let x = match self.next() {
+                None => return other.next().is_none(),
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return false,
+                Some(val) => val,
+            };
+
+            if x != y { return false }
         }
     }
 
@@ -2124,11 +2330,17 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return false,
-                (None, _) | (_, None) => return true,
-                (Some(x), Some(y)) => if x.ne(&y) { return true },
-            }
+            let x = match self.next() {
+                None => return other.next().is_some(),
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return true,
+                Some(val) => val,
+            };
+
+            if x != y { return true }
         }
     }
 
@@ -2143,18 +2355,21 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return false,
-                (None, _   ) => return true,
-                (_   , None) => return false,
-                (Some(x), Some(y)) => {
-                    match x.partial_cmp(&y) {
-                        Some(Ordering::Less) => return true,
-                        Some(Ordering::Equal) => {}
-                        Some(Ordering::Greater) => return false,
-                        None => return false,
-                    }
-                },
+            let x = match self.next() {
+                None => return other.next().is_some(),
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return false,
+                Some(val) => val,
+            };
+
+            match x.partial_cmp(&y) {
+                Some(Ordering::Less) => return true,
+                Some(Ordering::Equal) => (),
+                Some(Ordering::Greater) => return false,
+                None => return false,
             }
         }
     }
@@ -2170,18 +2385,21 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return true,
-                (None, _   ) => return true,
-                (_   , None) => return false,
-                (Some(x), Some(y)) => {
-                    match x.partial_cmp(&y) {
-                        Some(Ordering::Less) => return true,
-                        Some(Ordering::Equal) => {}
-                        Some(Ordering::Greater) => return false,
-                        None => return false,
-                    }
-                },
+            let x = match self.next() {
+                None => { other.next(); return true; },
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return false,
+                Some(val) => val,
+            };
+
+            match x.partial_cmp(&y) {
+                Some(Ordering::Less) => return true,
+                Some(Ordering::Equal) => (),
+                Some(Ordering::Greater) => return false,
+                None => return false,
             }
         }
     }
@@ -2197,18 +2415,21 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return false,
-                (None, _   ) => return false,
-                (_   , None) => return true,
-                (Some(x), Some(y)) => {
-                    match x.partial_cmp(&y) {
-                        Some(Ordering::Less) => return false,
-                        Some(Ordering::Equal) => {}
-                        Some(Ordering::Greater) => return true,
-                        None => return false,
-                    }
-                }
+            let x = match self.next() {
+                None => { other.next(); return false; },
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return true,
+                Some(val) => val,
+            };
+
+            match x.partial_cmp(&y) {
+                Some(Ordering::Less) => return false,
+                Some(Ordering::Equal) => (),
+                Some(Ordering::Greater) => return true,
+                None => return false,
             }
         }
     }
@@ -2224,18 +2445,21 @@ pub trait Iterator {
         let mut other = other.into_iter();
 
         loop {
-            match (self.next(), other.next()) {
-                (None, None) => return true,
-                (None, _   ) => return false,
-                (_   , None) => return true,
-                (Some(x), Some(y)) => {
-                    match x.partial_cmp(&y) {
-                        Some(Ordering::Less) => return false,
-                        Some(Ordering::Equal) => {}
-                        Some(Ordering::Greater) => return true,
-                        None => return false,
-                    }
-                },
+            let x = match self.next() {
+                None => return other.next().is_none(),
+                Some(val) => val,
+            };
+
+            let y = match other.next() {
+                None => return true,
+                Some(val) => val,
+            };
+
+            match x.partial_cmp(&y) {
+                Some(Ordering::Less) => return false,
+                Some(Ordering::Equal) => (),
+                Some(Ordering::Greater) => return true,
+                None => return false,
             }
         }
     }
@@ -2258,17 +2482,17 @@ fn select_fold1<I, B, FProj, FCmp>(mut it: I,
     // start with the first element as our selection. This avoids
     // having to use `Option`s inside the loop, translating to a
     // sizeable performance gain (6x in one case).
-    it.next().map(|mut sel| {
-        let mut sel_p = f_proj(&sel);
+    it.next().map(|first| {
+        let first_p = f_proj(&first);
 
-        for x in it {
+        it.fold((first_p, first), |(sel_p, sel), x| {
             let x_p = f_proj(&x);
             if f_cmp(&sel_p, &sel, &x_p, &x) {
-                sel = x;
-                sel_p = x_p;
+                (x_p, x)
+            } else {
+                (sel_p, sel)
             }
-        }
-        (sel_p, sel)
+        })
     })
 }
 

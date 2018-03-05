@@ -23,7 +23,7 @@ use core::iter::{repeat, FromIterator, FusedIterator};
 use core::mem;
 use core::ops::{Index, IndexMut, Place, Placer, InPlace};
 use core::ptr;
-use core::ptr::Shared;
+use core::ptr::NonNull;
 use core::slice;
 
 use core::hash::{Hash, Hasher};
@@ -558,7 +558,7 @@ impl<T> VecDeque<T> {
             .and_then(|needed_cap| needed_cap.checked_next_power_of_two())
             .expect("capacity overflow");
 
-        if new_cap > self.capacity() {
+        if new_cap > old_cap {
             self.buf.reserve_exact(used_cap, new_cap - used_cap);
             unsafe {
                 self.handle_cap_increase(old_cap);
@@ -895,7 +895,7 @@ impl<T> VecDeque<T> {
         self.head = drain_tail;
 
         Drain {
-            deque: Shared::from(&mut *self),
+            deque: NonNull::from(&mut *self),
             after_tail: drain_head,
             after_head: head,
             iter: Iter {
@@ -906,7 +906,7 @@ impl<T> VecDeque<T> {
         }
     }
 
-    /// Clears the buffer, removing all values.
+    /// Clears the `VecDeque`, removing all values.
     ///
     /// # Examples
     ///
@@ -1624,10 +1624,10 @@ impl<T> VecDeque<T> {
         return elem;
     }
 
-    /// Splits the collection into two at the given index.
+    /// Splits the `VecDeque` into two at the given index.
     ///
-    /// Returns a newly allocated `Self`. `self` contains elements `[0, at)`,
-    /// and the returned `Self` contains elements `[at, len)`.
+    /// Returns a newly allocated `VecDeque`. `self` contains elements `[0, at)`,
+    /// and the returned `VecDeque` contains elements `[at, len)`.
     ///
     /// Note that the capacity of `self` does not change.
     ///
@@ -1635,7 +1635,7 @@ impl<T> VecDeque<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `at > len`
+    /// Panics if `at > len`.
     ///
     /// # Examples
     ///
@@ -1815,7 +1815,8 @@ impl<T> VecDeque<T> {
 
 impl<T: Clone> VecDeque<T> {
     /// Modifies the `VecDeque` in-place so that `len()` is equal to new_len,
-    /// either by removing excess elements or by appending clones of `value` to the back.
+    /// either by removing excess elements from the back or by appending clones of `value`
+    /// to the back.
     ///
     /// # Examples
     ///
@@ -1922,7 +1923,7 @@ impl<'a, T: 'a + fmt::Debug> fmt::Debug for Iter<'a, T> {
     }
 }
 
-// FIXME(#19839) Remove in favor of `#[derive(Clone)]`
+// FIXME(#26925) Remove in favor of `#[derive(Clone)]`
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> Clone for Iter<'a, T> {
     fn clone(&self) -> Iter<'a, T> {
@@ -1972,6 +1973,14 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
         }
         self.head = wrap_index(self.head.wrapping_sub(1), self.ring.len());
         unsafe { Some(self.ring.get_unchecked(self.head)) }
+    }
+
+    fn rfold<Acc, F>(self, mut accum: Acc, mut f: F) -> Acc
+        where F: FnMut(Acc, Self::Item) -> Acc
+    {
+        let (front, back) = RingSlices::ring_slices(self.ring, self.head, self.tail);
+        accum = back.iter().rfold(accum, &mut f);
+        front.iter().rfold(accum, &mut f)
     }
 }
 
@@ -2058,6 +2067,14 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
             Some(&mut *(elem as *mut _))
         }
     }
+
+    fn rfold<Acc, F>(self, mut accum: Acc, mut f: F) -> Acc
+        where F: FnMut(Acc, Self::Item) -> Acc
+    {
+        let (front, back) = RingSlices::ring_slices(self.ring, self.head, self.tail);
+        accum = back.iter_mut().rfold(accum, &mut f);
+        front.iter_mut().rfold(accum, &mut f)
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -2138,7 +2155,7 @@ pub struct Drain<'a, T: 'a> {
     after_tail: usize,
     after_head: usize,
     iter: Iter<'a, T>,
-    deque: Shared<VecDeque<T>>,
+    deque: NonNull<VecDeque<T>>,
 }
 
 #[stable(feature = "collection_debug", since = "1.17.0")]
@@ -2374,7 +2391,7 @@ impl<T> IntoIterator for VecDeque<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
 
-    /// Consumes the list into a front-to-back iterator yielding elements by
+    /// Consumes the `VecDeque` into a front-to-back iterator yielding elements by
     /// value.
     fn into_iter(self) -> IntoIter<T> {
         IntoIter { inner: self }
@@ -2464,7 +2481,7 @@ impl<T> From<VecDeque<T>> for Vec<T> {
             if other.is_contiguous() {
                 ptr::copy(buf.offset(tail as isize), buf, len);
             } else {
-                if (tail - head) >= cmp::min((cap - tail), head) {
+                if (tail - head) >= cmp::min(cap - tail, head) {
                     // There is enough free space in the centre for the shortest block so we can
                     // do this in at most three copy moves.
                     if (cap - tail) > head {
@@ -2548,7 +2565,7 @@ impl<'a, T> Placer<T> for PlaceBack<'a, T> {
 #[unstable(feature = "collection_placement",
            reason = "placement protocol is subject to change",
            issue = "30172")]
-impl<'a, T> Place<T> for PlaceBack<'a, T> {
+unsafe impl<'a, T> Place<T> for PlaceBack<'a, T> {
     fn pointer(&mut self) -> *mut T {
         unsafe { self.vec_deque.ptr().offset(self.vec_deque.head as isize) }
     }
@@ -2594,7 +2611,7 @@ impl<'a, T> Placer<T> for PlaceFront<'a, T> {
 #[unstable(feature = "collection_placement",
            reason = "placement protocol is subject to change",
            issue = "30172")]
-impl<'a, T> Place<T> for PlaceFront<'a, T> {
+unsafe impl<'a, T> Place<T> for PlaceFront<'a, T> {
     fn pointer(&mut self) -> *mut T {
         let tail = self.vec_deque.wrap_sub(self.vec_deque.tail, 1);
         unsafe { self.vec_deque.ptr().offset(tail as isize) }

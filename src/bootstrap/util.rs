@@ -14,8 +14,9 @@
 //! not a lot of interesting happenings here unfortunately.
 
 use std::env;
-use std::fs;
-use std::io::{self, Write};
+use std::str;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, Instant};
@@ -48,6 +49,36 @@ pub fn copy(src: &Path, dst: &Path) {
     let atime = FileTime::from_last_access_time(&metadata);
     let mtime = FileTime::from_last_modification_time(&metadata);
     t!(filetime::set_file_times(dst, atime, mtime));
+}
+
+/// Search-and-replaces within a file. (Not maximally efficiently: allocates a
+/// new string for each replacement.)
+pub fn replace_in_file(path: &Path, replacements: &[(&str, &str)]) {
+    let mut contents = String::new();
+    let mut file = t!(OpenOptions::new().read(true).write(true).open(path));
+    t!(file.read_to_string(&mut contents));
+    for &(target, replacement) in replacements {
+        contents = contents.replace(target, replacement);
+    }
+    t!(file.seek(SeekFrom::Start(0)));
+    t!(file.set_len(0));
+    t!(file.write_all(contents.as_bytes()));
+}
+
+pub fn read_stamp_file(stamp: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut contents = Vec::new();
+    t!(t!(File::open(stamp)).read_to_end(&mut contents));
+    // This is the method we use for extracting paths from the stamp file passed to us. See
+    // run_cargo for more information (in compile.rs).
+    for part in contents.split(|b| *b == 0) {
+        if part.is_empty() {
+            continue
+        }
+        let path = PathBuf::from(t!(str::from_utf8(part)));
+        paths.push(path);
+    }
+    paths
 }
 
 /// Copies the `src` directory recursively to `dst`. Both are assumed to exist
@@ -284,7 +315,7 @@ pub fn symlink_dir(src: &Path, dest: &Path) -> io::Result<()> {
             let mut data = [0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
             let db = data.as_mut_ptr()
                             as *mut REPARSE_MOUNTPOINT_DATA_BUFFER;
-            let buf = &mut (*db).ReparseTarget as *mut _;
+            let buf = &mut (*db).ReparseTarget as *mut u16;
             let mut i = 0;
             // FIXME: this conversion is very hacky
             let v = br"\??\";

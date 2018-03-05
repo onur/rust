@@ -89,9 +89,12 @@ pub fn check(path: &Path, bad: &mut bool, quiet: bool) {
 
     let mut contents = String::new();
 
-    super::walk_many(&[&path.join("test/compile-fail"),
+    super::walk_many(&[&path.join("test/ui-fulldeps"),
+                       &path.join("test/ui"),
+                       &path.join("test/compile-fail"),
                        &path.join("test/compile-fail-fulldeps"),
-                       &path.join("test/parse-fail"),],
+                       &path.join("test/parse-fail"),
+                       &path.join("test/ui"),],
                      &mut |path| super::filter_dirs(path),
                      &mut |file| {
         let filename = file.file_name().unwrap().to_string_lossy();
@@ -150,9 +153,9 @@ pub fn check(path: &Path, bad: &mut bool, quiet: bool) {
 
     for &(name, _) in gate_untested.iter() {
         println!("Expected a gate test for the feature '{}'.", name);
-        println!("Hint: create a file named 'feature-gate-{}.rs' in the compile-fail\
-                \n      test suite, with its failures due to missing usage of\
-                \n      #![feature({})].", name, name);
+        println!("Hint: create a failing test file named 'feature-gate-{}.rs'\
+                \n      in the 'ui' test suite, with its failures due to\
+                \n      missing usage of #![feature({})].", name, name);
         println!("Hint: If you already have such a test and don't want to rename it,\
                 \n      you can also add a // gate-test-{} line to the test file.",
                  name);
@@ -351,6 +354,26 @@ fn map_lib_features(base_src_path: &Path,
                 }
             }
             becoming_feature = None;
+            if line.contains("rustc_const_unstable(") {
+                // const fn features are handled specially
+                let feature_name = match find_attr_val(line, "feature") {
+                    Some(name) => name,
+                    None => err!("malformed stability attribute"),
+                };
+                let feature = Feature {
+                    level: Status::Unstable,
+                    since: "None".to_owned(),
+                    has_gate_test: false,
+                    // Whether there is a common tracking issue
+                    // for these feature gates remains an open question
+                    // https://github.com/rust-lang/rust/issues/24111#issuecomment-340283184
+                    // But we take 24111 otherwise they will be shown as
+                    // "internal to the compiler" which they are not.
+                    tracking_issue: Some(24111),
+                };
+                mf(Ok((feature_name, feature)), file, i + 1);
+                continue;
+            }
             let level = if line.contains("[unstable(") {
                 Status::Unstable
             } else if line.contains("[stable(") {

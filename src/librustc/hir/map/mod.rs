@@ -17,26 +17,32 @@ pub use self::definitions::{Definitions, DefKey, DefPath, DefPathData,
 
 use dep_graph::{DepGraph, DepNode, DepKind, DepNodeIndex};
 
-use hir::def_id::{CRATE_DEF_INDEX, DefId, DefIndexAddressSpace};
+use hir::def_id::{CRATE_DEF_INDEX, DefId, LocalDefId, DefIndexAddressSpace};
+
+use middle::cstore::CrateStore;
 
 use syntax::abi::Abi;
 use syntax::ast::{self, Name, NodeId, CRATE_NODE_ID};
 use syntax::codemap::Spanned;
+use syntax::ext::base::MacroKind;
 use syntax_pos::Span;
 
 use hir::*;
 use hir::print::Nested;
+use hir::svh::Svh;
 use util::nodemap::{DefIdMap, FxHashMap};
 
 use arena::TypedArena;
 use std::cell::RefCell;
 use std::io;
+use ty::TyCtxt;
 
 pub mod blocks;
 mod collector;
 mod def_collector;
 pub mod definitions;
 mod hir_id_validator;
+
 
 pub const ITEM_LIKE_SPACE: DefIndexAddressSpace = DefIndexAddressSpace::Low;
 pub const REGULAR_SPACE: DefIndexAddressSpace = DefIndexAddressSpace::High;
@@ -57,6 +63,7 @@ pub enum Node<'hir> {
     NodePat(&'hir Pat),
     NodeBlock(&'hir Block),
     NodeLocal(&'hir Local),
+    NodeMacroDef(&'hir MacroDef),
 
     /// NodeStructCtor represents a tuple struct.
     NodeStructCtor(&'hir VariantData),
@@ -93,6 +100,8 @@ enum MapEntry<'hir> {
     EntryVisibility(NodeId, DepNodeIndex, &'hir Visibility),
     EntryLocal(NodeId, DepNodeIndex, &'hir Local),
 
+    EntryMacroDef(DepNodeIndex, &'hir MacroDef),
+
     /// Roots for node trees. The DepNodeIndex is the dependency node of the
     /// crate's root module.
     RootCrate(DepNodeIndex),
@@ -127,6 +136,7 @@ impl<'hir> MapEntry<'hir> {
             EntryLocal(id, _, _) => id,
 
             NotPresent |
+            EntryMacroDef(..) |
             RootCrate(_) => return None,
         })
     }
@@ -151,6 +161,7 @@ impl<'hir> MapEntry<'hir> {
             EntryTyParam(_, _, n) => NodeTyParam(n),
             EntryVisibility(_, _, n) => NodeVisibility(n),
             EntryLocal(_, _, n) => NodeLocal(n),
+            EntryMacroDef(_, n) => NodeMacroDef(n),
 
             NotPresent |
             RootCrate(_) => return None
@@ -236,6 +247,9 @@ pub struct Map<'hir> {
     /// deref. This is a gratuitous micro-optimization.
     pub dep_graph: DepGraph,
 
+    /// The SVH of the local crate.
+    pub crate_hash: Svh,
+
     /// NodeIds are sequential integers from 0, so we can be
     /// super-compact by storing them in a vector. Not everything with
     /// a NodeId is in the map, but empirically the occupancy is about
@@ -285,20 +299,12 @@ impl<'hir> Map<'hir> {
             EntryVisibility(_, dep_node_index, _) |
             EntryExpr(_, dep_node_index, _) |
             EntryLocal(_, dep_node_index, _) |
+            EntryMacroDef(dep_node_index, _) |
             RootCrate(dep_node_index) => {
                 self.dep_graph.read_index(dep_node_index);
             }
             NotPresent => {
-                // Some nodes, notably macro definitions, are not
-                // present in the map for whatever reason, but
-                // they *do* have def-ids. So if we encounter an
-                // empty hole, check for that case.
-                if let Some(def_index) = self.definitions.opt_def_index(id) {
-                    let def_path_hash = self.definitions.def_path_hash(def_index);
-                    self.dep_graph.read(def_path_hash.to_dep_node(DepKind::Hir));
-                } else {
-                    bug!("called HirMap::read() with invalid NodeId")
-                }
+                bug!("called HirMap::read() with invalid NodeId")
             }
         }
     }
@@ -362,6 +368,102 @@ impl<'hir> Map<'hir> {
         self.definitions.as_local_node_id(DefId::local(def_index)).unwrap()
     }
 
+    #[inline]
+    pub fn local_def_id_to_hir_id(&self, def_id: LocalDefId) -> HirId {
+        self.definitions.def_index_to_hir_id(def_id.to_def_id().index)
+    }
+
+    #[inline]
+    pub fn local_def_id_to_node_id(&self, def_id: LocalDefId) -> NodeId {
+        self.definitions.as_local_node_id(def_id.to_def_id()).unwrap()
+    }
+
+    pub fn describe_def(&self, node_id: NodeId) -> Option<Def> {
+        let node = if let Some(node) = self.find(node_id) {
+            node
+        } else {
+            return None
+        };
+
+        match node {
+            NodeItem(item) => {
+                let def_id = || {
+                    self.local_def_id(item.id)
+                };
+
+                match item.node {
+                    ItemStatic(_, m, _) => Some(Def::Static(def_id(),
+                                                            m == MutMutable)),
+                    ItemConst(..) => Some(Def::Const(def_id())),
+                    ItemFn(..) => Some(Def::Fn(def_id())),
+                    ItemMod(..) => Some(Def::Mod(def_id())),
+                    ItemGlobalAsm(..) => Some(Def::GlobalAsm(def_id())),
+                    ItemTy(..) => Some(Def::TyAlias(def_id())),
+                    ItemEnum(..) => Some(Def::Enum(def_id())),
+                    ItemStruct(..) => Some(Def::Struct(def_id())),
+                    ItemUnion(..) => Some(Def::Union(def_id())),
+                    ItemTrait(..) => Some(Def::Trait(def_id())),
+                    ItemTraitAlias(..) => {
+                        bug!("trait aliases are not yet implemented (see issue #41517)")
+                    },
+                    ItemExternCrate(_) |
+                    ItemUse(..) |
+                    ItemForeignMod(..) |
+                    ItemImpl(..) => None,
+                }
+            }
+            NodeForeignItem(item) => {
+                let def_id = self.local_def_id(item.id);
+                match item.node {
+                    ForeignItemFn(..) => Some(Def::Fn(def_id)),
+                    ForeignItemStatic(_, m) => Some(Def::Static(def_id, m)),
+                    ForeignItemType => Some(Def::TyForeign(def_id)),
+                }
+            }
+            NodeTraitItem(item) => {
+                let def_id = self.local_def_id(item.id);
+                match item.node {
+                    TraitItemKind::Const(..) => Some(Def::AssociatedConst(def_id)),
+                    TraitItemKind::Method(..) => Some(Def::Method(def_id)),
+                    TraitItemKind::Type(..) => Some(Def::AssociatedTy(def_id)),
+                }
+            }
+            NodeImplItem(item) => {
+                let def_id = self.local_def_id(item.id);
+                match item.node {
+                    ImplItemKind::Const(..) => Some(Def::AssociatedConst(def_id)),
+                    ImplItemKind::Method(..) => Some(Def::Method(def_id)),
+                    ImplItemKind::Type(..) => Some(Def::AssociatedTy(def_id)),
+                }
+            }
+            NodeVariant(variant) => {
+                let def_id = self.local_def_id(variant.node.data.id());
+                Some(Def::Variant(def_id))
+            }
+            NodeField(_) |
+            NodeExpr(_) |
+            NodeStmt(_) |
+            NodeTy(_) |
+            NodeTraitRef(_) |
+            NodePat(_) |
+            NodeBinding(_) |
+            NodeStructCtor(_) |
+            NodeLifetime(_) |
+            NodeVisibility(_) |
+            NodeBlock(_) => None,
+            NodeLocal(local) => {
+                Some(Def::Local(local.id))
+            }
+            NodeMacroDef(macro_def) => {
+                Some(Def::Macro(self.local_def_id(macro_def.id),
+                                MacroKind::Bang))
+            }
+            NodeTyParam(param) => {
+                Some(Def::TyParam(self.local_def_id(param.id)))
+            }
+        }
+    }
+
     fn entry_count(&self) -> usize {
         self.map.len()
     }
@@ -419,6 +521,12 @@ impl<'hir> Map<'hir> {
     /// if the node is a body owner, otherwise returns `None`.
     pub fn maybe_body_owned_by(&self, id: NodeId) -> Option<BodyId> {
         if let Some(entry) = self.find_entry(id) {
+            if self.dep_graph.is_fully_enabled() {
+                let hir_id_owner = self.node_to_hir_id(id).owner;
+                let def_path_hash = self.definitions.def_path_hash(hir_id_owner);
+                self.dep_graph.read(def_path_hash.to_dep_node(DepKind::HirBody));
+            }
+
             if let Some(body_id) = entry.associated_body() {
                 // For item-like things and closures, the associated
                 // body has its own distinct id, and that is returned
@@ -443,6 +551,28 @@ impl<'hir> Map<'hir> {
             span_bug!(self.span(id), "body_owned_by: {} has no associated body",
                       self.node_to_string(id));
         })
+    }
+
+    pub fn body_owner_kind(&self, id: NodeId) -> BodyOwnerKind {
+        // Handle constants in enum discriminants, types, and repeat expressions.
+        let def_id = self.local_def_id(id);
+        let def_key = self.def_key(def_id);
+        if def_key.disambiguated_data.data == DefPathData::Initializer {
+            return BodyOwnerKind::Const;
+        }
+
+        match self.get(id) {
+            NodeItem(&Item { node: ItemConst(..), .. }) |
+            NodeTraitItem(&TraitItem { node: TraitItemKind::Const(..), .. }) |
+            NodeImplItem(&ImplItem { node: ImplItemKind::Const(..), .. }) => {
+                BodyOwnerKind::Const
+            }
+            NodeItem(&Item { node: ItemStatic(_, m, _), .. }) => {
+                BodyOwnerKind::Static(m)
+            }
+            // Default to function if it's not a constant or static.
+            _ => BodyOwnerKind::Fn
+        }
     }
 
     pub fn ty_param_owner(&self, id: NodeId) -> NodeId {
@@ -477,16 +607,16 @@ impl<'hir> Map<'hir> {
         self.forest.krate.trait_impls.get(&trait_did).map_or(&[], |xs| &xs[..])
     }
 
-    pub fn trait_default_impl(&self, trait_did: DefId) -> Option<NodeId> {
+    pub fn trait_auto_impl(&self, trait_did: DefId) -> Option<NodeId> {
         self.dep_graph.read(DepNode::new_no_params(DepKind::AllLocalTraitImpls));
 
         // NB: intentionally bypass `self.forest.krate()` so that we
         // do not trigger a read of the whole krate here
-        self.forest.krate.trait_default_impl.get(&trait_did).cloned()
+        self.forest.krate.trait_auto_impl.get(&trait_did).cloned()
     }
 
     pub fn trait_is_auto(&self, trait_did: DefId) -> bool {
-        self.trait_default_impl(trait_did).is_some()
+        self.trait_auto_impl(trait_did).is_some()
     }
 
     /// Get the attributes on the krate. This is preferable to
@@ -533,6 +663,12 @@ impl<'hir> Map<'hir> {
     /// from a node to the root of the ast (unless you get the same id back here
     /// that can happen if the id is not in the map itself or is just weird).
     pub fn get_parent_node(&self, id: NodeId) -> NodeId {
+        if self.dep_graph.is_fully_enabled() {
+            let hir_id_owner = self.node_to_hir_id(id).owner;
+            let def_path_hash = self.definitions.def_path_hash(hir_id_owner);
+            self.dep_graph.read(def_path_hash.to_dep_node(DepKind::HirBody));
+        }
+
         self.find_entry(id).and_then(|x| x.parent_node()).unwrap_or(id)
     }
 
@@ -805,7 +941,7 @@ impl<'hir> Map<'hir> {
             NodeTraitItem(ti) => ti.name,
             NodeVariant(v) => v.node.name,
             NodeField(f) => f.name,
-            NodeLifetime(lt) => lt.name,
+            NodeLifetime(lt) => lt.name.name(),
             NodeTyParam(tp) => tp.name,
             NodeBinding(&Pat { node: PatKind::Binding(_,_,l,_), .. }) => l.node,
             NodeStructCtor(_) => self.name(self.get_parent(id)),
@@ -875,20 +1011,11 @@ impl<'hir> Map<'hir> {
             Some(EntryVisibility(_, _, &Visibility::Restricted { ref path, .. })) => path.span,
             Some(EntryVisibility(_, _, v)) => bug!("unexpected Visibility {:?}", v),
             Some(EntryLocal(_, _, local)) => local.span,
+            Some(EntryMacroDef(_, macro_def)) => macro_def.span,
 
             Some(RootCrate(_)) => self.forest.krate.span,
             Some(NotPresent) | None => {
-                // Some nodes, notably macro definitions, are not
-                // present in the map for whatever reason, but
-                // they *do* have def-ids. So if we encounter an
-                // empty hole, check for that case.
-                if let Some(def_index) = self.definitions.opt_def_index(id) {
-                    let def_path_hash = self.definitions.def_path_hash(def_index);
-                    self.dep_graph.read(def_path_hash.to_dep_node(DepKind::Hir));
-                    DUMMY_SP
-                } else {
-                    bug!("hir::map::Map::span: id not in map: {:?}", id)
-                }
+                bug!("hir::map::Map::span: id not in map: {:?}", id)
             }
         }
     }
@@ -946,9 +1073,8 @@ impl<'a, 'hir> NodesMatchingSuffix<'a, 'hir> {
         // chain, then returns `None`.
         fn find_first_mod_parent<'a>(map: &'a Map, mut id: NodeId) -> Option<(NodeId, Name)> {
             loop {
-                match map.find(id) {
-                    None => return None,
-                    Some(NodeItem(item)) if item_is_mod(&item) =>
+                match map.find(id)? {
+                    NodeItem(item) if item_is_mod(&item) =>
                         return Some((id, item.name)),
                     _ => {}
                 }
@@ -1012,18 +1138,30 @@ impl Named for StructField { fn name(&self) -> Name { self.name } }
 impl Named for TraitItem { fn name(&self) -> Name { self.name } }
 impl Named for ImplItem { fn name(&self) -> Name { self.name } }
 
-pub fn map_crate<'hir>(forest: &'hir mut Forest,
+
+pub fn map_crate<'hir>(sess: &::session::Session,
+                       cstore: &dyn CrateStore,
+                       forest: &'hir mut Forest,
                        definitions: &'hir Definitions)
                        -> Map<'hir> {
-    let map = {
+    let (map, crate_hash) = {
+        let hcx = ::ich::StableHashingContext::new(sess, &forest.krate, definitions, cstore);
+
         let mut collector = NodeCollector::root(&forest.krate,
                                                 &forest.dep_graph,
-                                                &definitions);
+                                                &definitions,
+                                                hcx);
         intravisit::walk_crate(&mut collector, &forest.krate);
-        collector.into_map()
+
+        let crate_disambiguator = sess.local_crate_disambiguator();
+        let cmdline_args = sess.opts.dep_tracking_hash();
+        collector.finalize_and_compute_crate_hash(crate_disambiguator,
+                                                  cstore,
+                                                  sess.codemap(),
+                                                  cmdline_args)
     };
 
-    if log_enabled!(::log::LogLevel::Debug) {
+    if log_enabled!(::log::Level::Debug) {
         // This only makes sense for ordered stores; note the
         // enumerate to count the number of entries.
         let (entries_less_1, _) = map.iter().filter(|&x| {
@@ -1046,6 +1184,7 @@ pub fn map_crate<'hir>(forest: &'hir mut Forest,
     let map = Map {
         forest,
         dep_graph: forest.dep_graph.clone(),
+        crate_hash,
         map,
         hir_to_node_id,
         definitions,
@@ -1103,6 +1242,7 @@ impl<'a> print::State<'a> {
             // printing.
             NodeStructCtor(_)  => bug!("cannot print isolated StructCtor"),
             NodeLocal(a)       => self.print_local_decl(&a),
+            NodeMacroDef(_)    => bug!("cannot print MacroDef"),
         }
     }
 }
@@ -1143,8 +1283,8 @@ fn node_id_to_string(map: &Map, id: NodeId, include_id: bool) -> String {
                 ItemStruct(..) => "struct",
                 ItemUnion(..) => "union",
                 ItemTrait(..) => "trait",
+                ItemTraitAlias(..) => "trait alias",
                 ItemImpl(..) => "impl",
-                ItemDefaultImpl(..) => "default impl",
             };
             format!("{} {}{}", item_str, path_str(), id_str)
         }
@@ -1219,8 +1359,20 @@ fn node_id_to_string(map: &Map, id: NodeId, include_id: bool) -> String {
         Some(NodeVisibility(ref vis)) => {
             format!("visibility {:?}{}", vis, id_str)
         }
+        Some(NodeMacroDef(_)) => {
+            format!("macro {}{}",  path_str(), id_str)
+        }
         None => {
             format!("unknown node{}", id_str)
         }
+    }
+}
+
+pub fn describe_def(tcx: TyCtxt, def_id: DefId) -> Option<Def> {
+    if let Some(node_id) = tcx.hir.as_local_node_id(def_id) {
+        tcx.hir.describe_def(node_id)
+    } else {
+        bug!("Calling local describe_def query provider for upstream DefId: {:?}",
+             def_id)
     }
 }

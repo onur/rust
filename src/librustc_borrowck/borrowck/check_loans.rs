@@ -25,7 +25,7 @@ use rustc::middle::expr_use_visitor::MutateMode;
 use rustc::middle::mem_categorization as mc;
 use rustc::middle::mem_categorization::Categorization;
 use rustc::middle::region;
-use rustc::ty::{self, TyCtxt};
+use rustc::ty::{self, TyCtxt, RegionKind};
 use syntax::ast;
 use syntax_pos::Span;
 use rustc::hir;
@@ -92,6 +92,7 @@ struct CheckLoanCtxt<'a, 'tcx: 'a> {
     move_data: &'a move_data::FlowedMoveData<'a, 'tcx>,
     all_loans: &'a [Loan<'tcx>],
     param_env: ty::ParamEnv<'tcx>,
+    movable_generator: bool,
 }
 
 impl<'a, 'tcx> euv::Delegate<'tcx> for CheckLoanCtxt<'a, 'tcx> {
@@ -147,6 +148,8 @@ impl<'a, 'tcx> euv::Delegate<'tcx> for CheckLoanCtxt<'a, 'tcx> {
         }
 
         self.check_for_conflicting_loans(hir_id.local_id);
+
+        self.check_for_loans_across_yields(cmt, loan_region, borrow_span);
     }
 
     fn mutate(&mut self,
@@ -198,6 +201,16 @@ pub fn check_loans<'a, 'b, 'c, 'tcx>(bccx: &BorrowckCtxt<'a, 'tcx>,
     debug!("check_loans(body id={})", body.value.id);
 
     let def_id = bccx.tcx.hir.body_owner_def_id(body.id());
+
+    let node_id = bccx.tcx.hir.as_local_node_id(def_id).unwrap();
+    let movable_generator = !match bccx.tcx.hir.get(node_id) {
+        hir::map::Node::NodeExpr(&hir::Expr {
+            node: hir::ExprClosure(.., Some(hir::GeneratorMovability::Static)),
+            ..
+        }) => true,
+        _ => false,
+    };
+
     let param_env = bccx.tcx.param_env(def_id);
     let mut clcx = CheckLoanCtxt {
         bccx,
@@ -205,8 +218,15 @@ pub fn check_loans<'a, 'b, 'c, 'tcx>(bccx: &BorrowckCtxt<'a, 'tcx>,
         move_data,
         all_loans,
         param_env,
+        movable_generator,
     };
-    euv::ExprUseVisitor::new(&mut clcx, bccx.tcx, param_env, &bccx.region_scope_tree, bccx.tables)
+    let rvalue_promotable_map = bccx.tcx.rvalue_promotable_map(def_id);
+    euv::ExprUseVisitor::new(&mut clcx,
+                             bccx.tcx,
+                             param_env,
+                             &bccx.region_scope_tree,
+                             bccx.tables,
+                             Some(rvalue_promotable_map))
         .consume_body(body);
 }
 
@@ -342,6 +362,99 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
         return result;
     }
 
+    pub fn check_for_loans_across_yields(&self,
+                                         cmt: mc::cmt<'tcx>,
+                                         loan_region: ty::Region<'tcx>,
+                                         borrow_span: Span) {
+        pub fn borrow_of_local_data<'tcx>(cmt: &mc::cmt<'tcx>) -> bool {
+            match cmt.cat {
+                // Borrows of static items is allowed
+                Categorization::StaticItem => false,
+                // Reborrow of already borrowed data is ignored
+                // Any errors will be caught on the initial borrow
+                Categorization::Deref(..) => false,
+
+                // By-ref upvars has Derefs so they will get ignored.
+                // Generators counts as FnOnce so this leaves only
+                // by-move upvars, which is local data for generators
+                Categorization::Upvar(..) => true,
+
+                Categorization::Rvalue(region) => {
+                    // Rvalues promoted to 'static are no longer local
+                    if let RegionKind::ReStatic = *region {
+                        false
+                    } else {
+                        true
+                    }
+                }
+
+                // Borrow of local data must be checked
+                Categorization::Local(..) => true,
+
+                // For interior references and downcasts, find out if the base is local
+                Categorization::Downcast(ref cmt_base, _) |
+                Categorization::Interior(ref cmt_base, _) => borrow_of_local_data(&cmt_base),
+            }
+        }
+
+        if !self.movable_generator {
+            return;
+        }
+
+        if !borrow_of_local_data(&cmt) {
+            return;
+        }
+
+        let scope = match *loan_region {
+            // A concrete region in which we will look for a yield expression
+            RegionKind::ReScope(scope) => scope,
+
+            // There cannot be yields inside an empty region
+            RegionKind::ReEmpty => return,
+
+            // Local data cannot have these lifetimes
+            RegionKind::ReEarlyBound(..) |
+            RegionKind::ReLateBound(..) |
+            RegionKind::ReFree(..) |
+            RegionKind::ReStatic => {
+                self.bccx
+                    .tcx
+                    .sess.delay_span_bug(borrow_span,
+                                         &format!("unexpected region for local data {:?}",
+                                                  loan_region));
+                return
+            }
+
+            // These cannot exist in borrowck
+            RegionKind::ReVar(..) |
+            RegionKind::ReSkolemized(..) |
+            RegionKind::ReClosureBound(..) |
+            RegionKind::ReErased => span_bug!(borrow_span,
+                                              "unexpected region in borrowck {:?}",
+                                              loan_region),
+        };
+
+        let body_id = self.bccx.body.value.hir_id.local_id;
+
+        if self.bccx.region_scope_tree.containing_body(scope) != Some(body_id) {
+            // We are borrowing local data longer than its storage.
+            // This should result in other borrowck errors.
+            self.bccx.tcx.sess.delay_span_bug(borrow_span,
+                                              "borrowing local data longer than its storage");
+            return;
+        }
+
+        if let Some(yield_span) = self.bccx
+                                      .region_scope_tree
+                                      .yield_in_scope_for_expr(scope,
+                                                               cmt.id,
+                                                               self.bccx.body) {
+            self.bccx.cannot_borrow_across_generator_yield(borrow_span,
+                                                           yield_span,
+                                                           Origin::Ast).emit();
+        }
+    }
+
     pub fn check_for_conflicting_loans(&self, node: hir::ItemLocalId) {
         //! Checks to see whether any of the loans that are issued
         //! on entrance to `node` conflict with loans that have already been
@@ -389,10 +502,21 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
         assert!(self.bccx.region_scope_tree.scopes_intersect(old_loan.kill_scope,
                                                        new_loan.kill_scope));
 
-        self.report_error_if_loan_conflicts_with_restriction(
-            old_loan, new_loan, old_loan, new_loan) &&
-        self.report_error_if_loan_conflicts_with_restriction(
-            new_loan, old_loan, old_loan, new_loan)
+        let err_old_new = self.report_error_if_loan_conflicts_with_restriction(
+            old_loan, new_loan, old_loan, new_loan).err();
+        let err_new_old = self.report_error_if_loan_conflicts_with_restriction(
+            new_loan, old_loan, old_loan, new_loan).err();
+
+        match (err_old_new, err_new_old) {
+            (Some(mut err), None) | (None, Some(mut err)) => err.emit(),
+            (Some(mut err_old), Some(mut err_new)) => {
+                err_old.emit();
+                err_new.cancel();
+            }
+            (None, None) => return true,
+        }
+
+        false
     }
 
     pub fn report_error_if_loan_conflicts_with_restriction(&self,
@@ -400,7 +524,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                                                            loan2: &Loan<'tcx>,
                                                            old_loan: &Loan<'tcx>,
                                                            new_loan: &Loan<'tcx>)
-                                                           -> bool {
+                                                           -> Result<(), DiagnosticBuilder<'a>> {
         //! Checks whether the restrictions introduced by `loan1` would
         //! prohibit `loan2`. Returns false if an error is reported.
 
@@ -410,7 +534,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                loan2);
 
         if compatible_borrow_kinds(loan1.kind, loan2.kind) {
-            return true;
+            return Ok(());
         }
 
         let loan2_base_path = owned_ptr_base_path_rc(&loan2.loan_path);
@@ -467,105 +591,33 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
             // 3. Where does old loan expire.
 
             let previous_end_span =
-                old_loan.kill_scope.span(self.tcx(), &self.bccx.region_scope_tree).end_point();
+                Some(self.tcx().sess.codemap().end_point(
+                        old_loan.kill_scope.span(self.tcx(), &self.bccx.region_scope_tree)));
 
             let mut err = match (new_loan.kind, old_loan.kind) {
-                (ty::MutBorrow, ty::MutBorrow) => {
-                    let mut err = self.bccx.cannot_mutably_borrow_multiply(
-                        new_loan.span, &nl, &new_loan_msg, Origin::Ast);
-
-                    if new_loan.span == old_loan.span {
-                        // Both borrows are happening in the same place
-                        // Meaning the borrow is occurring in a loop
-                        err.span_label(
-                                new_loan.span,
-                                format!("mutable borrow starts here in previous \
-                                        iteration of loop{}", new_loan_msg));
-                        err.span_label(
-                                previous_end_span,
-                                "mutable borrow ends here");
-                        err
-                    } else {
-                       err.span_label(
-                                old_loan.span,
-                                format!("first mutable borrow occurs here{}", old_loan_msg));
-                        err.span_label(
-                                new_loan.span,
-                                format!("second mutable borrow occurs here{}", new_loan_msg));
-                        err.span_label(
-                                previous_end_span,
-                                "first borrow ends here");
-                        err
-                    }
-                }
-
-                (ty::UniqueImmBorrow, ty::UniqueImmBorrow) => {
-                    let mut err = self.bccx.cannot_uniquely_borrow_by_two_closures(
-                        new_loan.span, &nl, Origin::Ast);
-                    err.span_label(
-                            old_loan.span,
-                            "first closure is constructed here");
-                    err.span_label(
-                            new_loan.span,
-                            "second closure is constructed here");
-                    err.span_label(
-                            previous_end_span,
-                            "borrow from first closure ends here");
-                    err
-                }
-
-                (ty::UniqueImmBorrow, _) => {
-                    let mut err = self.bccx.cannot_uniquely_borrow_by_one_closure(
-                        new_loan.span, &nl, &ol_pronoun, &old_loan_msg, Origin::Ast);
-                    err.span_label(
-                            new_loan.span,
-                            format!("closure construction occurs here{}", new_loan_msg));
-                    err.span_label(
-                            old_loan.span,
-                            format!("borrow occurs here{}", old_loan_msg));
-                    err.span_label(
-                            previous_end_span,
-                            "borrow ends here");
-                    err
-                }
-
+                (ty::MutBorrow, ty::MutBorrow) =>
+                    self.bccx.cannot_mutably_borrow_multiply(
+                        new_loan.span, &nl, &new_loan_msg, old_loan.span, &old_loan_msg,
+                        previous_end_span, Origin::Ast),
+                (ty::UniqueImmBorrow, ty::UniqueImmBorrow) =>
+                    self.bccx.cannot_uniquely_borrow_by_two_closures(
+                        new_loan.span, &nl, old_loan.span, previous_end_span, Origin::Ast),
+                (ty::UniqueImmBorrow, _) =>
+                    self.bccx.cannot_uniquely_borrow_by_one_closure(
+                        new_loan.span, &nl, &new_loan_msg,
+                        old_loan.span, &ol_pronoun, &old_loan_msg, previous_end_span, Origin::Ast),
                 (_, ty::UniqueImmBorrow) => {
                     let new_loan_str = &new_loan.kind.to_user_str();
-                    let mut err = self.bccx.cannot_reborrow_already_uniquely_borrowed(
-                        new_loan.span, &nl, &new_loan_msg, new_loan_str, Origin::Ast);
-                    err.span_label(
-                            new_loan.span,
-                            format!("borrow occurs here{}", new_loan_msg));
-                    err.span_label(
-                            old_loan.span,
-                            format!("closure construction occurs here{}", old_loan_msg));
-                    err.span_label(
-                            previous_end_span,
-                            "borrow from closure ends here");
-                    err
+                    self.bccx.cannot_reborrow_already_uniquely_borrowed(
+                        new_loan.span, &nl, &new_loan_msg, new_loan_str,
+                        old_loan.span, &old_loan_msg, previous_end_span, Origin::Ast)
                 }
-
-                (..) => {
-                    let mut err = self.bccx.cannot_reborrow_already_borrowed(
+                (..) =>
+                    self.bccx.cannot_reborrow_already_borrowed(
                         new_loan.span,
                         &nl, &new_loan_msg, &new_loan.kind.to_user_str(),
-                        &ol_pronoun, &old_loan.kind.to_user_str(), &old_loan_msg, Origin::Ast);
-                    err.span_label(
-                            new_loan.span,
-                            format!("{} borrow occurs here{}",
-                                     new_loan.kind.to_user_str(),
-                                     new_loan_msg));
-                    err.span_label(
-                            old_loan.span,
-                            format!("{} borrow occurs here{}",
-                                     old_loan.kind.to_user_str(),
-                                     old_loan_msg));
-                    err.span_label(
-                            previous_end_span,
-                            format!("{} borrow ends here",
-                                     old_loan.kind.to_user_str()));
-                    err
-                }
+                        old_loan.span, &ol_pronoun, &old_loan.kind.to_user_str(), &old_loan_msg,
+                        previous_end_span, Origin::Ast)
             };
 
             match new_loan.cause {
@@ -587,11 +639,10 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                 _ => { }
             }
 
-            err.emit();
-            return false;
+            return Err(err);
         }
 
-        true
+        Ok(())
     }
 
     fn consume_common(&self,
@@ -640,14 +691,10 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
             UseOk => { }
             UseWhileBorrowed(loan_path, loan_span) => {
                 let desc = self.bccx.loan_path_to_string(copy_path);
-                self.bccx.cannot_use_when_mutably_borrowed(span, &desc, Origin::Ast)
-                    .span_label(loan_span,
-                               format!("borrow of `{}` occurs here",
-                                       &self.bccx.loan_path_to_string(&loan_path))
-                               )
-                    .span_label(span,
-                               format!("use of borrowed `{}`",
-                                        &self.bccx.loan_path_to_string(&loan_path)))
+                self.bccx.cannot_use_when_mutably_borrowed(
+                        span, &desc,
+                        loan_span, &self.bccx.loan_path_to_string(&loan_path),
+                        Origin::Ast)
                     .emit();
             }
         }
@@ -736,7 +783,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
         debug!("check_if_path_is_moved(id={:?}, use_kind={:?}, lp={:?})",
                id, use_kind, lp);
 
-        // FIXME (22079): if you find yourself tempted to cut and paste
+        // FIXME: if you find yourself tempted to cut and paste
         // the body below and then specializing the error reporting,
         // consider refactoring this instead!
 
@@ -797,7 +844,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                         // the path must be initialized to prevent a case of
                         // partial reinitialization
                         //
-                        // FIXME (22079): could refactor via hypothetical
+                        // FIXME: could refactor via hypothetical
                         // generalized check_if_path_is_moved
                         let loan_path = owned_ptr_base_path_rc(lp_base);
                         self.move_data.each_move_of(id, &loan_path, |_, _| {
@@ -847,7 +894,8 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
             let lp = opt_loan_path(&assignee_cmt).unwrap();
             self.move_data.each_assignment_of(assignment_id, &lp, |assign| {
                 if assignee_cmt.mutbl.is_mutable() {
-                    self.tcx().used_mut_nodes.borrow_mut().insert(local_id);
+                    let hir_id = self.bccx.tcx.hir.node_to_hir_id(local_id);
+                    self.bccx.used_mut_nodes.borrow_mut().insert(hir_id);
                 } else {
                     self.bccx.report_reassigned_immutable_variable(
                         assignment_span,
@@ -865,13 +913,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                                    loan_path: &LoanPath<'tcx>,
                                    loan: &Loan) {
         self.bccx.cannot_assign_to_borrowed(
-            span, &self.bccx.loan_path_to_string(loan_path), Origin::Ast)
-            .span_label(loan.span,
-                       format!("borrow of `{}` occurs here",
-                               self.bccx.loan_path_to_string(loan_path)))
-            .span_label(span,
-                       format!("assignment to borrowed `{}` occurs here",
-                               self.bccx.loan_path_to_string(loan_path)))
+            span, loan.span, &self.bccx.loan_path_to_string(loan_path), Origin::Ast)
             .emit();
     }
 }

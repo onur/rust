@@ -28,8 +28,9 @@
 //!   this code handles low-level equality and subtyping operations. The
 //!   type check pass in the compiler is found in the `librustc_typeck` crate.
 //!
-//! For a deeper explanation of how the compiler works and is
-//! organized, see the README.md file in this directory.
+//! For more information about how rustc works, see the [rustc guide].
+//!
+//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/
 //!
 //! # Note
 //!
@@ -43,23 +44,38 @@
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 #![feature(conservative_impl_trait)]
+#![feature(const_fn)]
+#![feature(copy_closures, clone_closures)]
 #![feature(core_intrinsics)]
+#![feature(drain_filter)]
+#![feature(dyn_trait)]
+#![feature(from_ref)]
+#![feature(fs_read_write)]
+#![feature(i128)]
 #![feature(i128_type)]
+#![feature(inclusive_range)]
+#![feature(inclusive_range_syntax)]
 #![cfg_attr(windows, feature(libc))]
+#![feature(macro_vis_matcher)]
+#![feature(match_default_bindings)]
 #![feature(never_type)]
+#![feature(non_exhaustive)]
 #![feature(nonzero)]
+#![feature(proc_macro_internals)]
 #![feature(quote)]
+#![feature(refcell_replace_swap)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_patterns)]
 #![feature(specialization)]
 #![feature(unboxed_closures)]
+#![feature(underscore_lifetimes)]
+#![feature(universal_impl_trait)]
 #![feature(trace_macros)]
+#![feature(trusted_len)]
+#![feature(catch_expr)]
 #![feature(test)]
 
-#![cfg_attr(stage0, feature(const_fn))]
-#![cfg_attr(not(stage0), feature(const_atomic_bool_new))]
-
-#![recursion_limit="256"]
+#![recursion_limit="512"]
 
 extern crate arena;
 #[macro_use] extern crate bitflags;
@@ -67,11 +83,11 @@ extern crate core;
 extern crate fmt_macros;
 extern crate getopts;
 extern crate graphviz;
+#[macro_use] extern crate lazy_static;
 #[cfg(windows)]
 extern crate libc;
-extern crate owning_ref;
 extern crate rustc_back;
-extern crate rustc_data_structures;
+#[macro_use] extern crate rustc_data_structures;
 extern crate serialize;
 extern crate rustc_const_math;
 extern crate rustc_errors as errors;
@@ -79,8 +95,13 @@ extern crate rustc_errors as errors;
 #[macro_use] extern crate syntax;
 extern crate syntax_pos;
 extern crate jobserver;
+extern crate proc_macro;
 
 extern crate serialize as rustc_serialize; // used by deriving
+
+extern crate rustc_apfloat;
+extern crate byteorder;
+extern crate backtrace;
 
 // Note that librustc doesn't actually depend on these crates, see the note in
 // `Cargo.toml` for this crate about why these are here.
@@ -105,13 +126,13 @@ pub mod lint;
 
 pub mod middle {
     pub mod allocator;
+    pub mod borrowck;
     pub mod expr_use_visitor;
     pub mod const_val;
     pub mod cstore;
     pub mod dataflow;
     pub mod dead;
     pub mod dependency_format;
-    pub mod effect;
     pub mod entry;
     pub mod exported_symbols;
     pub mod free_region;
@@ -125,7 +146,6 @@ pub mod middle {
     pub mod recursion_limit;
     pub mod resolve_lifetime;
     pub mod stability;
-    pub mod trans;
     pub mod weak_lang_items;
 }
 

@@ -14,7 +14,7 @@
 // When an executable or dylib image is linked, all user code and libraries are
 // "sandwiched" between these two object files, so code or data from rsbegin.o
 // become first in the respective sections of the image, whereas code and data
-// from rsend.o become the last ones.  This effect can be used to place symbols
+// from rsend.o become the last ones. This effect can be used to place symbols
 // at the beginning or at the end of a section, as well as to insert any required
 // headers or footers.
 //
@@ -30,15 +30,13 @@
 #[lang = "sized"]
 trait Sized {}
 #[lang = "sync"]
-trait Sync {}
-impl Sync for .. {}
+auto trait Sync {}
 #[lang = "copy"]
 trait Copy {}
 #[lang = "freeze"]
-trait Freeze {}
-impl Freeze for .. {}
+auto trait Freeze {}
 
-#[lang="drop_in_place"]
+#[lang = "drop_in_place"]
 #[inline]
 #[allow(unconditional_recursion)]
 pub unsafe fn drop_in_place<T: ?Sized>(to_drop: *mut T) {

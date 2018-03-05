@@ -22,17 +22,18 @@
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 #![feature(custom_attribute)]
+#![feature(fs_read_write)]
 #![allow(unused_attributes)]
 #![feature(i128_type)]
+#![feature(i128)]
+#![feature(inclusive_range)]
+#![feature(inclusive_range_syntax)]
 #![feature(libc)]
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_patterns)]
 #![feature(conservative_impl_trait)]
-
-#![cfg_attr(stage0, feature(const_fn))]
-#![cfg_attr(not(stage0), feature(const_atomic_bool_new))]
-#![cfg_attr(not(stage0), feature(const_once_new))]
+#![feature(optin_builtin_traits)]
 
 use rustc::dep_graph::WorkProduct;
 use syntax_pos::symbol::Symbol;
@@ -41,18 +42,21 @@ use syntax_pos::symbol::Symbol;
 extern crate bitflags;
 extern crate flate2;
 extern crate libc;
-extern crate owning_ref;
 #[macro_use] extern crate rustc;
+extern crate jobserver;
+extern crate num_cpus;
+extern crate rustc_mir;
 extern crate rustc_allocator;
+extern crate rustc_apfloat;
 extern crate rustc_back;
+extern crate rustc_binaryen;
+extern crate rustc_const_math;
 extern crate rustc_data_structures;
+extern crate rustc_demangle;
 extern crate rustc_incremental;
 extern crate rustc_llvm as llvm;
 extern crate rustc_platform_intrinsics as intrinsics;
-extern crate rustc_const_math;
-extern crate rustc_demangle;
-extern crate jobserver;
-extern crate num_cpus;
+extern crate rustc_trans_utils;
 
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
@@ -60,39 +64,47 @@ extern crate syntax_pos;
 extern crate rustc_errors as errors;
 extern crate serialize;
 #[cfg(windows)]
-extern crate gcc; // Used to locate MSVC, not gcc :)
+extern crate cc; // Used to locate MSVC
+extern crate tempdir;
 
-pub use base::trans_crate;
+use back::bytecode::RLIB_BYTECODE_EXTENSION;
 
-pub use metadata::LlvmMetadataLoader;
-pub use llvm_util::{init, target_features, print_version, print_passes, print, enable_llvm_debug};
+pub use llvm_util::target_features;
 
-use std::rc::Rc;
+use std::any::Any;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use rustc_data_structures::sync::Lrc;
 
+use rustc::dep_graph::DepGraph;
 use rustc::hir::def_id::CrateNum;
+use rustc::middle::cstore::MetadataLoader;
 use rustc::middle::cstore::{NativeLibrary, CrateSource, LibSource};
-use rustc::ty::maps::Providers;
+use rustc::session::{Session, CompileIncomplete};
+use rustc::session::config::{OutputFilenames, OutputType, PrintRequest};
+use rustc::ty::{self, TyCtxt};
 use rustc::util::nodemap::{FxHashSet, FxHashMap};
+use rustc_mir::monomorphize;
+use rustc_trans_utils::trans_crate::TransCrate;
 
 mod diagnostics;
 
-pub mod back {
+mod back {
+    pub use rustc_trans_utils::symbol_names;
     mod archive;
+    pub mod bytecode;
     mod command;
-    pub(crate) mod linker;
+    pub mod linker;
     pub mod link;
     mod lto;
-    pub(crate) mod symbol_export;
-    pub(crate) mod symbol_names;
+    pub mod symbol_export;
     pub mod write;
     mod rpath;
 }
 
 mod abi;
-mod adt;
 mod allocator;
 mod asm;
-mod assert_module_sources;
 mod attributes;
 mod base;
 mod builder;
@@ -114,7 +126,6 @@ mod cabi_x86;
 mod cabi_x86_64;
 mod cabi_x86_win64;
 mod callee;
-mod collector;
 mod common;
 mod consts;
 mod context;
@@ -123,85 +134,220 @@ mod declare;
 mod glue;
 mod intrinsic;
 mod llvm_util;
-mod machine;
 mod metadata;
 mod meth;
 mod mir;
-mod monomorphize;
-mod partitioning;
-mod symbol_names_test;
 mod time_graph;
 mod trans_item;
-mod tvec;
 mod type_;
 mod type_of;
 mod value;
 
-pub struct ModuleTranslation {
+pub struct LlvmTransCrate(());
+
+impl !Send for LlvmTransCrate {} // Llvm is on a per-thread basis
+impl !Sync for LlvmTransCrate {}
+
+impl LlvmTransCrate {
+    pub fn new() -> Box<TransCrate> {
+        box LlvmTransCrate(())
+    }
+}
+
+impl TransCrate for LlvmTransCrate {
+    fn init(&self, sess: &Session) {
+        llvm_util::init(sess); // Make sure llvm is inited
+    }
+
+    fn print(&self, req: PrintRequest, sess: &Session) {
+        match req {
+            PrintRequest::RelocationModels => {
+                println!("Available relocation models:");
+                for &(name, _) in back::write::RELOC_MODEL_ARGS.iter() {
+                    println!("    {}", name);
+                }
+                println!("");
+            }
+            PrintRequest::CodeModels => {
+                println!("Available code models:");
+                for &(name, _) in back::write::CODE_GEN_MODEL_ARGS.iter(){
+                    println!("    {}", name);
+                }
+                println!("");
+            }
+            PrintRequest::TlsModels => {
+                println!("Available TLS models:");
+                for &(name, _) in back::write::TLS_MODEL_ARGS.iter(){
+                    println!("    {}", name);
+                }
+                println!("");
+            }
+            req => llvm_util::print(req, sess),
+        }
+    }
+
+    fn print_passes(&self) {
+        llvm_util::print_passes();
+    }
+
+    fn print_version(&self) {
+        llvm_util::print_version();
+    }
+
+    fn diagnostics(&self) -> &[(&'static str, &'static str)] {
+        &DIAGNOSTICS
+    }
+
+    fn target_features(&self, sess: &Session) -> Vec<Symbol> {
+        target_features(sess)
+    }
+
+    fn metadata_loader(&self) -> Box<MetadataLoader> {
+        box metadata::LlvmMetadataLoader
+    }
+
+    fn provide(&self, providers: &mut ty::maps::Providers) {
+        back::symbol_names::provide(providers);
+        back::symbol_export::provide(providers);
+        base::provide(providers);
+        attributes::provide(providers);
+    }
+
+    fn provide_extern(&self, providers: &mut ty::maps::Providers) {
+        back::symbol_export::provide_extern(providers);
+    }
+
+    fn trans_crate<'a, 'tcx>(
+        &self,
+        tcx: TyCtxt<'a, 'tcx, 'tcx>,
+        rx: mpsc::Receiver<Box<Any + Send>>
+    ) -> Box<Any> {
+        box base::trans_crate(tcx, rx)
+    }
+
+    fn join_trans_and_link(
+        &self,
+        trans: Box<Any>,
+        sess: &Session,
+        dep_graph: &DepGraph,
+        outputs: &OutputFilenames,
+    ) -> Result<(), CompileIncomplete>{
+        use rustc::util::common::time;
+        let trans = trans.downcast::<::back::write::OngoingCrateTranslation>()
+            .expect("Expected LlvmTransCrate's OngoingCrateTranslation, found Box<Any>")
+            .join(sess, dep_graph);
+        if sess.opts.debugging_opts.incremental_info {
+            back::write::dump_incremental_data(&trans);
+        }
+
+        time(sess.time_passes(),
+             "serialize work products",
+             move || rustc_incremental::save_work_products(sess, &dep_graph));
+
+        sess.compile_status()?;
+
+        if !sess.opts.output_types.keys().any(|&i| i == OutputType::Exe ||
+                                                   i == OutputType::Metadata) {
+            return Ok(());
+        }
+
+        // Run the linker on any artifacts that resulted from the LLVM run.
+        // This should produce either a finished executable or library.
+        time(sess.time_passes(), "linking", || {
+            back::link::link_binary(sess, &trans, outputs, &trans.crate_name.as_str());
+        });
+
+        // Now that we won't touch anything in the incremental compilation directory
+        // any more, we can finalize it (which involves renaming it)
+        rustc_incremental::finalize_session_directory(sess, trans.link.crate_hash);
+
+        Ok(())
+    }
+}
+
+/// This is the entrypoint for a hot plugged rustc_trans
+#[no_mangle]
+pub fn __rustc_codegen_backend() -> Box<TransCrate> {
+    LlvmTransCrate::new()
+}
+
+struct ModuleTranslation {
     /// The name of the module. When the crate may be saved between
     /// compilations, incremental compilation requires that name be
     /// unique amongst **all** crates.  Therefore, it should contain
     /// something unique to this crate (e.g., a module path) as well
     /// as the crate name and disambiguator.
     name: String,
-    symbol_name_hash: u64,
-    pub source: ModuleSource,
-    pub kind: ModuleKind,
+    llmod_id: String,
+    source: ModuleSource,
+    kind: ModuleKind,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub enum ModuleKind {
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum ModuleKind {
     Regular,
     Metadata,
     Allocator,
 }
 
 impl ModuleTranslation {
-    pub fn into_compiled_module(self, emit_obj: bool, emit_bc: bool) -> CompiledModule {
+    fn llvm(&self) -> Option<&ModuleLlvm> {
+        match self.source {
+            ModuleSource::Translated(ref llvm) => Some(llvm),
+            ModuleSource::Preexisting(_) => None,
+        }
+    }
+
+    fn into_compiled_module(self,
+                                emit_obj: bool,
+                                emit_bc: bool,
+                                emit_bc_compressed: bool,
+                                outputs: &OutputFilenames) -> CompiledModule {
         let pre_existing = match self.source {
             ModuleSource::Preexisting(_) => true,
             ModuleSource::Translated(_) => false,
         };
+        let object = if emit_obj {
+            Some(outputs.temp_path(OutputType::Object, Some(&self.name)))
+        } else {
+            None
+        };
+        let bytecode = if emit_bc {
+            Some(outputs.temp_path(OutputType::Bitcode, Some(&self.name)))
+        } else {
+            None
+        };
+        let bytecode_compressed = if emit_bc_compressed {
+            Some(outputs.temp_path(OutputType::Bitcode, Some(&self.name))
+                    .with_extension(RLIB_BYTECODE_EXTENSION))
+        } else {
+            None
+        };
 
         CompiledModule {
+            llmod_id: self.llmod_id,
             name: self.name.clone(),
             kind: self.kind,
-            symbol_name_hash: self.symbol_name_hash,
             pre_existing,
-            emit_obj,
-            emit_bc,
-        }
-    }
-}
-
-impl Drop for ModuleTranslation {
-    fn drop(&mut self) {
-        match self.source {
-            ModuleSource::Preexisting(_) => {
-                // Nothing to dispose.
-            },
-            ModuleSource::Translated(llvm) => {
-                unsafe {
-                    llvm::LLVMDisposeModule(llvm.llmod);
-                    llvm::LLVMContextDispose(llvm.llcx);
-                }
-            },
+            object,
+            bytecode,
+            bytecode_compressed,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct CompiledModule {
-    pub name: String,
-    pub kind: ModuleKind,
-    pub symbol_name_hash: u64,
-    pub pre_existing: bool,
-    pub emit_obj: bool,
-    pub emit_bc: bool,
+struct CompiledModule {
+    name: String,
+    llmod_id: String,
+    kind: ModuleKind,
+    pre_existing: bool,
+    object: Option<PathBuf>,
+    bytecode: Option<PathBuf>,
+    bytecode_compressed: Option<PathBuf>,
 }
 
-#[derive(Clone)]
-pub enum ModuleSource {
+enum ModuleSource {
     /// Copy the `.o` files or whatever from the incr. comp. directory.
     Preexisting(WorkProduct),
 
@@ -209,52 +355,52 @@ pub enum ModuleSource {
     Translated(ModuleLlvm),
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct ModuleLlvm {
+#[derive(Debug)]
+struct ModuleLlvm {
     llcx: llvm::ContextRef,
-    pub llmod: llvm::ModuleRef,
+    llmod: llvm::ModuleRef,
+    tm: llvm::TargetMachineRef,
 }
 
-unsafe impl Send for ModuleTranslation { }
-unsafe impl Sync for ModuleTranslation { }
+unsafe impl Send for ModuleLlvm { }
+unsafe impl Sync for ModuleLlvm { }
 
-pub struct CrateTranslation {
-    pub crate_name: Symbol,
-    pub modules: Vec<CompiledModule>,
+impl Drop for ModuleLlvm {
+    fn drop(&mut self) {
+        unsafe {
+            llvm::LLVMDisposeModule(self.llmod);
+            llvm::LLVMContextDispose(self.llcx);
+            llvm::LLVMRustDisposeTargetMachine(self.tm);
+        }
+    }
+}
+
+struct CrateTranslation {
+    crate_name: Symbol,
+    modules: Vec<CompiledModule>,
     allocator_module: Option<CompiledModule>,
-    pub link: rustc::middle::cstore::LinkMeta,
-    pub metadata: rustc::middle::cstore::EncodedMetadata,
+    metadata_module: CompiledModule,
+    link: rustc::middle::cstore::LinkMeta,
+    metadata: rustc::middle::cstore::EncodedMetadata,
     windows_subsystem: Option<String>,
     linker_info: back::linker::LinkerInfo,
     crate_info: CrateInfo,
 }
 
 // Misc info we load from metadata to persist beyond the tcx
-pub struct CrateInfo {
+struct CrateInfo {
     panic_runtime: Option<CrateNum>,
     compiler_builtins: Option<CrateNum>,
     profiler_runtime: Option<CrateNum>,
     sanitizer_runtime: Option<CrateNum>,
     is_no_builtins: FxHashSet<CrateNum>,
-    native_libraries: FxHashMap<CrateNum, Rc<Vec<NativeLibrary>>>,
+    native_libraries: FxHashMap<CrateNum, Lrc<Vec<NativeLibrary>>>,
     crate_name: FxHashMap<CrateNum, String>,
-    used_libraries: Rc<Vec<NativeLibrary>>,
-    link_args: Rc<Vec<String>>,
-    used_crate_source: FxHashMap<CrateNum, Rc<CrateSource>>,
+    used_libraries: Lrc<Vec<NativeLibrary>>,
+    link_args: Lrc<Vec<String>>,
+    used_crate_source: FxHashMap<CrateNum, Lrc<CrateSource>>,
     used_crates_static: Vec<(CrateNum, LibSource)>,
     used_crates_dynamic: Vec<(CrateNum, LibSource)>,
 }
 
 __build_diagnostic_array! { librustc_trans, DIAGNOSTICS }
-
-pub fn provide_local(providers: &mut Providers) {
-    back::symbol_names::provide(providers);
-    back::symbol_export::provide_local(providers);
-    base::provide_local(providers);
-}
-
-pub fn provide_extern(providers: &mut Providers) {
-    back::symbol_names::provide(providers);
-    back::symbol_export::provide_extern(providers);
-    base::provide_extern(providers);
-}

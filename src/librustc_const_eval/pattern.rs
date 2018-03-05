@@ -27,6 +27,7 @@ use syntax_pos::Span;
 
 #[derive(Clone, Debug)]
 pub enum PatternError<'tcx> {
+    AssociatedConstInPattern(Span),
     StaticInPattern(Span),
     ConstEval(ConstEvalErr<'tcx>),
 }
@@ -92,7 +93,9 @@ pub enum PatternKind<'tcx> {
         end: RangeEnd,
     },
 
-    /// matches against a slice, checking the length and extracting elements
+    /// matches against a slice, checking the length and extracting elements.
+    /// irrefutable when there is a slice pattern and both `prefix` and `suffix` are empty.
+    /// e.g. `&[ref xs..]`.
     Slice {
         prefix: Vec<Pattern<'tcx>>,
         slice: Option<Pattern<'tcx>>,
@@ -131,7 +134,7 @@ impl<'tcx> fmt::Display for Pattern<'tcx> {
                     BindingMode::ByValue => mutability == Mutability::Mut,
                     BindingMode::ByRef(_, bk) => {
                         write!(f, "ref ")?;
-                        bk == BorrowKind::Mut
+                        match bk { BorrowKind::Mut { .. } => true, _ => false }
                     }
                 };
                 if is_mut {
@@ -150,7 +153,7 @@ impl<'tcx> fmt::Display for Pattern<'tcx> {
                         Some(&adt_def.variants[variant_index])
                     }
                     _ => if let ty::TyAdt(adt, _) = self.ty.sty {
-                        if adt.is_univariant() {
+                        if !adt.is_enum() {
                             Some(&adt.variants[0])
                         } else {
                             None
@@ -280,7 +283,8 @@ impl<'a, 'tcx> Pattern<'tcx> {
         let mut pcx = PatternContext::new(tcx, param_env_and_substs, tables);
         let result = pcx.lower_pattern(pat);
         if !pcx.errors.is_empty() {
-            span_bug!(pat.span, "encountered errors lowering pattern: {:?}", pcx.errors)
+            let msg = format!("encountered errors lowering pattern: {:?}", pcx.errors);
+            tcx.sess.delay_span_bug(pat.span, &msg);
         }
         debug!("Pattern::from_hir({:?}) = {:?}", pat, result);
         result
@@ -301,6 +305,44 @@ impl<'a, 'tcx> PatternContext<'a, 'tcx> {
     }
 
     pub fn lower_pattern(&mut self, pat: &'tcx hir::Pat) -> Pattern<'tcx> {
+        // When implicit dereferences have been inserted in this pattern, the unadjusted lowered
+        // pattern has the type that results *after* dereferencing. For example, in this code:
+        //
+        // ```
+        // match &&Some(0i32) {
+        //     Some(n) => { ... },
+        //     _ => { ... },
+        // }
+        // ```
+        //
+        // the type assigned to `Some(n)` in `unadjusted_pat` would be `Option<i32>` (this is
+        // determined in rustc_typeck::check::match). The adjustments would be
+        //
+        // `vec![&&Option<i32>, &Option<i32>]`.
+        //
+        // Applying the adjustments, we want to instead output `&&Some(n)` (as a HAIR pattern). So
+        // we wrap the unadjusted pattern in `PatternKind::Deref` repeatedly, consuming the
+        // adjustments in *reverse order* (last-in-first-out, so that the last `Deref` inserted
+        // gets the least-dereferenced type).
+        let unadjusted_pat = self.lower_pattern_unadjusted(pat);
+        self.tables
+            .pat_adjustments()
+            .get(pat.hir_id)
+            .unwrap_or(&vec![])
+            .iter()
+            .rev()
+            .fold(unadjusted_pat, |pat, ref_ty| {
+                    debug!("{:?}: wrapping pattern with type {:?}", pat, ref_ty);
+                    Pattern {
+                        span: pat.span,
+                        ty: ref_ty,
+                        kind: Box::new(PatternKind::Deref { subpattern: pat }),
+                    }
+                },
+            )
+    }
+
+    fn lower_pattern_unadjusted(&mut self, pat: &'tcx hir::Pat) -> Pattern<'tcx> {
         let mut ty = self.tables.node_id_to_type(pat.hir_id);
 
         let kind = match pat.node {
@@ -387,7 +429,7 @@ impl<'a, 'tcx> PatternContext<'a, 'tcx> {
                         (Mutability::Not, BindingMode::ByValue),
                     ty::BindByReference(hir::MutMutable) =>
                         (Mutability::Not, BindingMode::ByRef(
-                            region.unwrap(), BorrowKind::Mut)),
+                            region.unwrap(), BorrowKind::Mut { allow_two_phase_borrow: false })),
                     ty::BindByReference(hir::MutImmutable) =>
                         (Mutability::Not, BindingMode::ByRef(
                             region.unwrap(), BorrowKind::Shared)),
@@ -560,7 +602,7 @@ impl<'a, 'tcx> PatternContext<'a, 'tcx> {
             Def::Variant(variant_id) | Def::VariantCtor(variant_id, ..) => {
                 let enum_id = self.tcx.parent_def_id(variant_id).unwrap();
                 let adt_def = self.tcx.adt_def(enum_id);
-                if adt_def.variants.len() > 1 {
+                if adt_def.is_enum() {
                     let substs = match ty.sty {
                         ty::TyAdt(_, substs) |
                         ty::TyFnDef(_, substs) => substs,
@@ -594,6 +636,10 @@ impl<'a, 'tcx> PatternContext<'a, 'tcx> {
                   -> Pattern<'tcx> {
         let ty = self.tables.node_id_to_type(id);
         let def = self.tables.qpath_def(qpath, id);
+        let is_associated_const = match def {
+            Def::AssociatedConst(_) => true,
+            _ => false,
+        };
         let kind = match def {
             Def::Const(def_id) | Def::AssociatedConst(def_id) => {
                 let substs = self.tables.node_substs(id);
@@ -615,7 +661,11 @@ impl<'a, 'tcx> PatternContext<'a, 'tcx> {
                         return pat;
                     }
                     None => {
-                        self.errors.push(PatternError::StaticInPattern(span));
+                        self.errors.push(if is_associated_const {
+                            PatternError::AssociatedConstInPattern(span)
+                        } else {
+                            PatternError::StaticInPattern(span)
+                        });
                         PatternKind::Wild
                     }
                 }

@@ -11,10 +11,11 @@
 #![feature(associated_consts)]
 #![feature(conservative_impl_trait)]
 #![feature(decl_macro)]
-#![allow(warnings)]
+#![allow(private_in_public)]
 
 mod m {
     fn priv_fn() {}
+    static PRIV_STATIC: u8 = 0;
     enum PrivEnum { Variant }
     pub enum PubEnum { Variant }
     trait PrivTrait { fn method() {} }
@@ -47,6 +48,7 @@ mod m {
 
     pub macro m() {
         priv_fn; //~ ERROR type `fn() {m::priv_fn}` is private
+        PRIV_STATIC; // OK, not cross-crate
         PrivEnum::Variant; //~ ERROR type `m::PrivEnum` is private
         PubEnum::Variant; // OK
         <u8 as PrivTrait>::method; //~ ERROR type `fn() {<u8 as m::PrivTrait>::method}` is private
@@ -56,7 +58,7 @@ mod m {
         PubTupleStruct;
         //~^ ERROR type `fn(u8) -> m::PubTupleStruct {m::PubTupleStruct::{{constructor}}}` is privat
         Pub(0u8).priv_method();
-        //~^ ERROR type `fn(&m::Pub<u8>) {<m::Pub<u8>>::priv_method}` is private
+        //~^ ERROR type `for<'r> fn(&'r m::Pub<u8>) {<m::Pub<u8>>::priv_method}` is private
     }
 
     trait Trait {}
@@ -68,6 +70,7 @@ mod m {
     impl<T> TraitWithTyParam<T> for u8 {}
     impl TraitWithTyParam2<Priv> for u8 {}
     impl TraitWithAssocTy for u8 { type AssocTy = Priv; }
+    //~^ ERROR private type `m::Priv` in public interface
 
     pub fn leak_anon1() -> impl Trait + 'static { 0 }
     pub fn leak_anon2() -> impl TraitWithTyParam<Alias> { 0 }
@@ -88,7 +91,7 @@ mod adjust {
     pub struct S3;
 
     impl Deref for S1 {
-        type Target = S2Alias;
+        type Target = S2Alias; //~ ERROR private type `adjust::S2` in public interface
         fn deref(&self) -> &Self::Target { loop {} }
     }
     impl Deref for S2 {
@@ -103,10 +106,11 @@ mod adjust {
 
 fn main() {
     let _: m::Alias; //~ ERROR type `m::Priv` is private
-    let _: <m::Alias as m::TraitWithAssocTy>::AssocTy; // FIXME
+                     //~^ ERROR type `m::Priv` is private
+    let _: <m::Alias as m::TraitWithAssocTy>::AssocTy; //~ ERROR type `m::Priv` is private
     m::Alias {}; //~ ERROR type `m::Priv` is private
     m::Pub { 0: m::Alias {} }; //~ ERROR type `m::Priv` is private
-    m::Pub { 0: loop {} }; // FIXME
+    m::Pub { 0: loop {} }; // OK, `m::Pub` is in value context, so it means Pub<_>, not Pub<Priv>
     m::Pub::static_method; //~ ERROR type `m::Priv` is private
     m::Pub::INHERENT_ASSOC_CONST; //~ ERROR type `m::Priv` is private
     m::Pub(0u8).method_with_substs::<m::Alias>(); //~ ERROR type `m::Priv` is private

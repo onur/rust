@@ -63,7 +63,8 @@ impl FlagComputation {
             &ty::TyFloat(_) |
             &ty::TyUint(_) |
             &ty::TyNever |
-            &ty::TyStr => {
+            &ty::TyStr |
+            &ty::TyForeign(..) => {
             }
 
             // You might think that we could just return TyError for
@@ -91,6 +92,12 @@ impl FlagComputation {
                 self.add_flags(TypeFlags::HAS_LOCAL_NAMES);
                 self.add_substs(&substs.substs);
                 self.add_ty(interior.witness);
+            }
+
+            &ty::TyGeneratorWitness(ref ts) => {
+                let mut computation = FlagComputation::new();
+                computation.add_tys(&ts.skip_binder()[..]);
+                self.add_bound_computation(&computation);
             }
 
             &ty::TyClosure(_, ref substs) => {

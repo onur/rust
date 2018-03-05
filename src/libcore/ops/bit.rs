@@ -120,7 +120,8 @@ not_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 /// ```
 #[lang = "bitand"]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} & {RHS}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} & {RHS}`",
+                         label="no implementation for `{Self} & {RHS}`")]
 pub trait BitAnd<RHS=Self> {
     /// The resulting type after applying the `&` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -201,7 +202,8 @@ bitand_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 /// ```
 #[lang = "bitor"]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} | {RHS}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} | {RHS}`",
+                         label="no implementation for `{Self} | {RHS}`")]
 pub trait BitOr<RHS=Self> {
     /// The resulting type after applying the `|` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -285,7 +287,8 @@ bitor_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 /// ```
 #[lang = "bitxor"]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} ^ {RHS}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} ^ {RHS}`",
+                         label="no implementation for `{Self} ^ {RHS}`")]
 pub trait BitXor<RHS=Self> {
     /// The resulting type after applying the `^` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -365,7 +368,8 @@ bitxor_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 /// ```
 #[lang = "shl"]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} << {RHS}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} << {RHS}`",
+                         label="no implementation for `{Self} << {RHS}`")]
 pub trait Shl<RHS> {
     /// The resulting type after applying the `<<` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -466,7 +470,8 @@ shl_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 isize i128 }
 /// ```
 #[lang = "shr"]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} >> {RHS}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} >> {RHS}`",
+                         label="no implementation for `{Self} >> {RHS}`")]
 pub trait Shr<RHS> {
     /// The resulting type after applying the `>>` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -579,7 +584,8 @@ shr_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
 /// ```
 #[lang = "bitand_assign"]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} &= {Rhs}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} &= {Rhs}`",
+                         label="no implementation for `{Self} &= {Rhs}`")]
 pub trait BitAndAssign<Rhs=Self> {
     /// Performs the `&=` operation.
     #[stable(feature = "op_assign_traits", since = "1.8.0")]
@@ -593,6 +599,8 @@ macro_rules! bitand_assign_impl {
             #[inline]
             fn bitand_assign(&mut self, other: $t) { *self &= other }
         }
+
+        forward_ref_op_assign! { impl BitAndAssign, bitand_assign for $t, $t }
     )+)
 }
 
@@ -624,7 +632,8 @@ bitand_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 /// ```
 #[lang = "bitor_assign"]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} |= {Rhs}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} |= {Rhs}`",
+                         label="no implementation for `{Self} |= {Rhs}`")]
 pub trait BitOrAssign<Rhs=Self> {
     /// Performs the `|=` operation.
     #[stable(feature = "op_assign_traits", since = "1.8.0")]
@@ -638,6 +647,8 @@ macro_rules! bitor_assign_impl {
             #[inline]
             fn bitor_assign(&mut self, other: $t) { *self |= other }
         }
+
+        forward_ref_op_assign! { impl BitOrAssign, bitor_assign for $t, $t }
     )+)
 }
 
@@ -669,7 +680,8 @@ bitor_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 /// ```
 #[lang = "bitxor_assign"]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} ^= {Rhs}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} ^= {Rhs}`",
+                         label="no implementation for `{Self} ^= {Rhs}`")]
 pub trait BitXorAssign<Rhs=Self> {
     /// Performs the `^=` operation.
     #[stable(feature = "op_assign_traits", since = "1.8.0")]
@@ -683,6 +695,8 @@ macro_rules! bitxor_assign_impl {
             #[inline]
             fn bitxor_assign(&mut self, other: $t) { *self ^= other }
         }
+
+        forward_ref_op_assign! { impl BitXorAssign, bitxor_assign for $t, $t }
     )+)
 }
 
@@ -712,7 +726,8 @@ bitxor_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 /// ```
 #[lang = "shl_assign"]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} <<= {Rhs}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} <<= {Rhs}`",
+                         label="no implementation for `{Self} <<= {Rhs}`")]
 pub trait ShlAssign<Rhs> {
     /// Performs the `<<=` operation.
     #[stable(feature = "op_assign_traits", since = "1.8.0")]
@@ -729,6 +744,8 @@ macro_rules! shl_assign_impl {
                 *self <<= other
             }
         }
+
+        forward_ref_op_assign! { impl ShlAssign, shl_assign for $t, $f }
     )
 }
 
@@ -776,7 +793,8 @@ shl_assign_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
 /// ```
 #[lang = "shr_assign"]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented = "no implementation for `{Self} >>= {Rhs}`"]
+#[rustc_on_unimplemented(message="no implementation for `{Self} >>= {Rhs}`",
+                         label="no implementation for `{Self} >>= {Rhs}`")]
 pub trait ShrAssign<Rhs=Self> {
     /// Performs the `>>=` operation.
     #[stable(feature = "op_assign_traits", since = "1.8.0")]
@@ -793,6 +811,8 @@ macro_rules! shr_assign_impl {
                 *self >>= other
             }
         }
+
+        forward_ref_op_assign! { impl ShrAssign, shr_assign for $t, $f }
     )
 }
 

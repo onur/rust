@@ -85,29 +85,15 @@
 #![feature(prelude_import)]
 #![feature(repr_simd, platform_intrinsics)]
 #![feature(rustc_attrs)]
-#![cfg_attr(not(stage0), feature(rustc_const_unstable))]
 #![feature(specialization)]
 #![feature(staged_api)]
 #![feature(unboxed_closures)]
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
-
-#![cfg_attr(not(stage0), feature(const_min_value))]
-#![cfg_attr(not(stage0), feature(const_max_value))]
-#![cfg_attr(not(stage0), feature(const_atomic_bool_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_isize_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_usize_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_i8_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_u8_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_i16_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_u16_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_i32_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_u32_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_i64_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_u64_new))]
-#![cfg_attr(not(stage0), feature(const_unsafe_cell_new))]
-#![cfg_attr(not(stage0), feature(const_cell_new))]
-#![cfg_attr(not(stage0), feature(const_nonzero_new))]
+#![feature(doc_spotlight)]
+#![feature(rustc_const_unstable)]
+#![feature(iterator_repeat_with)]
+#![feature(iterator_flatten)]
 
 #[prelude_import]
 #[allow(unused)]
@@ -175,6 +161,7 @@ pub mod array;
 pub mod sync;
 pub mod cell;
 pub mod char;
+pub mod panic;
 pub mod panicking;
 pub mod iter;
 pub mod option;
@@ -185,8 +172,10 @@ pub mod slice;
 pub mod str;
 pub mod hash;
 pub mod fmt;
+pub mod time;
 
 // note: does not need to be public
 mod char_private;
 mod iter_private;
 mod tuple;
+mod unit;

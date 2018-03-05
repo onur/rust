@@ -80,5 +80,4 @@ pub mod marker {
 }
 
 #[lang = "freeze"]
-trait Freeze {}
-impl Freeze for .. {}
+auto trait Freeze {}

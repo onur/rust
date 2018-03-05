@@ -329,7 +329,6 @@ impl<T> Cell<T> {
     /// let c = Cell::new(5);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(not(stage0), rustc_const_unstable(feature = "const_cell_new"))]
     #[inline]
     pub const fn new(value: T) -> Cell<T> {
         Cell {
@@ -451,7 +450,7 @@ impl<T> Cell<T> {
     /// ```
     #[stable(feature = "move_cell", since = "1.17.0")]
     pub fn into_inner(self) -> T {
-        unsafe { self.value.into_inner() }
+        self.value.into_inner()
     }
 }
 
@@ -544,7 +543,6 @@ impl<T> RefCell<T> {
     /// let c = RefCell::new(5);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(not(stage0), rustc_const_unstable(feature = "const_refcell_new"))]
     #[inline]
     pub const fn new(value: T) -> RefCell<T> {
         RefCell {
@@ -571,7 +569,7 @@ impl<T> RefCell<T> {
         // compiler statically verifies that it is not currently borrowed.
         // Therefore the following assertion is just a `debug_assert!`.
         debug_assert!(self.borrow.get() == UNUSED);
-        unsafe { self.value.into_inner() }
+        self.value.into_inner()
     }
 
     /// Replaces the wrapped value with a new one, returning the old value,
@@ -579,25 +577,50 @@ impl<T> RefCell<T> {
     ///
     /// This function corresponds to [`std::mem::replace`](../mem/fn.replace.html).
     ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently borrowed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    /// let cell = RefCell::new(5);
+    /// let old_value = cell.replace(6);
+    /// assert_eq!(old_value, 5);
+    /// assert_eq!(cell, RefCell::new(6));
+    /// ```
+    #[inline]
+    #[stable(feature = "refcell_replace", since="1.24.0")]
+    pub fn replace(&self, t: T) -> T {
+        mem::replace(&mut *self.borrow_mut(), t)
+    }
+
+    /// Replaces the wrapped value with a new one computed from `f`, returning
+    /// the old value, without deinitializing either one.
+    ///
+    /// This function corresponds to [`std::mem::replace`](../mem/fn.replace.html).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently borrowed.
+    ///
     /// # Examples
     ///
     /// ```
     /// #![feature(refcell_replace_swap)]
     /// use std::cell::RefCell;
-    /// let c = RefCell::new(5);
-    /// let u = c.replace(6);
-    /// assert_eq!(u, 5);
-    /// assert_eq!(c, RefCell::new(6));
+    /// let cell = RefCell::new(5);
+    /// let old_value = cell.replace_with(|&mut old| old + 1);
+    /// assert_eq!(old_value, 5);
+    /// assert_eq!(cell, RefCell::new(6));
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the `RefCell` has any outstanding borrows,
-    /// whether or not they are full mutable borrows.
     #[inline]
     #[unstable(feature = "refcell_replace_swap", issue="43570")]
-    pub fn replace(&self, t: T) -> T {
-        mem::replace(&mut *self.borrow_mut(), t)
+    pub fn replace_with<F: FnOnce(&mut T) -> T>(&self, f: F) -> T {
+        let mut_borrow = &mut *self.borrow_mut();
+        let replacement = f(mut_borrow);
+        mem::replace(mut_borrow, replacement)
     }
 
     /// Swaps the wrapped value of `self` with the wrapped value of `other`,
@@ -605,10 +628,13 @@ impl<T> RefCell<T> {
     ///
     /// This function corresponds to [`std::mem::swap`](../mem/fn.swap.html).
     ///
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
+    ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(refcell_replace_swap)]
     /// use std::cell::RefCell;
     /// let c = RefCell::new(5);
     /// let d = RefCell::new(6);
@@ -616,13 +642,8 @@ impl<T> RefCell<T> {
     /// assert_eq!(c, RefCell::new(6));
     /// assert_eq!(d, RefCell::new(5));
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if either `RefCell` has any outstanding borrows,
-    /// whether or not they are full mutable borrows.
     #[inline]
-    #[unstable(feature = "refcell_replace_swap", issue="43570")]
+    #[stable(feature = "refcell_swap", since="1.24.0")]
     pub fn swap(&self, other: &Self) {
         mem::swap(&mut *self.borrow_mut(), &mut *other.borrow_mut())
     }
@@ -842,6 +863,9 @@ impl<T: ?Sized> !Sync for RefCell<T> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone> Clone for RefCell<T> {
+    /// # Panics
+    ///
+    /// Panics if the value is currently mutably borrowed.
     #[inline]
     fn clone(&self) -> RefCell<T> {
         RefCell::new(self.borrow().clone())
@@ -859,6 +883,9 @@ impl<T:Default> Default for RefCell<T> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized + PartialEq> PartialEq for RefCell<T> {
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
     #[inline]
     fn eq(&self, other: &RefCell<T>) -> bool {
         *self.borrow() == *other.borrow()
@@ -870,26 +897,41 @@ impl<T: ?Sized + Eq> Eq for RefCell<T> {}
 
 #[stable(feature = "cell_ord", since = "1.10.0")]
 impl<T: ?Sized + PartialOrd> PartialOrd for RefCell<T> {
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
     #[inline]
     fn partial_cmp(&self, other: &RefCell<T>) -> Option<Ordering> {
         self.borrow().partial_cmp(&*other.borrow())
     }
 
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
     #[inline]
     fn lt(&self, other: &RefCell<T>) -> bool {
         *self.borrow() < *other.borrow()
     }
 
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
     #[inline]
     fn le(&self, other: &RefCell<T>) -> bool {
         *self.borrow() <= *other.borrow()
     }
 
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
     #[inline]
     fn gt(&self, other: &RefCell<T>) -> bool {
         *self.borrow() > *other.borrow()
     }
 
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
     #[inline]
     fn ge(&self, other: &RefCell<T>) -> bool {
         *self.borrow() >= *other.borrow()
@@ -898,6 +940,9 @@ impl<T: ?Sized + PartialOrd> PartialOrd for RefCell<T> {
 
 #[stable(feature = "cell_ord", since = "1.10.0")]
 impl<T: ?Sized + Ord> Ord for RefCell<T> {
+    /// # Panics
+    ///
+    /// Panics if the value in either `RefCell` is currently borrowed.
     #[inline]
     fn cmp(&self, other: &RefCell<T>) -> Ordering {
         self.borrow().cmp(&*other.borrow())
@@ -1061,9 +1106,11 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
     pub fn map<U: ?Sized, F>(orig: RefMut<'b, T>, f: F) -> RefMut<'b, U>
         where F: FnOnce(&mut T) -> &mut U
     {
+        // FIXME(nll-rfc#40): fix borrow-check
+        let RefMut { value, borrow } = orig;
         RefMut {
-            value: f(orig.value),
-            borrow: orig.borrow,
+            value: f(value),
+            borrow: borrow,
         }
     }
 }
@@ -1190,18 +1237,12 @@ impl<T> UnsafeCell<T> {
     /// let uc = UnsafeCell::new(5);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(not(stage0), rustc_const_unstable(feature = "const_unsafe_cell_new"))]
     #[inline]
     pub const fn new(value: T) -> UnsafeCell<T> {
         UnsafeCell { value: value }
     }
 
     /// Unwraps the value.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because this thread or another thread may currently be
-    /// inspecting the inner value.
     ///
     /// # Examples
     ///
@@ -1210,11 +1251,11 @@ impl<T> UnsafeCell<T> {
     ///
     /// let uc = UnsafeCell::new(5);
     ///
-    /// let five = unsafe { uc.into_inner() };
+    /// let five = uc.into_inner();
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub unsafe fn into_inner(self) -> T {
+    pub fn into_inner(self) -> T {
         self.value
     }
 }

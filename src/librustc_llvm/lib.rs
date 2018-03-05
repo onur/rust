@@ -74,22 +74,19 @@ pub fn AddFunctionAttrStringValue(llfn: ValueRef,
     }
 }
 
-#[repr(C)]
 #[derive(Copy, Clone)]
 pub enum AttributePlace {
+    ReturnValue,
     Argument(u32),
     Function,
 }
 
 impl AttributePlace {
-    pub fn ReturnValue() -> Self {
-        AttributePlace::Argument(0)
-    }
-
     pub fn as_uint(self) -> c_uint {
         match self {
+            AttributePlace::ReturnValue => 0,
+            AttributePlace::Argument(i) => 1 + i,
             AttributePlace::Function => !0,
-            AttributePlace::Argument(i) => i,
         }
     }
 }
@@ -108,7 +105,6 @@ impl FromStr for ArchiveKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "gnu" => Ok(ArchiveKind::K_GNU),
-            "mips64" => Ok(ArchiveKind::K_MIPS64),
             "bsd" => Ok(ArchiveKind::K_BSD),
             "coff" => Ok(ArchiveKind::K_COFF),
             _ => Err(()),
@@ -170,6 +166,11 @@ pub fn SetUnnamedAddr(global: ValueRef, unnamed: bool) {
 pub fn set_thread_local(global: ValueRef, is_thread_local: bool) {
     unsafe {
         LLVMSetThreadLocal(global, is_thread_local as Bool);
+    }
+}
+pub fn set_thread_local_mode(global: ValueRef, mode: ThreadLocalMode) {
+    unsafe {
+        LLVMSetThreadLocalMode(global, mode);
     }
 }
 
@@ -294,11 +295,6 @@ pub unsafe fn twine_to_string(tr: TwineRef) -> String {
     build_string(|s| LLVMRustWriteTwineToString(tr, s)).expect("got a non-UTF8 Twine from LLVM")
 }
 
-pub unsafe fn debug_loc_to_string(c: ContextRef, tr: DebugLocRef) -> String {
-    build_string(|s| LLVMRustWriteDebugLocToString(c, tr, s))
-        .expect("got a non-UTF8 DebugLoc from LLVM")
-}
-
 pub fn initialize_available_targets() {
     macro_rules! init_target(
         ($cfg:meta, $($method:ident),*) => { {
@@ -346,10 +342,6 @@ pub fn initialize_available_targets() {
                  LLVMInitializePowerPCTargetMC,
                  LLVMInitializePowerPCAsmPrinter,
                  LLVMInitializePowerPCAsmParser);
-    init_target!(llvm_component = "pnacl",
-                 LLVMInitializePNaClTargetInfo,
-                 LLVMInitializePNaClTarget,
-                 LLVMInitializePNaClTargetMC);
     init_target!(llvm_component = "systemz",
                  LLVMInitializeSystemZTargetInfo,
                  LLVMInitializeSystemZTarget,

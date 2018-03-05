@@ -14,26 +14,25 @@
        html_playground_url = "https://play.rust-lang.org/")]
 #![deny(warnings)]
 
+#![feature(ascii_ctype)]
 #![feature(rustc_private)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
-#![feature(libc)]
+#![feature(fs_read_write)]
 #![feature(set_stdio)]
 #![feature(slice_patterns)]
 #![feature(test)]
 #![feature(unicode)]
 #![feature(vec_remove_item)]
-#![feature(ascii_ctype)]
+#![feature(entry_and_modify)]
 
 extern crate arena;
 extern crate getopts;
 extern crate env_logger;
-extern crate html_diff;
-extern crate libc;
 extern crate rustc;
 extern crate rustc_data_structures;
 extern crate rustc_const_math;
-extern crate rustc_trans;
+extern crate rustc_trans_utils;
 extern crate rustc_driver;
 extern crate rustc_resolve;
 extern crate rustc_lint;
@@ -48,6 +47,7 @@ extern crate std_unicode;
 #[macro_use] extern crate log;
 extern crate rustc_errors as errors;
 extern crate pulldown_cmark;
+extern crate tempdir;
 
 extern crate serialize as rustc_serialize; // used by deriving
 
@@ -57,14 +57,13 @@ use std::env;
 use std::fmt::Display;
 use std::io;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::mpsc::channel;
 
 use externalfiles::ExternalHtml;
 use rustc::session::search_paths::SearchPaths;
-use rustc::session::config::{ErrorOutputType, RustcOptGroup, nightly_options,
-                             Externs};
+use rustc::session::config::{ErrorOutputType, RustcOptGroup, nightly_options, Externs};
 
 #[macro_use]
 pub mod externalfiles;
@@ -89,10 +88,9 @@ pub mod plugins;
 pub mod visit_ast;
 pub mod visit_lib;
 pub mod test;
+pub mod theme;
 
 use clean::AttributesExt;
-
-use html::markdown::RenderType;
 
 struct Output {
     krate: clean::Crate,
@@ -173,6 +171,9 @@ pub fn opts() -> Vec<RustcOptGroup> {
         stable("no-default", |o| {
             o.optflag("", "no-defaults", "don't run the default passes")
         }),
+        stable("document-private-items", |o| {
+            o.optflag("", "document-private-items", "document private items")
+        }),
         stable("test", |o| o.optflag("", "test", "run code examples as tests")),
         stable("test-args", |o| {
             o.optmulti("", "test-args", "arguments to pass to the test runner",
@@ -240,11 +241,33 @@ pub fn opts() -> Vec<RustcOptGroup> {
                       or `#![doc(html_playground_url=...)]`",
                      "URL")
         }),
-        unstable("enable-commonmark", |o| {
-            o.optflag("", "enable-commonmark", "to enable commonmark doc rendering/testing")
-        }),
         unstable("display-warnings", |o| {
             o.optflag("", "display-warnings", "to print code warnings when testing doc")
+        }),
+        unstable("crate-version", |o| {
+            o.optopt("", "crate-version", "crate version to print into documentation", "VERSION")
+        }),
+        unstable("linker", |o| {
+            o.optopt("", "linker", "linker used for building executable test code", "PATH")
+        }),
+        unstable("sort-modules-by-appearance", |o| {
+            o.optflag("", "sort-modules-by-appearance", "sort modules by where they appear in the \
+                                                         program, rather than alphabetically")
+        }),
+        unstable("themes", |o| {
+            o.optmulti("", "themes",
+                       "additional themes which will be added to the generated docs",
+                       "FILES")
+        }),
+        unstable("theme-checker", |o| {
+            o.optmulti("", "theme-checker",
+                       "check if given theme is valid",
+                       "FILES")
+        }),
+        unstable("resource-suffix", |o| {
+            o.optopt("",
+                     "resource-suffix", "suffix which will be added at the end of resource files",
+                     "PATH")
         }),
     ]
 }
@@ -272,6 +295,9 @@ pub fn main_args(args: &[String]) -> isize {
     // Check for unstable options.
     nightly_options::check_nightly_options(&matches, &opts());
 
+    // check for deprecated options
+    check_deprecated_options(&matches);
+
     if matches.opt_present("h") || matches.opt_present("help") {
         usage("rustdoc");
         return 0;
@@ -288,6 +314,31 @@ pub fn main_args(args: &[String]) -> isize {
         println!("\nDefault passes for rustdoc:");
         for &name in passes::DEFAULT_PASSES {
             println!("{:>20}", name);
+        }
+        return 0;
+    }
+
+    let to_check = matches.opt_strs("theme-checker");
+    if !to_check.is_empty() {
+        let paths = theme::load_css_paths(include_bytes!("html/static/themes/main.css"));
+        let mut errors = 0;
+
+        println!("rustdoc: [theme-checker] Starting tests!");
+        for theme_file in to_check.iter() {
+            print!(" - Checking \"{}\"...", theme_file);
+            let (success, differences) = theme::test_theme_against(theme_file, &paths);
+            if !differences.is_empty() || !success {
+                println!(" FAILED");
+                errors += 1;
+                if !differences.is_empty() {
+                    println!("{}", differences.join("\n"));
+                }
+            } else {
+                println!(" OK");
+            }
+        }
+        if errors != 0 {
+            return 1;
         }
         return 0;
     }
@@ -329,17 +380,12 @@ pub fn main_args(args: &[String]) -> isize {
                                           .collect();
 
     let should_test = matches.opt_present("test");
-    let markdown_input = input.ends_with(".md") || input.ends_with(".markdown");
+    let markdown_input = Path::new(input).extension()
+        .map_or(false, |e| e == "md" || e == "markdown");
 
     let output = matches.opt_str("o").map(|s| PathBuf::from(&s));
     let css_file_extension = matches.opt_str("e").map(|s| PathBuf::from(&s));
     let cfgs = matches.opt_strs("cfg");
-
-    let render_type = if matches.opt_present("enable-commonmark") {
-        RenderType::Pulldown
-    } else {
-        RenderType::Hoedown
-    };
 
     if let Some(ref p) = css_file_extension {
         if !p.is_file() {
@@ -351,13 +397,33 @@ pub fn main_args(args: &[String]) -> isize {
         }
     }
 
+    let mut themes = Vec::new();
+    if matches.opt_present("themes") {
+        let paths = theme::load_css_paths(include_bytes!("html/static/themes/main.css"));
+
+        for (theme_file, theme_s) in matches.opt_strs("themes")
+                                            .iter()
+                                            .map(|s| (PathBuf::from(&s), s.to_owned())) {
+            if !theme_file.is_file() {
+                println!("rustdoc: option --themes arguments must all be files");
+                return 1;
+            }
+            let (success, ret) = theme::test_theme_against(&theme_file, &paths);
+            if !success || !ret.is_empty() {
+                println!("rustdoc: invalid theme: \"{}\"", theme_s);
+                println!("         Check what's wrong with the \"theme-checker\" option");
+                return 1;
+            }
+            themes.push(theme_file);
+        }
+    }
+
     let external_html = match ExternalHtml::load(
             &matches.opt_strs("html-in-header"),
             &matches.opt_strs("html-before-content"),
             &matches.opt_strs("html-after-content"),
             &matches.opt_strs("markdown-before-content"),
-            &matches.opt_strs("markdown-after-content"),
-            render_type) {
+            &matches.opt_strs("markdown-after-content")) {
         Some(eh) => eh,
         None => return 3,
     };
@@ -365,36 +431,40 @@ pub fn main_args(args: &[String]) -> isize {
     let playground_url = matches.opt_str("playground-url");
     let maybe_sysroot = matches.opt_str("sysroot").map(PathBuf::from);
     let display_warnings = matches.opt_present("display-warnings");
+    let linker = matches.opt_str("linker").map(PathBuf::from);
+    let sort_modules_alphabetically = !matches.opt_present("sort-modules-by-appearance");
+    let resource_suffix = matches.opt_str("resource-suffix");
 
     match (should_test, markdown_input) {
         (true, true) => {
-            return markdown::test(input, cfgs, libs, externs, test_args, maybe_sysroot, render_type,
-                                  display_warnings)
+            return markdown::test(input, cfgs, libs, externs, test_args, maybe_sysroot,
+                                  display_warnings, linker)
         }
         (true, false) => {
-            return test::run(input, cfgs, libs, externs, test_args, crate_name, maybe_sysroot,
-                             render_type, display_warnings)
+            return test::run(Path::new(input), cfgs, libs, externs, test_args, crate_name,
+                             maybe_sysroot, display_warnings, linker)
         }
-        (false, true) => return markdown::render(input,
+        (false, true) => return markdown::render(Path::new(input),
                                                  output.unwrap_or(PathBuf::from("doc")),
                                                  &matches, &external_html,
-                                                 !matches.opt_present("markdown-no-toc"),
-                                                 render_type),
+                                                 !matches.opt_present("markdown-no-toc")),
         (false, false) => {}
     }
 
     let output_format = matches.opt_str("w");
-    let res = acquire_input(input, externs, &matches, move |out| {
+    let res = acquire_input(PathBuf::from(input), externs, &matches, move |out| {
         let Output { krate, passes, renderinfo } = out;
         info!("going to format");
         match output_format.as_ref().map(|s| &**s) {
             Some("html") | None => {
                 html::render::run(krate, extern_versions, &external_html, playground_url,
                                   output.unwrap_or(PathBuf::from("doc")),
+                                  resource_suffix.unwrap_or(String::new()),
                                   passes.into_iter().collect(),
                                   css_file_extension,
                                   renderinfo,
-                                  render_type)
+                                  sort_modules_alphabetically,
+                                  themes)
                     .expect("failed to generate documentation");
                 0
             }
@@ -421,7 +491,7 @@ fn print_error<T>(error_message: T) where T: Display {
 
 /// Looks inside the command line arguments to extract the relevant input format
 /// and files and then generates the necessary rustdoc output for formatting.
-fn acquire_input<R, F>(input: &str,
+fn acquire_input<R, F>(input: PathBuf,
                        externs: Externs,
                        matches: &getopts::Matches,
                        f: F)
@@ -473,11 +543,22 @@ fn parse_extern_versions(matches: &getopts::Matches) -> Result<Externs, String> 
 /// generated from the cleaned AST of the crate.
 ///
 /// This form of input will run all of the plug/cleaning passes
-fn rust_input<R, F>(cratefile: &str, externs: Externs, matches: &getopts::Matches, f: F) -> R
+fn rust_input<R, F>(cratefile: PathBuf, externs: Externs, matches: &getopts::Matches, f: F) -> R
 where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
     let mut default_passes = !matches.opt_present("no-defaults");
     let mut passes = matches.opt_strs("passes");
     let mut plugins = matches.opt_strs("plugins");
+
+    // We hardcode in the passes here, as this is a new flag and we
+    // are generally deprecating passes.
+    if matches.opt_present("document-private-items") {
+        default_passes = false;
+
+        passes = vec![
+            String::from("collapse-docs"),
+            String::from("unindent-comments"),
+        ];
+    }
 
     // First, parse the crate and extract all relevant information.
     let mut paths = SearchPaths::new();
@@ -488,9 +569,9 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
     let triple = matches.opt_str("target");
     let maybe_sysroot = matches.opt_str("sysroot").map(PathBuf::from);
     let crate_name = matches.opt_str("crate-name");
+    let crate_version = matches.opt_str("crate-version");
     let plugin_path = matches.opt_str("plugin-path");
 
-    let cr = PathBuf::from(cratefile);
     info!("starting to run rustc");
     let display_warnings = matches.opt_present("display-warnings");
 
@@ -503,14 +584,17 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
         use rustc::session::config::Input;
 
         let (mut krate, renderinfo) =
-            core::run_core(paths, cfgs, externs, Input::File(cr), triple, maybe_sysroot,
-                           display_warnings, force_unstable_if_unmarked);
+            core::run_core(paths, cfgs, externs, Input::File(cratefile), triple, maybe_sysroot,
+                           display_warnings, crate_name.clone(),
+                           force_unstable_if_unmarked);
 
         info!("finished with rustc");
 
         if let Some(name) = crate_name {
             krate.name = name
         }
+
+        krate.version = crate_version;
 
         // Process all of the crate attributes, extracting plugin metadata along
         // with the passes which we are supposed to run.
@@ -567,4 +651,27 @@ where R: 'static + Send, F: 'static + Send + FnOnce(Output) -> R {
         tx.send(f(Output { krate: krate, renderinfo: renderinfo, passes: passes })).unwrap();
     });
     rx.recv().unwrap()
+}
+
+/// Prints deprecation warnings for deprecated options
+fn check_deprecated_options(matches: &getopts::Matches) {
+    let deprecated_flags = [
+       "input-format",
+       "output-format",
+       "plugin-path",
+       "plugins",
+       "no-defaults",
+       "passes",
+    ];
+
+    for flag in deprecated_flags.into_iter() {
+        if matches.opt_present(flag) {
+            eprintln!("WARNING: the '{}' flag is considered deprecated", flag);
+            eprintln!("WARNING: please see https://github.com/rust-lang/rust/issues/44136");
+        }
+    }
+
+    if matches.opt_present("no-defaults") {
+        eprintln!("WARNING: (you may want to use --document-private-items)");
+    }
 }

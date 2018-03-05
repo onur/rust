@@ -136,10 +136,7 @@ impl Iterator for LookupHost {
     fn next(&mut self) -> Option<SocketAddr> {
         loop {
             unsafe {
-                let cur = match self.cur.as_ref() {
-                    None => return None,
-                    Some(c) => c,
-                };
+                let cur = self.cur.as_ref()?;
                 self.cur = cur.ai_next;
                 match sockaddr_to_addr(mem::transmute(cur.ai_addr),
                                        cur.ai_addrlen as usize)
@@ -169,22 +166,9 @@ pub fn lookup_host(host: &str) -> io::Result<LookupHost> {
     hints.ai_socktype = c::SOCK_STREAM;
     let mut res = ptr::null_mut();
     unsafe {
-        match cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), &hints, &mut res)) {
-            Ok(_) => {
-                Ok(LookupHost { original: res, cur: res })
-            },
-            #[cfg(unix)]
-            Err(e) => {
-                // The lookup failure could be caused by using a stale /etc/resolv.conf.
-                // See https://github.com/rust-lang/rust/issues/41570.
-                // We therefore force a reload of the nameserver information.
-                c::res_init();
-                Err(e)
-            },
-            // the cfg is needed here to avoid an "unreachable pattern" warning
-            #[cfg(not(unix))]
-            Err(e) => Err(e),
-        }
+        cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), &hints, &mut res)).map(|_| {
+            LookupHost { original: res, cur: res }
+        })
     }
 }
 

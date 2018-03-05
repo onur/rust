@@ -732,8 +732,8 @@ and [RFC 809] for more details.
 "##,
 
 E0067: r##"
-The left-hand side of a compound assignment expression must be an lvalue
-expression. An lvalue expression represents a memory location and includes
+The left-hand side of a compound assignment expression must be a place
+expression. A place expression represents a memory location and includes
 item paths (ie, namespaced variables), dereferences, indexing expressions,
 and field references.
 
@@ -742,7 +742,7 @@ Let's start with some erroneous code examples:
 ```compile_fail,E0067
 use std::collections::LinkedList;
 
-// Bad: assignment to non-lvalue expression
+// Bad: assignment to non-place expression
 LinkedList::new() += 1;
 
 // ...
@@ -783,14 +783,14 @@ function's return type and the value being returned.
 "##,
 
 E0070: r##"
-The left-hand side of an assignment operator must be an lvalue expression. An
-lvalue expression represents a memory location and can be a variable (with
+The left-hand side of an assignment operator must be a place expression. An
+place expression represents a memory location and can be a variable (with
 optional namespacing), a dereference, an indexing expression or a field
 reference.
 
 More details can be found in the [Expressions] section of the Reference.
 
-[Expressions]: https://doc.rust-lang.org/reference/expressions.html#lvalues-rvalues-and-temporaries
+[Expressions]: https://doc.rust-lang.org/reference/expressions.html#places-rvalues-and-temporaries
 
 Now, we can go further. Here are some erroneous code examples:
 
@@ -806,7 +806,7 @@ fn some_other_func() {}
 
 fn some_function() {
     SOME_CONST = 14; // error : a constant value cannot be changed!
-    1 = 3; // error : 1 isn't a valid lvalue!
+    1 = 3; // error : 1 isn't a valid place!
     some_other_func() = 4; // error : we can't assign value to a function!
     SomeStruct.x = 12; // error : SomeStruct a structure name but it is used
                        // like a variable!
@@ -1715,7 +1715,7 @@ type Foo = Trait<Bar=i32>; // ok!
 "##,
 
 E0192: r##"
-Negative impls are only allowed for traits with default impls. For more
+Negative impls are only allowed for auto traits. For more
 information see the [opt-in builtin traits RFC][RFC 19].
 
 [RFC 19]: https://github.com/rust-lang/rfcs/blob/master/text/0019-opt-in-builtin-traits.md
@@ -1819,54 +1819,6 @@ impl Trait for Foo {
     }
 }
 ```
-"##,
-
-E0197: r##"
-Inherent implementations (one that do not implement a trait but provide
-methods associated with a type) are always safe because they are not
-implementing an unsafe trait. Removing the `unsafe` keyword from the inherent
-implementation will resolve this error.
-
-```compile_fail,E0197
-struct Foo;
-
-// this will cause this error
-unsafe impl Foo { }
-// converting it to this will fix it
-impl Foo { }
-```
-"##,
-
-E0198: r##"
-A negative implementation is one that excludes a type from implementing a
-particular trait. Not being able to use a trait is always a safe operation,
-so negative implementations are always safe and never need to be marked as
-unsafe.
-
-```compile_fail
-#![feature(optin_builtin_traits)]
-
-struct Foo;
-
-// unsafe is unnecessary
-unsafe impl !Clone for Foo { }
-```
-
-This will compile:
-
-```
-#![feature(optin_builtin_traits)]
-
-struct Foo;
-
-trait Enterprise {}
-
-impl Enterprise for .. { }
-
-impl !Enterprise for Foo { }
-```
-
-Please note that negative impls are only allowed for traits with default impls.
 "##,
 
 E0199: r##"
@@ -2455,9 +2407,9 @@ fn main() {
 }
 ```
 
-Send and Sync are an exception to this rule: it's possible to have bounds of
-one non-builtin trait, plus either or both of Send and Sync. For example, the
-following compiles correctly:
+Auto traits such as Send and Sync are an exception to this rule:
+It's possible to have bounds of one non-builtin trait, plus any number of
+auto traits. For example, the following compiles correctly:
 
 ```
 fn main() {
@@ -2531,13 +2483,6 @@ struct Foo { x: bool }
 
 struct Bar<S, T> { x: Foo<S, T> }
 ```
-"##,
-
-E0318: r##"
-Default impls for a trait must be located in the same crate where the trait was
-defined. For more information see the [opt-in builtin traits RFC][RFC 19].
-
-[RFC 19]: https://github.com/rust-lang/rfcs/blob/master/text/0019-opt-in-builtin-traits.md
 "##,
 
 E0321: r##"
@@ -3170,13 +3115,6 @@ impl<T, U> CoerceUnsized<Foo<U>> for Foo<T> where T: CoerceUnsized<U> {}
 Note that in Rust, structs can only contain an unsized type if the field
 containing the unsized type is the last and only unsized type field in the
 struct.
-"##,
-
-E0380: r##"
-Default impls are only allowed for traits with no methods or associated items.
-For more information see the [opt-in builtin traits RFC][RFC 19].
-
-[RFC 19]: https://github.com/rust-lang/rfcs/blob/master/text/0019-opt-in-builtin-traits.md
 "##,
 
 E0390: r##"
@@ -3818,46 +3756,6 @@ let s = Simba { mother: 1, father: 0 }; // ok!
 ```
 "##,
 
-E0562: r##"
-Abstract return types (written `impl Trait` for some trait `Trait`) are only
-allowed as function return types.
-
-Erroneous code example:
-
-```compile_fail,E0562
-#![feature(conservative_impl_trait)]
-
-fn main() {
-    let count_to_ten: impl Iterator<Item=usize> = 0..10;
-    // error: `impl Trait` not allowed outside of function and inherent method
-    //        return types
-    for i in count_to_ten {
-        println!("{}", i);
-    }
-}
-```
-
-Make sure `impl Trait` only appears in return-type position.
-
-```
-#![feature(conservative_impl_trait)]
-
-fn count_to_n(n: usize) -> impl Iterator<Item=usize> {
-    0..n
-}
-
-fn main() {
-    for i in count_to_n(10) {  // ok!
-        println!("{}", i);
-    }
-}
-```
-
-See [RFC 1522] for more details.
-
-[RFC 1522]: https://github.com/rust-lang/rfcs/blob/master/text/1522-conservative-impl-trait.md
-"##,
-
 E0569: r##"
 If an impl has a generic parameter with the `#[may_dangle]` attribute, then
 that impl must be declared as an `unsafe impl.
@@ -3986,6 +3884,10 @@ details.
 "##,
 
 E0599: r##"
+This error occurs when a method is used on a type which doesn't implement it:
+
+Erroneous code example:
+
 ```compile_fail,E0599
 struct Mouth;
 
@@ -4466,12 +4368,13 @@ i_am_a_function();
 "##,
 
 E0619: r##"
+#### Note: this error code is no longer emitted by the compiler.
 The type-checker needed to know the type of an expression, but that type had not
 yet been inferred.
 
 Erroneous code example:
 
-```compile_fail,E0619
+```compile_fail
 let mut x = vec![];
 match x.pop() {
     Some(v) => {
@@ -4602,6 +4505,249 @@ foo.method(); // Ok!
 ```
 "##,
 
+E0638: r##"
+This error indicates that the struct or enum must be matched non-exhaustively
+as it has been marked as `non_exhaustive`.
+
+When applied within a crate, downstream users of the crate will need to use the
+`_` pattern when matching enums and use the `..` pattern when matching structs.
+
+For example, in the below example, since the enum is marked as
+`non_exhaustive`, it is required that downstream crates match non-exhaustively
+on it.
+
+```rust,ignore (pseudo-Rust)
+use std::error::Error as StdError;
+
+#[non_exhaustive] pub enum Error {
+   Message(String),
+   Other,
+}
+
+impl StdError for Error {
+   fn description(&self) -> &str {
+        // This will not error, despite being marked as non_exhaustive, as this
+        // enum is defined within the current crate, it can be matched
+        // exhaustively.
+        match *self {
+           Message(ref s) => s,
+           Other => "other or unknown error",
+        }
+   }
+}
+```
+
+An example of matching non-exhaustively on the above enum is provided below:
+
+```rust,ignore (pseudo-Rust)
+use mycrate::Error;
+
+// This will not error as the non_exhaustive Error enum has been matched with a
+// wildcard.
+match error {
+   Message(ref s) => ...,
+   Other => ...,
+   _ => ...,
+}
+```
+
+Similarly, for structs, match with `..` to avoid this error.
+"##,
+
+E0639: r##"
+This error indicates that the struct or enum cannot be instantiated from
+outside of the defining crate as it has been marked as `non_exhaustive` and as
+such more fields/variants may be added in future that could cause adverse side
+effects for this code.
+
+It is recommended that you look for a `new` function or equivalent in the
+crate's documentation.
+"##,
+
+E0643: r##"
+This error indicates that there is a mismatch between generic parameters and
+impl Trait parameters in a trait declaration versus its impl.
+
+```compile_fail,E0643
+#![feature(universal_impl_trait)]
+trait Foo {
+    fn foo(&self, _: &impl Iterator);
+}
+impl Foo for () {
+    fn foo<U: Iterator>(&self, _: &U) { } // error method `foo` has incompatible
+                                          // signature for trait
+}
+```
+"##,
+
+E0689: r##"
+This error indicates that the numeric value for the method being passed exists
+but the type of the numeric value or binding could not be identified.
+
+The error happens on numeric literals:
+
+```compile_fail,E0689
+2.0.powi(2);
+```
+
+and on numeric bindings without an identified concrete type:
+
+```compile_fail,E0689
+let x = 2.0;
+x.powi(2);  // same error as above
+```
+
+Because of this, you must give the numeric literal or binding a type:
+
+```
+let _ = 2.0_f32.powi(2);
+let x: f32 = 2.0;
+let _ = x.powi(2);
+let _ = (2.0 as f32).powi(2);
+```
+"##,
+
+E0690: r##"
+A struct with the representation hint `repr(transparent)` had zero or more than
+on fields that were not guaranteed to be zero-sized.
+
+Erroneous code example:
+
+```compile_fail,E0690
+#![feature(repr_transparent)]
+
+#[repr(transparent)]
+struct LengthWithUnit<U> { // error: transparent struct needs exactly one
+    value: f32,            //        non-zero-sized field, but has 2
+    unit: U,
+}
+```
+
+Because transparent structs are represented exactly like one of their fields at
+run time, said field must be uniquely determined. If there is no field, or if
+there are multiple fields, it is not clear how the struct should be represented.
+Note that fields of zero-typed types (e.g., `PhantomData`) can also exist
+alongside the field that contains the actual data, they do not count for this
+error. When generic types are involved (as in the above example), an error is
+reported because the type parameter could be non-zero-sized.
+
+To combine `repr(transparent)` with type parameters, `PhantomData` may be
+useful:
+
+```
+#![feature(repr_transparent)]
+
+use std::marker::PhantomData;
+
+#[repr(transparent)]
+struct LengthWithUnit<U> {
+    value: f32,
+    unit: PhantomData<U>,
+}
+```
+"##,
+
+E0691: r##"
+A struct with the `repr(transparent)` representation hint contains a zero-sized
+field that requires non-trivial alignment.
+
+Erroneous code example:
+
+```compile_fail,E0691
+#![feature(repr_transparent, repr_align, attr_literals)]
+
+#[repr(align(32))]
+struct ForceAlign32;
+
+#[repr(transparent)]
+struct Wrapper(f32, ForceAlign32); // error: zero-sized field in transparent
+                                   //        struct has alignment larger than 1
+```
+
+A transparent struct is supposed to be represented exactly like the piece of
+data it contains. Zero-sized fields with different alignment requirements
+potentially conflict with this property. In the example above, `Wrapper` would
+have to be aligned to 32 bytes even though `f32` has a smaller alignment
+requirement.
+
+Consider removing the over-aligned zero-sized field:
+
+```
+#![feature(repr_transparent)]
+
+#[repr(transparent)]
+struct Wrapper(f32);
+```
+
+Alternatively, `PhantomData<T>` has alignment 1 for all `T`, so you can use it
+if you need to keep the field for some reason:
+
+```
+#![feature(repr_transparent, repr_align, attr_literals)]
+
+use std::marker::PhantomData;
+
+#[repr(align(32))]
+struct ForceAlign32;
+
+#[repr(transparent)]
+struct Wrapper(f32, PhantomData<ForceAlign32>);
+```
+
+Note that empty arrays `[T; 0]` have the same alignment requirement as the
+element type `T`. Also note that the error is conservatively reported even when
+the alignment of the zero-sized type is less than or equal to the data field's
+alignment.
+"##,
+
+
+E0908: r##"
+A method was called on a raw pointer whose inner type wasn't completely known.
+
+For example, you may have done something like:
+
+```compile_fail
+# #![deny(warnings)]
+let foo = &1;
+let bar = foo as *const _;
+if bar.is_null() {
+    // ...
+}
+```
+
+Here, the type of `bar` isn't known; it could be a pointer to anything. Instead,
+specify a type for the pointer (preferably something that makes sense for the
+thing you're pointing to):
+
+```
+let foo = &1;
+let bar = foo as *const i32;
+if bar.is_null() {
+    // ...
+}
+```
+
+Even though `is_null()` exists as a method on any raw pointer, Rust shows this
+error because  Rust allows for `self` to have arbitrary types (behind the
+arbitrary_self_types feature flag).
+
+This means that someone can specify such a function:
+
+```ignore (cannot-doctest-feature-doesnt-exist-yet)
+impl Foo {
+    fn is_null(self: *const Self) -> bool {
+        // do something else
+    }
+}
+```
+
+and now when you call `.is_null()` on a raw pointer to `Foo`, there's ambiguity.
+
+Given that we don't know what type the pointer is, and there's potential
+ambiguity for some types, we disallow calling methods on raw pointers when
+the type is unknown.
+"##,
+
 }
 
 register_diagnostics! {
@@ -4656,25 +4802,29 @@ register_diagnostics! {
 //  E0240,
 //  E0241,
 //  E0242,
-    E0245, // not a trait
+//  E0245, // not a trait
 //  E0246, // invalid recursive type
 //  E0247,
 //  E0248, // value used as a type, now reported earlier during resolution as E0412
 //  E0249,
+    E0307, // invalid method `self` type
 //  E0319, // trait impls for defaulted traits allowed just for structs/enums
 //  E0372, // coherence not object safe
     E0377, // the trait `CoerceUnsized` may only be implemented for a coercion
            // between structures with the same definition
-    E0521, // redundant default implementations of trait
     E0533, // `{}` does not name a unit variant, unit struct or a constant
 //  E0563, // cannot determine a type for this `impl Trait`: {} // removed in 6383de15
     E0564, // only named lifetimes are allowed in `impl Trait`,
            // but `{}` was found in the type `{}`
-    E0567, // auto traits can not have type parameters
-    E0568, // auto-traits can not have predicates,
     E0587, // struct has conflicting packed and align representation hints
     E0588, // packed struct cannot transitively contain a `[repr(align)]` struct
     E0592, // duplicate definitions with name `{}`
 //  E0613, // Removed (merged with E0609)
+    E0640, // infer outlives
     E0627, // yield statement outside of generator literal
+    E0632, // cannot provide explicit type parameters when `impl Trait` is used in
+           // argument position.
+    E0641, // cannot cast to/from a pointer with an unknown kind
+    E0645, // trait aliases not finished
+    E0907, // type inside generator must be known in this context
 }

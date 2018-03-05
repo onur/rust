@@ -25,7 +25,7 @@ use pattern::{PatternFoldable, PatternFolder};
 
 use rustc::hir::def_id::DefId;
 use rustc::hir::RangeEnd;
-use rustc::ty::{self, AdtKind, Ty, TyCtxt, TypeFoldable};
+use rustc::ty::{self, Ty, TyCtxt, TypeFoldable};
 
 use rustc::mir::Field;
 use rustc::util::common::ErrorReported;
@@ -202,21 +202,33 @@ impl<'a, 'tcx> MatchCheckCtxt<'a, 'tcx> {
 
     fn is_uninhabited(&self, ty: Ty<'tcx>) -> bool {
         if self.tcx.sess.features.borrow().never_type {
-            ty.is_uninhabited_from(self.module, self.tcx)
+            self.tcx.is_ty_uninhabited_from(self.module, ty)
         } else {
             false
         }
     }
 
+    fn is_non_exhaustive_enum(&self, ty: Ty<'tcx>) -> bool {
+        match ty.sty {
+            ty::TyAdt(adt_def, ..) => adt_def.is_enum() && adt_def.is_non_exhaustive(),
+            _ => false,
+        }
+    }
+
+    fn is_local(&self, ty: Ty<'tcx>) -> bool {
+        match ty.sty {
+            ty::TyAdt(adt_def, ..) => adt_def.did.is_local(),
+            _ => false,
+        }
+    }
+
     fn is_variant_uninhabited(&self,
                               variant: &'tcx ty::VariantDef,
-                              substs: &'tcx ty::subst::Substs<'tcx>) -> bool
+                              substs: &'tcx ty::subst::Substs<'tcx>)
+                              -> bool
     {
         if self.tcx.sess.features.borrow().never_type {
-            let forest = variant.uninhabited_from(
-                &mut FxHashMap::default(), self.tcx, substs, AdtKind::Enum
-            );
-            forest.contains(self.tcx, self.module)
+            self.tcx.is_enum_variant_uninhabited_from(self.module, variant, substs)
         } else {
             false
         }
@@ -243,7 +255,7 @@ impl<'tcx> Constructor<'tcx> {
         match self {
             &Variant(vid) => adt.variant_index_with_id(vid),
             &Single => {
-                assert_eq!(adt.variants.len(), 1);
+                assert!(!adt.is_enum());
                 0
             }
             _ => bug!("bad constructor {:?} for adt {:?}", self, adt)
@@ -344,7 +356,7 @@ impl<'tcx> Witness<'tcx> {
                     }).collect();
 
                     if let ty::TyAdt(adt, substs) = ty.sty {
-                        if adt.variants.len() > 1 {
+                        if adt.is_enum() {
                             PatternKind::Variant {
                                 adt_def: adt,
                                 substs,
@@ -432,7 +444,7 @@ fn all_constructors<'a, 'tcx: 'a>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
                 (0..pcx.max_slice_length+1).map(|length| Slice(length)).collect()
             }
         }
-        ty::TyAdt(def, substs) if def.is_enum() && def.variants.len() != 1 => {
+        ty::TyAdt(def, substs) if def.is_enum() => {
             def.variants.iter()
                 .filter(|v| !cx.is_variant_uninhabited(v, substs))
                 .map(|v| Variant(v.did))
@@ -549,19 +561,25 @@ fn max_slice_length<'p, 'a: 'p, 'tcx: 'a, I>(
 ///   (1) all_constructors will only return constructors that are statically
 ///       possible. eg. it will only return Ok for Result<T, !>
 ///
-/// Whether a vector `v` of patterns is 'useful' in relation to a set of such
-/// vectors `m` is defined as there being a set of inputs that will match `v`
-/// but not any of the sets in `m`.
+/// This finds whether a (row) vector `v` of patterns is 'useful' in relation
+/// to a set of such vectors `m` - this is defined as there being a set of
+/// inputs that will match `v` but not any of the sets in `m`.
+///
+/// All the patterns at each column of the `matrix ++ v` matrix must
+/// have the same type, except that wildcard (PatternKind::Wild) patterns
+/// with type TyErr are also allowed, even if the "type of the column"
+/// is not TyErr. That is used to represent private fields, as using their
+/// real type would assert that they are inhabited.
 ///
 /// This is used both for reachability checking (if a pattern isn't useful in
 /// relation to preceding patterns, it is not reachable) and exhaustiveness
 /// checking (if a wildcard pattern is useful in relation to a matrix, the
 /// matrix isn't exhaustive).
 pub fn is_useful<'p, 'a: 'p, 'tcx: 'a>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
-                           matrix: &Matrix<'p, 'tcx>,
-                           v: &[&'p Pattern<'tcx>],
-                           witness: WitnessPreference)
-                           -> Usefulness<'tcx> {
+                                       matrix: &Matrix<'p, 'tcx>,
+                                       v: &[&'p Pattern<'tcx>],
+                                       witness: WitnessPreference)
+                                       -> Usefulness<'tcx> {
     let &Matrix(ref rows) = matrix;
     debug!("is_useful({:?}, {:?})", matrix, v);
 
@@ -584,6 +602,25 @@ pub fn is_useful<'p, 'a: 'p, 'tcx: 'a>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
     assert!(rows.iter().all(|r| r.len() == v.len()));
 
     let pcx = PatternContext {
+        // TyErr is used to represent the type of wildcard patterns matching
+        // against inaccessible (private) fields of structs, so that we won't
+        // be able to observe whether the types of the struct's fields are
+        // inhabited.
+        //
+        // If the field is truly inaccessible, then all the patterns
+        // matching against it must be wildcard patterns, so its type
+        // does not matter.
+        //
+        // However, if we are matching against non-wildcard patterns, we
+        // need to know the real type of the field so we can specialize
+        // against it. This primarily occurs through constants - they
+        // can include contents for fields that are inaccessible at the
+        // location of the match. In that case, the field's type is
+        // inhabited - by the constant - so we can just use it.
+        //
+        // FIXME: this might lead to "unstable" behavior with macro hygiene
+        // introducing uninhabited patterns for inaccessible fields. We
+        // need to figure out how to model that.
         ty: rows.iter().map(|r| r[0].ty).find(|ty| !ty.references_error())
             .unwrap_or(v[0].ty),
         max_slice_length: max_slice_length(cx, rows.iter().map(|r| r[0]).chain(Some(v[0])))
@@ -630,9 +667,16 @@ pub fn is_useful<'p, 'a: 'p, 'tcx: 'a>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
 
         let is_privately_empty =
             all_ctors.is_empty() && !cx.is_uninhabited(pcx.ty);
-        debug!("missing_ctors={:?} is_privately_empty={:?}", missing_ctors,
-               is_privately_empty);
-        if missing_ctors.is_empty() && !is_privately_empty {
+        let is_declared_nonexhaustive =
+            cx.is_non_exhaustive_enum(pcx.ty) && !cx.is_local(pcx.ty);
+        debug!("missing_ctors={:?} is_privately_empty={:?} is_declared_nonexhaustive={:?}",
+               missing_ctors, is_privately_empty, is_declared_nonexhaustive);
+
+        // For privately empty and non-exhaustive enums, we work as if there were an "extra"
+        // `_` constructor for the type, so we can never match over all constructors.
+        let is_non_exhaustive = is_privately_empty || is_declared_nonexhaustive;
+
+        if missing_ctors.is_empty() && !is_non_exhaustive {
             all_ctors.into_iter().map(|c| {
                 is_useful_specialized(cx, matrix, v, c.clone(), pcx.ty, witness)
             }).find(|result| result.is_useful()).unwrap_or(NotUseful)
@@ -647,7 +691,51 @@ pub fn is_useful<'p, 'a: 'p, 'tcx: 'a>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
             match is_useful(cx, &matrix, &v[1..], witness) {
                 UsefulWithWitness(pats) => {
                     let cx = &*cx;
-                    let new_witnesses = if used_ctors.is_empty() {
+                    // In this case, there's at least one "free"
+                    // constructor that is only matched against by
+                    // wildcard patterns.
+                    //
+                    // There are 2 ways we can report a witness here.
+                    // Commonly, we can report all the "free"
+                    // constructors as witnesses, e.g. if we have:
+                    //
+                    // ```
+                    //     enum Direction { N, S, E, W }
+                    //     let Direction::N = ...;
+                    // ```
+                    //
+                    // we can report 3 witnesses: `S`, `E`, and `W`.
+                    //
+                    // However, there are 2 cases where we don't want
+                    // to do this and instead report a single `_` witness:
+                    //
+                    // 1) If the user is matching against a non-exhaustive
+                    // enum, there is no point in enumerating all possible
+                    // variants, because the user can't actually match
+                    // against them himself, e.g. in an example like:
+                    // ```
+                    //     let err: io::ErrorKind = ...;
+                    //     match err {
+                    //         io::ErrorKind::NotFound => {},
+                    //     }
+                    // ```
+                    // we don't want to show every possible IO error,
+                    // but instead have `_` as the witness (this is
+                    // actually *required* if the user specified *all*
+                    // IO errors, but is probably what we want in every
+                    // case).
+                    //
+                    // 2) If the user didn't actually specify a constructor
+                    // in this arm, e.g. in
+                    // ```
+                    //     let x: (Direction, Direction, bool) = ...;
+                    //     let (_, _, false) = x;
+                    // ```
+                    // we don't want to show all 16 possible witnesses
+                    // `(<direction-1>, <direction-2>, true)` - we are
+                    // satisfied with `(_, _, true)`. In this case,
+                    // `used_ctors` is empty.
+                    let new_witnesses = if is_non_exhaustive || used_ctors.is_empty() {
                         // All constructors are unused. Add wild patterns
                         // rather than each individual constructor
                         pats.into_iter().map(|mut witness| {
@@ -790,7 +878,7 @@ fn constructor_sub_pattern_tys<'a, 'tcx: 'a>(cx: &MatchCheckCtxt<'a, 'tcx>,
         ty::TyAdt(adt, substs) => {
             if adt.is_box() {
                 // Use T as the sub pattern type of Box<T>.
-                vec![substs[0].as_type().unwrap()]
+                vec![substs.type_at(0)]
             } else {
                 adt.variants[ctor.variant_index_for_adt(adt)].fields.iter().map(|field| {
                     let is_visible = adt.is_enum()
@@ -798,13 +886,13 @@ fn constructor_sub_pattern_tys<'a, 'tcx: 'a>(cx: &MatchCheckCtxt<'a, 'tcx>,
                     if is_visible {
                         field.ty(cx.tcx, substs)
                     } else {
-                        // Treat all non-visible fields as nil. They
+                        // Treat all non-visible fields as TyErr. They
                         // can't appear in any other pattern from
                         // this match (because they are private),
                         // so their type does not matter - but
                         // we don't want to know they are
                         // uninhabited.
-                        cx.tcx.mk_nil()
+                        cx.tcx.types.err
                     }
                 }).collect()
             }

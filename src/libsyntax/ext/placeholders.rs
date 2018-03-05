@@ -32,7 +32,8 @@ pub fn placeholder(kind: ExpansionKind, id: ast::NodeId) -> Expansion {
 
     let ident = keywords::Invalid.ident();
     let attrs = Vec::new();
-    let vis = ast::Visibility::Inherited;
+    let generics = ast::Generics::default();
+    let vis = dummy_spanned(ast::VisibilityKind::Inherited);
     let span = DUMMY_SP;
     let expr_placeholder = || P(ast::Expr {
         id, span,
@@ -49,12 +50,12 @@ pub fn placeholder(kind: ExpansionKind, id: ast::NodeId) -> Expansion {
             tokens: None,
         }))),
         ExpansionKind::TraitItems => Expansion::TraitItems(SmallVector::one(ast::TraitItem {
-            id, span, ident, attrs,
+            id, span, ident, attrs, generics,
             node: ast::TraitItemKind::Macro(mac_placeholder()),
             tokens: None,
         })),
         ExpansionKind::ImplItems => Expansion::ImplItems(SmallVector::one(ast::ImplItem {
-            id, span, ident, vis, attrs,
+            id, span, ident, vis, attrs, generics,
             node: ast::ImplItemKind::Macro(mac_placeholder()),
             defaultness: ast::Defaultness::Final,
             tokens: None,

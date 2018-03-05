@@ -229,7 +229,7 @@
 
 // Turn warnings into errors, but only after stage0, where it can be useful for
 // code to emit warnings during language transitions
-#![deny(warnings)]
+#![cfg_attr(not(stage0), deny(warnings))]
 
 // std may use features in a platform-specific way
 #![allow(unused_features)]
@@ -243,7 +243,10 @@
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
 #![feature(align_offset)]
+#![feature(array_error_internals)]
+#![feature(ascii_ctype)]
 #![feature(asm)]
+#![feature(attr_literals)]
 #![feature(box_syntax)]
 #![feature(cfg_target_has_atomic)]
 #![feature(cfg_target_thread_local)]
@@ -257,6 +260,9 @@
 #![feature(core_intrinsics)]
 #![feature(dropck_eyepatch)]
 #![feature(exact_size_is_empty)]
+#![feature(external_doc)]
+#![feature(fs_read_write)]
+#![feature(fixed_size_array)]
 #![feature(float_from_str_radix)]
 #![feature(fn_traits)]
 #![feature(fnbox)]
@@ -283,50 +289,41 @@
 #![feature(on_unimplemented)]
 #![feature(oom)]
 #![feature(optin_builtin_traits)]
+#![feature(panic_internals)]
 #![feature(panic_unwind)]
 #![feature(peek)]
 #![feature(placement_in_syntax)]
 #![feature(placement_new_protocol)]
 #![feature(prelude_import)]
+#![feature(ptr_internals)]
 #![feature(rand)]
 #![feature(raw)]
-#![feature(repr_simd)]
 #![feature(rustc_attrs)]
-#![cfg_attr(not(stage0), feature(rustc_const_unstable))]
-#![feature(shared)]
 #![feature(sip_hash_13)]
 #![feature(slice_bytes)]
 #![feature(slice_concat_ext)]
+#![feature(slice_internals)]
 #![feature(slice_patterns)]
 #![feature(staged_api)]
 #![feature(stmt_expr_attributes)]
 #![feature(str_char)]
 #![feature(str_internals)]
 #![feature(str_utf16)]
+#![feature(termination_trait)]
 #![feature(test, rustc_private)]
 #![feature(thread_local)]
 #![feature(toowned_clone_into)]
 #![feature(try_from)]
 #![feature(unboxed_closures)]
 #![feature(unicode)]
-#![feature(unique)]
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
 #![feature(vec_push_all)]
 #![feature(doc_cfg)]
 #![feature(doc_masked)]
+#![feature(doc_spotlight)]
 #![cfg_attr(test, feature(update_panic_count))]
-
-#![cfg_attr(not(stage0), feature(const_max_value))]
-#![cfg_attr(not(stage0), feature(const_atomic_bool_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_isize_new))]
-#![cfg_attr(not(stage0), feature(const_atomic_usize_new))]
-#![cfg_attr(all(not(stage0), windows), feature(const_atomic_ptr_new))]
-#![cfg_attr(not(stage0), feature(const_unsafe_cell_new))]
-#![cfg_attr(not(stage0), feature(const_cell_new))]
-#![cfg_attr(not(stage0), feature(const_once_new))]
-#![cfg_attr(not(stage0), feature(const_ptr_null))]
-#![cfg_attr(not(stage0), feature(const_ptr_null_mut))]
+#![cfg_attr(windows, feature(used))]
 
 #![default_lib_allocator]
 
@@ -352,17 +349,15 @@ use prelude::v1::*;
 
 // Access to Bencher, etc.
 #[cfg(test)] extern crate test;
+#[cfg(test)] extern crate rand;
 
-// We want to reexport a few macros from core but libcore has already been
+// We want to re-export a few macros from core but libcore has already been
 // imported by the compiler (via our #[no_std] attribute) In this case we just
-// add a new crate name so we can attach the reexports to it.
+// add a new crate name so we can attach the re-exports to it.
 #[macro_reexport(assert, assert_eq, assert_ne, debug_assert, debug_assert_eq,
                  debug_assert_ne, unreachable, unimplemented, write, writeln, try)]
 extern crate core as __core;
 
-#[doc(masked)]
-#[allow(deprecated)]
-extern crate rand as core_rand;
 #[macro_use]
 #[macro_reexport(vec, format)]
 extern crate alloc;
@@ -395,7 +390,7 @@ mod macros;
 // The Rust prelude
 pub mod prelude;
 
-// Public module declarations and reexports
+// Public module declarations and re-exports
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::any;
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -500,23 +495,11 @@ mod sys;
 
 // Private support modules
 mod panicking;
-mod rand;
 mod memchr;
 
 // The runtime entry point and a few unstable public functions used by the
 // compiler
 pub mod rt;
-
-// Some external utilities of the standard library rely on randomness (aka
-// rustc_back::TempDir and tests) and need a way to get at the OS rng we've got
-// here. This module is not at all intended for stabilization as-is, however,
-// but it may be stabilized long-term. As a result we're exposing a hidden,
-// unstable module so we can get our build working.
-#[doc(hidden)]
-#[unstable(feature = "rand", issue = "27703")]
-pub mod __rand {
-    pub use rand::{thread_rng, ThreadRng, Rng};
-}
 
 // Include a number of private modules that exist solely to provide
 // the rustdoc documentation for primitive types. Using `include!`

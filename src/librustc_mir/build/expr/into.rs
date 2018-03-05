@@ -22,7 +22,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
     /// Compile `expr`, storing the result into `destination`, which
     /// is assumed to be uninitialized.
     pub fn into_expr(&mut self,
-                     destination: &Lvalue<'tcx>,
+                     destination: &Place<'tcx>,
                      mut block: BasicBlock,
                      expr: Expr<'tcx>)
                      -> BlockAnd<()>
@@ -38,9 +38,10 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         let source_info = this.source_info(expr_span);
 
         match expr.kind {
-            ExprKind::Scope { region_scope, value } => {
+            ExprKind::Scope { region_scope, lint_level, value } => {
                 let region_scope = (region_scope, source_info);
-                this.in_scope(region_scope, block, |this| this.into(destination, block, value))
+                this.in_scope(region_scope, lint_level, block,
+                              |this| this.into(destination, block, value))
             }
             ExprKind::Block { body: ast_block } => {
                 this.ast_block(destination, block, ast_block, source_info)
@@ -103,8 +104,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 // Or:
                 //
                 // [block: If(lhs)] -false-> [else_block: If(rhs)] -true-> [true_block]
-                //        |                          | (false)
-                //        +----------true------------+-------------------> [false_block]
+                //        | (true)                   | (false)
+                //  [true_block]               [false_block]
 
                 let (true_block, false_block, mut else_block, join_block) =
                     (this.cfg.start_new_block(), this.cfg.start_new_block(),
@@ -146,20 +147,24 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 join_block.unit()
             }
             ExprKind::Loop { condition: opt_cond_expr, body } => {
-                // [block] --> [loop_block] ~~> [loop_block_end] -1-> [exit_block]
-                //                  ^                  |
-                //                  |                  0
-                //                  |                  |
-                //                  |                  v
-                //           [body_block_end] <~~~ [body_block]
+                // [block] --> [loop_block] -/eval. cond./-> [loop_block_end] -1-> [exit_block]
+                //                  ^                               |
+                //                  |                               0
+                //                  |                               |
+                //                  |                               v
+                //           [body_block_end] <-/eval. body/-- [body_block]
                 //
                 // If `opt_cond_expr` is `None`, then the graph is somewhat simplified:
                 //
-                // [block] --> [loop_block / body_block ] ~~> [body_block_end]    [exit_block]
-                //                         ^                          |
-                //                         |                          |
-                //                         +--------------------------+
-                //
+                // [block]
+                //    |
+                //   [loop_block] -> [body_block] -/eval. body/-> [body_block_end]
+                //    |        ^                                         |
+                // false link  |                                         |
+                //    |        +-----------------------------------------+
+                //    +-> [diverge_cleanup]
+                // The false link is required to make sure borrowck considers unwinds through the
+                // body, even when the exact code in the body cannot unwind
 
                 let loop_block = this.cfg.start_new_block();
                 let exit_block = this.cfg.start_new_block();
@@ -187,7 +192,13 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                             // always `()` anyway
                             this.cfg.push_assign_unit(exit_block, source_info, destination);
                         } else {
-                            body_block = loop_block;
+                            body_block = this.cfg.start_new_block();
+                            let diverge_cleanup = this.diverge_cleanup();
+                            this.cfg.terminate(loop_block, source_info,
+                                               TerminatorKind::FalseUnwind {
+                                                   real_target: body_block,
+                                                   unwind: Some(diverge_cleanup)
+                                               })
                         }
 
                         // The “return” value of the loop body must always be an unit. We therefore
@@ -227,9 +238,22 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                     let val = args.next().expect("1 argument to `move_val_init`");
                     assert!(args.next().is_none(), ">2 arguments to `move_val_init`");
 
-                    let topmost_scope = this.topmost_scope();
-                    let ptr = unpack!(block = this.as_temp(block, Some(topmost_scope), ptr));
-                    this.into(&Lvalue::Local(ptr).deref(), block, val)
+                    let ptr = this.hir.mirror(ptr);
+                    let ptr_ty = ptr.ty;
+                    // Create an *internal* temp for the pointer, so that unsafety
+                    // checking won't complain about the raw pointer assignment.
+                    let ptr_temp = this.local_decls.push(LocalDecl {
+                        mutability: Mutability::Mut,
+                        ty: ptr_ty,
+                        name: None,
+                        source_info,
+                        syntactic_scope: source_info.scope,
+                        internal: true,
+                        is_user_variable: false
+                    });
+                    let ptr_temp = Place::Local(ptr_temp);
+                    let block = unpack!(this.into(&ptr_temp, block, ptr));
+                    this.into(&ptr_temp.deref(), block, val)
                 } else {
                     let args: Vec<_> =
                         args.into_iter()
@@ -241,7 +265,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                     this.cfg.terminate(block, source_info, TerminatorKind::Call {
                         func: fun,
                         args,
-                        cleanup,
+                        cleanup: Some(cleanup),
                         destination: if diverges {
                             None
                         } else {
@@ -258,8 +282,10 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             ExprKind::Continue { .. } |
             ExprKind::Break { .. } |
             ExprKind::InlineAsm { .. } |
-            ExprKind::Return {.. } => {
-                this.stmt_expr(block, expr)
+            ExprKind::Return { .. } => {
+                unpack!(block = this.stmt_expr(block, expr));
+                this.cfg.push_assign_unit(block, source_info, destination);
+                block.unit()
             }
 
             // these are the cases that are more naturally handled by some other mode

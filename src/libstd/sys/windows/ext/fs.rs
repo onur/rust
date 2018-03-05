@@ -32,7 +32,7 @@ pub trait FileExt {
     /// function, it is set to the end of the read.
     ///
     /// Reading beyond the end of the file will always return with a length of
-    /// 0.
+    /// 0\.
     ///
     /// Note that similar to `File::read`, it is not an error to return with a
     /// short read. When returning from such a short read, the file pointer is
@@ -393,8 +393,8 @@ pub trait MetadataExt {
     /// to. For a directory, the structure specifies when the directory was
     /// created.
     ///
-    /// If the underlying filesystem does not support the last write time
-    /// time, the returned value is 0.
+    /// If the underlying filesystem does not support the last write time,
+    /// the returned value is 0.
     ///
     /// # Examples
     ///
@@ -443,6 +443,24 @@ impl MetadataExt for Metadata {
     fn last_access_time(&self) -> u64 { self.as_inner().accessed_u64() }
     fn last_write_time(&self) -> u64 { self.as_inner().modified_u64() }
     fn file_size(&self) -> u64 { self.as_inner().size() }
+}
+
+/// Add support for the Windows specific fact that a symbolic link knows whether it is a file
+/// or directory.
+#[unstable(feature = "windows_file_type_ext", issue = "0")]
+pub trait FileTypeExt {
+    /// Returns whether this file type is a symbolic link that is also a directory.
+    #[unstable(feature = "windows_file_type_ext", issue = "0")]
+    fn is_symlink_dir(&self) -> bool;
+    /// Returns whether this file type is a symbolic link that is also a file.
+    #[unstable(feature = "windows_file_type_ext", issue = "0")]
+    fn is_symlink_file(&self) -> bool;
+}
+
+#[unstable(feature = "windows_file_type_ext", issue = "0")]
+impl FileTypeExt for fs::FileType {
+    fn is_symlink_dir(&self) -> bool { self.as_inner().is_symlink_dir() }
+    fn is_symlink_file(&self) -> bool { self.as_inner().is_symlink_file() }
 }
 
 /// Creates a new file symbolic link on the filesystem.

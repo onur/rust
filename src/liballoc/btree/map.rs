@@ -1748,6 +1748,11 @@ impl<'a, K: Ord, Q: ?Sized, V> Index<&'a Q> for BTreeMap<K, V>
 {
     type Output = V;
 
+    /// Returns a reference to the value corresponding to the supplied key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key is not present in the `BTreeMap`.
     #[inline]
     fn index(&self, key: &Q) -> &V {
         self.get(key).expect("no entry found for key")
@@ -2100,6 +2105,39 @@ impl<'a, K: Ord, V> Entry<'a, K, V> {
         match *self {
             Occupied(ref entry) => entry.key(),
             Vacant(ref entry) => entry.key(),
+        }
+    }
+
+    /// Provides in-place mutable access to an occupied entry before any
+    /// potential inserts into the map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::BTreeMap;
+    ///
+    /// let mut map: BTreeMap<&str, usize> = BTreeMap::new();
+    ///
+    /// map.entry("poneyland")
+    ///    .and_modify(|e| { *e += 1 })
+    ///    .or_insert(42);
+    /// assert_eq!(map["poneyland"], 42);
+    ///
+    /// map.entry("poneyland")
+    ///    .and_modify(|e| { *e += 1 })
+    ///    .or_insert(42);
+    /// assert_eq!(map["poneyland"], 43);
+    /// ```
+    #[stable(feature = "entry_and_modify", since = "1.26.0")]
+    pub fn and_modify<F>(self, mut f: F) -> Self
+        where F: FnMut(&mut V)
+    {
+        match self {
+            Occupied(mut entry) => {
+                f(entry.get_mut());
+                Occupied(entry)
+            },
+            Vacant(entry) => Vacant(entry),
         }
     }
 }

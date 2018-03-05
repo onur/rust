@@ -25,6 +25,7 @@
 extern crate rustc;
 extern crate rustc_const_eval;
 extern crate rustc_const_math;
+extern crate rustc_data_structures;
 
 #[macro_use]
 extern crate log;
@@ -33,6 +34,8 @@ extern crate syntax;
 extern crate syntax_pos;
 extern crate rustc_errors as errors;
 
+use rustc::ty::maps::Providers;
+
 mod diagnostics;
 
 pub mod ast_validation;
@@ -40,7 +43,9 @@ pub mod consts;
 pub mod hir_stats;
 pub mod loops;
 mod mir_stats;
-pub mod no_asm;
-pub mod static_recursion;
 
 __build_diagnostic_array! { librustc_passes, DIAGNOSTICS }
+
+pub fn provide(providers: &mut Providers) {
+    consts::provide(providers);
+}

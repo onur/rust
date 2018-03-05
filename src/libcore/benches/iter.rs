@@ -147,40 +147,166 @@ fn bench_for_each_chain_ref_fold(b: &mut Bencher) {
     });
 }
 
-#[bench]
-fn bench_flat_map_sum(b: &mut Bencher) {
-    b.iter(|| -> i64 {
-        (0i64..1000).flat_map(|x| x..x+1000)
-            .map(black_box)
-            .sum()
-    });
+
+/// Helper to benchmark `sum` for iterators taken by value which
+/// can optimize `fold`, and by reference which cannot.
+macro_rules! bench_sums {
+    ($bench_sum:ident, $bench_ref_sum:ident, $iter:expr) => {
+        #[bench]
+        fn $bench_sum(b: &mut Bencher) {
+            b.iter(|| -> i64 {
+                $iter.map(black_box).sum()
+            });
+        }
+
+        #[bench]
+        fn $bench_ref_sum(b: &mut Bencher) {
+            b.iter(|| -> i64 {
+                $iter.map(black_box).by_ref().sum()
+            });
+        }
+    }
 }
 
-#[bench]
-fn bench_flat_map_ref_sum(b: &mut Bencher) {
-    b.iter(|| -> i64 {
-        (0i64..1000).flat_map(|x| x..x+1000)
-            .map(black_box)
-            .by_ref()
-            .sum()
-    });
+bench_sums! {
+    bench_flat_map_sum,
+    bench_flat_map_ref_sum,
+    (0i64..1000).flat_map(|x| x..x+1000)
 }
 
-#[bench]
-fn bench_flat_map_chain_sum(b: &mut Bencher) {
-    b.iter(|| -> i64 {
-        (0i64..1000000).flat_map(|x| once(x).chain(once(x)))
-            .map(black_box)
-            .sum()
-    });
+bench_sums! {
+    bench_flat_map_chain_sum,
+    bench_flat_map_chain_ref_sum,
+    (0i64..1000000).flat_map(|x| once(x).chain(once(x)))
 }
 
+bench_sums! {
+    bench_enumerate_sum,
+    bench_enumerate_ref_sum,
+    (0i64..1000000).enumerate().map(|(i, x)| x * i as i64)
+}
+
+bench_sums! {
+    bench_enumerate_chain_sum,
+    bench_enumerate_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).enumerate().map(|(i, x)| x * i as i64)
+}
+
+bench_sums! {
+    bench_filter_sum,
+    bench_filter_ref_sum,
+    (0i64..1000000).filter(|x| x % 2 == 0)
+}
+
+bench_sums! {
+    bench_filter_chain_sum,
+    bench_filter_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).filter(|x| x % 2 == 0)
+}
+
+bench_sums! {
+    bench_filter_map_sum,
+    bench_filter_map_ref_sum,
+    (0i64..1000000).filter_map(|x| x.checked_mul(x))
+}
+
+bench_sums! {
+    bench_filter_map_chain_sum,
+    bench_filter_map_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).filter_map(|x| x.checked_mul(x))
+}
+
+bench_sums! {
+    bench_fuse_sum,
+    bench_fuse_ref_sum,
+    (0i64..1000000).fuse()
+}
+
+bench_sums! {
+    bench_fuse_chain_sum,
+    bench_fuse_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).fuse()
+}
+
+bench_sums! {
+    bench_inspect_sum,
+    bench_inspect_ref_sum,
+    (0i64..1000000).inspect(|_| {})
+}
+
+bench_sums! {
+    bench_inspect_chain_sum,
+    bench_inspect_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).inspect(|_| {})
+}
+
+bench_sums! {
+    bench_peekable_sum,
+    bench_peekable_ref_sum,
+    (0i64..1000000).peekable()
+}
+
+bench_sums! {
+    bench_peekable_chain_sum,
+    bench_peekable_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).peekable()
+}
+
+bench_sums! {
+    bench_skip_sum,
+    bench_skip_ref_sum,
+    (0i64..1000000).skip(1000)
+}
+
+bench_sums! {
+    bench_skip_chain_sum,
+    bench_skip_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).skip(1000)
+}
+
+bench_sums! {
+    bench_skip_while_sum,
+    bench_skip_while_ref_sum,
+    (0i64..1000000).skip_while(|&x| x < 1000)
+}
+
+bench_sums! {
+    bench_skip_while_chain_sum,
+    bench_skip_while_chain_ref_sum,
+    (0i64..1000000).chain(0..1000000).skip_while(|&x| x < 1000)
+}
+
+bench_sums! {
+    bench_take_while_chain_sum,
+    bench_take_while_chain_ref_sum,
+    (0i64..1000000).chain(1000000..).take_while(|&x| x < 1111111)
+}
+
+// Checks whether Skip<Zip<A,B>> is as fast as Zip<Skip<A>, Skip<B>>, from
+// https://users.rust-lang.org/t/performance-difference-between-iterator-zip-and-skip-order/15743
 #[bench]
-fn bench_flat_map_chain_ref_sum(b: &mut Bencher) {
-    b.iter(|| -> i64 {
-        (0i64..1000000).flat_map(|x| once(x).chain(once(x)))
-            .map(black_box)
-            .by_ref()
-            .sum()
+fn bench_zip_then_skip(b: &mut Bencher) {
+    let v: Vec<_> = (0..100_000).collect();
+    let t: Vec<_> = (0..100_000).collect();
+
+    b.iter(|| {
+        let s = v.iter().zip(t.iter()).skip(10000)
+            .take_while(|t| *t.0 < 10100)
+            .map(|(a, b)| *a + *b)
+            .sum::<u64>();
+        assert_eq!(s, 2009900);
+    });
+}
+#[bench]
+fn bench_skip_then_zip(b: &mut Bencher) {
+    let v: Vec<_> = (0..100_000).collect();
+    let t: Vec<_> = (0..100_000).collect();
+
+    b.iter(|| {
+        let s = v.iter().skip(10000).zip(t.iter().skip(10000))
+            .take_while(|t| *t.0 < 10100)
+            .map(|(a, b)| *a + *b)
+            .sum::<u64>();
+        assert_eq!(s, 2009900);
     });
 }

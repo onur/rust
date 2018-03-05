@@ -12,6 +12,7 @@
 #![feature(box_syntax)]
 #![feature(rustc_private)]
 #![feature(associated_type_defaults)]
+#![feature(external_doc)]
 
 extern crate graphviz;
 // A simple rust project
@@ -441,6 +442,11 @@ fn test_format_args() {
     print!("x is {}, y is {1}, name is {n}", x, y, n = name);
 }
 
+
+union TestUnion {
+    f1: u32
+}
+
 struct FrameBuffer;
 
 struct SilenceGenerator;
@@ -456,3 +462,6 @@ impl Iterator for SilenceGenerator {
 trait Foo {
     type Bar = FrameBuffer;
 }
+
+#[doc(include="extra-docs.md")]
+struct StructWithDocs;

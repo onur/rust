@@ -56,6 +56,8 @@ use any::TypeId;
 use borrow::Cow;
 use cell;
 use char;
+use convert;
+use core::array;
 use fmt::{self, Debug, Display};
 use mem::transmute;
 use num;
@@ -232,7 +234,7 @@ impl<'a> From<Cow<'a, str>> for Box<Error> {
     }
 }
 
-#[unstable(feature = "never_type_impls", issue = "35121")]
+#[unstable(feature = "never_type", issue = "35121")]
 impl Error for ! {
     fn description(&self) -> &str { *self }
 }
@@ -276,6 +278,13 @@ impl Error for num::ParseIntError {
 
 #[unstable(feature = "try_from", issue = "33417")]
 impl Error for num::TryFromIntError {
+    fn description(&self) -> &str {
+        self.__description()
+    }
+}
+
+#[unstable(feature = "try_from", issue = "33417")]
+impl Error for array::TryFromSliceError {
     fn description(&self) -> &str {
         self.__description()
     }
@@ -362,6 +371,13 @@ impl Error for char::ParseCharError {
     }
 }
 
+#[unstable(feature = "try_from", issue = "33417")]
+impl Error for convert::Infallible {
+    fn description(&self) -> &str {
+        match *self {
+        }
+    }
+}
 
 // copied from any.rs
 impl Error + 'static {

@@ -22,15 +22,15 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use build_helper::output;
 use cmake;
-use gcc;
+use cc;
 
 use Build;
-use util;
+use util::{self, exe};
 use build_helper::up_to_date;
 use builder::{Builder, RunConfig, ShouldRun, Step};
 use cache::Interned;
@@ -38,35 +38,40 @@ use cache::Interned;
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct Llvm {
     pub target: Interned<String>,
+    pub emscripten: bool,
 }
 
 impl Step for Llvm {
-    type Output = ();
+    type Output = PathBuf; // path to llvm-config
+
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
-        run.path("src/llvm")
+        run.path("src/llvm").path("src/llvm-emscripten")
     }
 
     fn make_run(run: RunConfig) {
-        run.builder.ensure(Llvm { target: run.target })
+        let emscripten = run.path.ends_with("llvm-emscripten");
+        run.builder.ensure(Llvm {
+            target: run.target,
+            emscripten,
+        });
     }
 
     /// Compile LLVM for `target`.
-    fn run(self, builder: &Builder) {
+    fn run(self, builder: &Builder) -> PathBuf {
         let build = builder.build;
         let target = self.target;
-
-        // If we're not compiling for LLVM bail out here.
-        if !build.config.llvm_enabled {
-            return;
-        }
+        let emscripten = self.emscripten;
 
         // If we're using a custom LLVM bail out here, but we can only use a
         // custom LLVM for the build triple.
-        if let Some(config) = build.config.target_config.get(&target) {
-            if let Some(ref s) = config.llvm_config {
-                return check_llvm_version(build, s);
+        if !self.emscripten {
+            if let Some(config) = build.config.target_config.get(&target) {
+                if let Some(ref s) = config.llvm_config {
+                    check_llvm_version(build, s);
+                    return s.to_path_buf()
+                }
             }
         }
 
@@ -74,8 +79,17 @@ impl Step for Llvm {
         let mut rebuild_trigger_contents = String::new();
         t!(t!(File::open(&rebuild_trigger)).read_to_string(&mut rebuild_trigger_contents));
 
-        let out_dir = build.llvm_out(target);
+        let (out_dir, llvm_config_ret_dir) = if emscripten {
+            let dir = build.emscripten_llvm_out(target);
+            let config_dir = dir.join("bin");
+            (dir, config_dir)
+        } else {
+            (build.llvm_out(target),
+                build.llvm_out(build.config.build).join("bin"))
+        };
         let done_stamp = out_dir.join("llvm-finished-building");
+        let build_llvm_config = llvm_config_ret_dir
+            .join(exe("llvm-config", &*build.config.build));
         if done_stamp.exists() {
             let mut done_contents = String::new();
             t!(t!(File::open(&done_stamp)).read_to_string(&mut done_contents));
@@ -83,17 +97,19 @@ impl Step for Llvm {
             // If LLVM was already built previously and contents of the rebuild-trigger file
             // didn't change from the previous build, then no action is required.
             if done_contents == rebuild_trigger_contents {
-                return
+                return build_llvm_config
             }
         }
 
         let _folder = build.fold_output(|| "llvm");
-        println!("Building LLVM for {}", target);
+        let descriptor = if emscripten { "Emscripten " } else { "" };
+        println!("Building {}LLVM for {}", descriptor, target);
         let _time = util::timeit();
         t!(fs::create_dir_all(&out_dir));
 
         // http://llvm.org/docs/CMake.html
-        let mut cfg = cmake::Config::new(build.src.join("src/llvm"));
+        let root = if self.emscripten { "src/llvm-emscripten" } else { "src/llvm" };
+        let mut cfg = cmake::Config::new(build.src.join(root));
         if build.config.ninja {
             cfg.generator("Ninja");
         }
@@ -104,15 +120,21 @@ impl Step for Llvm {
             (true, true) => "RelWithDebInfo",
         };
 
-        // NOTE: remember to also update `config.toml.example` when changing the defaults!
-        let llvm_targets = match build.config.llvm_targets {
-            Some(ref s) => s,
-            None => "X86;ARM;AArch64;Mips;PowerPC;SystemZ;JSBackend;MSP430;Sparc;NVPTX;Hexagon",
+        // NOTE: remember to also update `config.toml.example` when changing the
+        // defaults!
+        let llvm_targets = if self.emscripten {
+            "JSBackend"
+        } else {
+            match build.config.llvm_targets {
+                Some(ref s) => s,
+                None => "X86;ARM;AArch64;Mips;PowerPC;SystemZ;MSP430;Sparc;NVPTX;Hexagon",
+            }
         };
 
-        let llvm_exp_targets = match build.config.llvm_experimental_targets {
-            Some(ref s) => s,
-            None => "",
+        let llvm_exp_targets = if self.emscripten {
+            ""
+        } else {
+            &build.config.llvm_experimental_targets[..]
         };
 
         let assertions = if build.config.llvm_assertions {"ON"} else {"OFF"};
@@ -135,6 +157,14 @@ impl Step for Llvm {
            .define("LLVM_TARGET_ARCH", target.split('-').next().unwrap())
            .define("LLVM_DEFAULT_TARGET_TRIPLE", target);
 
+        // By default, LLVM will automatically find OCaml and, if it finds it,
+        // install the LLVM bindings in LLVM_OCAML_INSTALL_PATH, which defaults
+        // to /usr/bin/ocaml.
+        // This causes problem for non-root builds of Rust. Side-step the issue
+        // by setting LLVM_OCAML_INSTALL_PATH to a relative path, so it installs
+        // in the prefix.
+        cfg.define("LLVM_OCAML_INSTALL_PATH",
+            env::var_os("LLVM_OCAML_INSTALL_PATH").unwrap_or_else(|| "usr/lib/ocaml".into()));
 
         // This setting makes the LLVM tools link to the dynamic LLVM library,
         // which saves both memory during parallel links and overall disk space
@@ -162,8 +192,11 @@ impl Step for Llvm {
         }
 
         // http://llvm.org/docs/HowToCrossCompileLLVM.html
-        if target != build.build {
-            builder.ensure(Llvm { target: build.build });
+        if target != build.build && !emscripten {
+            builder.ensure(Llvm {
+                target: build.build,
+                emscripten: false,
+            });
             // FIXME: if the llvm root for the build triple is overridden then we
             //        should use llvm-tblgen from there, also should verify that it
             //        actually exists most of the time in normal installs of LLVM.
@@ -227,6 +260,13 @@ impl Step for Llvm {
             cfg.build_arg("-j").build_arg(build.jobs().to_string());
             cfg.define("CMAKE_C_FLAGS", build.cflags(target).join(" "));
             cfg.define("CMAKE_CXX_FLAGS", build.cflags(target).join(" "));
+            if let Some(ar) = build.ar(target) {
+                if ar.is_absolute() {
+                    // LLVM build breaks if `CMAKE_AR` is a relative path, for some reason it
+                    // tries to resolve this path in the LLVM build directory.
+                    cfg.define("CMAKE_AR", sanitize_cc(ar));
+                }
+            }
         };
 
         configure_compilers(&mut cfg);
@@ -242,6 +282,8 @@ impl Step for Llvm {
         cfg.build();
 
         t!(t!(File::create(&done_stamp)).write_all(rebuild_trigger_contents.as_bytes()));
+
+        build_llvm_config
     }
 }
 
@@ -252,11 +294,14 @@ fn check_llvm_version(build: &Build, llvm_config: &Path) {
 
     let mut cmd = Command::new(llvm_config);
     let version = output(cmd.arg("--version"));
-    if version.starts_with("3.5") || version.starts_with("3.6") ||
-       version.starts_with("3.7") {
-        return
+    let mut parts = version.split('.').take(2)
+        .filter_map(|s| s.parse::<u32>().ok());
+    if let (Some(major), Some(minor)) = (parts.next(), parts.next()) {
+        if major > 3 || (major == 3 && minor >= 9) {
+            return
+        }
     }
-    panic!("\n\nbad LLVM version: {}, need >=3.5\n\n", version)
+    panic!("\n\nbad LLVM version: {}, need >=3.9\n\n", version)
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -268,7 +313,7 @@ impl Step for TestHelpers {
     type Output = ();
 
     fn should_run(run: ShouldRun) -> ShouldRun {
-        run.path("src/rt/rust_test_helpers.c")
+        run.path("src/test/auxiliary/rust_test_helpers.c")
     }
 
     fn make_run(run: RunConfig) {
@@ -281,7 +326,7 @@ impl Step for TestHelpers {
         let build = builder.build;
         let target = self.target;
         let dst = build.test_helpers_out(target);
-        let src = build.src.join("src/rt/rust_test_helpers.c");
+        let src = build.src.join("src/test/auxiliary/rust_test_helpers.c");
         if up_to_date(&src, &dst.join("librust_test_helpers.a")) {
             return
         }
@@ -289,7 +334,7 @@ impl Step for TestHelpers {
         let _folder = build.fold_output(|| "build_test_helpers");
         println!("Building test helpers");
         t!(fs::create_dir_all(&dst));
-        let mut cfg = gcc::Build::new();
+        let mut cfg = cc::Build::new();
 
         // We may have found various cross-compilers a little differently due to our
         // extra configuration, so inform gcc of these compilers. Note, though, that
@@ -308,14 +353,14 @@ impl Step for TestHelpers {
            .opt_level(0)
            .warnings(false)
            .debug(false)
-           .file(build.src.join("src/rt/rust_test_helpers.c"))
-           .compile("librust_test_helpers.a");
+           .file(build.src.join("src/test/auxiliary/rust_test_helpers.c"))
+           .compile("rust_test_helpers");
     }
 }
 
-const OPENSSL_VERS: &'static str = "1.0.2k";
+const OPENSSL_VERS: &'static str = "1.0.2m";
 const OPENSSL_SHA256: &'static str =
-    "6b3977c61f2aedf0f96367dcfb5c6e578cf37e7b8d913b4ecb6643c3cb88d8c0";
+    "8c6ff15ec6b319b50788f42c7abc2890c08ba5a1cdcd3810eb9092deada37b0f";
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct Openssl {
@@ -352,34 +397,51 @@ impl Step for Openssl {
             // originally from https://www.openssl.org/source/...
             let url = format!("https://s3-us-west-1.amazonaws.com/rust-lang-ci2/rust-ci-mirror/{}",
                               name);
-            let mut ok = false;
+            let mut last_error = None;
             for _ in 0..3 {
                 let status = Command::new("curl")
                                 .arg("-o").arg(&tmp)
+                                .arg("-f")  // make curl fail if the URL does not return HTTP 200
                                 .arg(&url)
                                 .status()
                                 .expect("failed to spawn curl");
-                if status.success() {
-                    ok = true;
-                    break
+
+                // Retry if download failed.
+                if !status.success() {
+                    last_error = Some(status.to_string());
+                    continue;
                 }
+
+                // Ensure the hash is correct.
+                let mut shasum = if target.contains("apple") || build.build.contains("netbsd") {
+                    let mut cmd = Command::new("shasum");
+                    cmd.arg("-a").arg("256");
+                    cmd
+                } else {
+                    Command::new("sha256sum")
+                };
+                let output = output(&mut shasum.arg(&tmp));
+                let found = output.split_whitespace().next().unwrap();
+
+                // If the hash is wrong, probably the download is incomplete or S3 served an error
+                // page. In any case, retry.
+                if found != OPENSSL_SHA256 {
+                    last_error = Some(format!(
+                        "downloaded openssl sha256 different\n\
+                         expected: {}\n\
+                         found:    {}\n",
+                        OPENSSL_SHA256,
+                        found
+                    ));
+                    continue;
+                }
+
+                // Everything is fine, so exit the retry loop.
+                last_error = None;
+                break;
             }
-            if !ok {
-                panic!("failed to download openssl source")
-            }
-            let mut shasum = if target.contains("apple") {
-                let mut cmd = Command::new("shasum");
-                cmd.arg("-a").arg("256");
-                cmd
-            } else {
-                Command::new("sha256sum")
-            };
-            let output = output(&mut shasum.arg(&tmp));
-            let found = output.split_whitespace().next().unwrap();
-            if found != OPENSSL_SHA256 {
-                panic!("downloaded openssl sha256 different\n\
-                        expected: {}\n\
-                        found:    {}\n", OPENSSL_SHA256, found);
+            if let Some(error) = last_error {
+                panic!("failed to download openssl source: {}", error);
             }
             t!(fs::rename(&tmp, &tarball));
         }
@@ -387,7 +449,7 @@ impl Step for Openssl {
         let dst = build.openssl_install_dir(target).unwrap();
         drop(fs::remove_dir_all(&obj));
         drop(fs::remove_dir_all(&dst));
-        build.run(Command::new("tar").arg("xf").arg(&tarball).current_dir(&out));
+        build.run(Command::new("tar").arg("zxf").arg(&tarball).current_dir(&out));
 
         let mut configure = Command::new("perl");
         configure.arg(obj.join("Configure"));
@@ -399,11 +461,14 @@ impl Step for Openssl {
         let os = match &*target {
             "aarch64-linux-android" => "linux-aarch64",
             "aarch64-unknown-linux-gnu" => "linux-aarch64",
+            "aarch64-unknown-linux-musl" => "linux-aarch64",
             "arm-linux-androideabi" => "android",
             "arm-unknown-linux-gnueabi" => "linux-armv4",
             "arm-unknown-linux-gnueabihf" => "linux-armv4",
             "armv7-linux-androideabi" => "android-armv7",
             "armv7-unknown-linux-gnueabihf" => "linux-armv4",
+            "i586-unknown-linux-gnu" => "linux-elf",
+            "i586-unknown-linux-musl" => "linux-elf",
             "i686-apple-darwin" => "darwin-i386-cc",
             "i686-linux-android" => "android-x86",
             "i686-unknown-freebsd" => "BSD-x86-elf",
@@ -415,14 +480,20 @@ impl Step for Openssl {
             "mips64el-unknown-linux-gnuabi64" => "linux64-mips64",
             "mipsel-unknown-linux-gnu" => "linux-mips32",
             "powerpc-unknown-linux-gnu" => "linux-ppc",
+            "powerpc-unknown-linux-gnuspe" => "linux-ppc",
+            "powerpc-unknown-netbsd" => "BSD-generic32",
             "powerpc64-unknown-linux-gnu" => "linux-ppc64",
             "powerpc64le-unknown-linux-gnu" => "linux-ppc64le",
             "s390x-unknown-linux-gnu" => "linux64-s390x",
+            "sparc-unknown-linux-gnu" => "linux-sparcv9",
+            "sparc64-unknown-linux-gnu" => "linux64-sparcv9",
             "sparc64-unknown-netbsd" => "BSD-sparc64",
             "x86_64-apple-darwin" => "darwin64-x86_64-cc",
             "x86_64-linux-android" => "linux-x86_64",
             "x86_64-unknown-freebsd" => "BSD-x86_64",
+            "x86_64-unknown-dragonfly" => "BSD-x86_64",
             "x86_64-unknown-linux-gnu" => "linux-x86_64",
+            "x86_64-unknown-linux-gnux32" => "linux-x32",
             "x86_64-unknown-linux-musl" => "linux-x86_64",
             "x86_64-unknown-netbsd" => "BSD-x86_64",
             _ => panic!("don't know how to configure OpenSSL for {}", target),
