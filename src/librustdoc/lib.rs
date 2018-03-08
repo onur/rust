@@ -100,7 +100,7 @@ struct Output {
 
 pub fn main() {
     const STACK_SIZE: usize = 32_000_000; // 32MB
-    env_logger::init().unwrap();
+    env_logger::init();
     let res = std::thread::Builder::new().stack_size(STACK_SIZE).spawn(move || {
         get_args().map(|args| main_args(&args)).unwrap_or(1)
     }).unwrap().join().unwrap_or(101);
@@ -266,7 +266,9 @@ pub fn opts() -> Vec<RustcOptGroup> {
         }),
         unstable("resource-suffix", |o| {
             o.optopt("",
-                     "resource-suffix", "suffix which will be added at the end of resource files",
+                     "resource-suffix",
+                     "suffix to add to CSS and JavaScript files, e.g. \"main.css\" will become \
+                      \"main-suffix.css\"",
                      "PATH")
         }),
     ]

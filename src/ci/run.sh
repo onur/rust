@@ -67,6 +67,12 @@ else
   fi
 fi
 
+# We've had problems in the past of shell scripts leaking fds into the sccache
+# server (#48192) which causes Cargo to erroneously think that a build script
+# hasn't finished yet. Try to solve that problem by starting a very long-lived
+# sccache server at the start of the build, but no need to worry if this fails.
+SCCACHE_IDLE_TIMEOUT=10800 sccache --start-server || true
+
 travis_fold start configure
 travis_time_start
 $SRC/configure $RUST_CONFIGURE_ARGS
@@ -98,7 +104,7 @@ else
     travis_fold start "make-$1"
     travis_time_start
     echo "make -j $ncpus $1"
-    make -j $ncpus "$1"
+    make -j $ncpus $1
     local retval=$?
     travis_fold end "make-$1"
     travis_time_finish

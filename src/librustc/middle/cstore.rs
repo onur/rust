@@ -32,18 +32,16 @@ use ich;
 use ty::{self, TyCtxt};
 use session::{Session, CrateDisambiguator};
 use session::search_paths::PathKind;
-use util::nodemap::NodeSet;
 
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use rustc_data_structures::owning_ref::ErasedBoxRef;
 use syntax::ast;
 use syntax::ext::base::SyntaxExtension;
 use syntax::symbol::Symbol;
 use syntax_pos::Span;
 use rustc_back::target::Target;
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{MetadataRef, Lrc};
 
 pub use self::NativeLibraryKind::*;
 
@@ -187,11 +185,11 @@ pub trait MetadataLoader {
     fn get_rlib_metadata(&self,
                          target: &Target,
                          filename: &Path)
-                         -> Result<ErasedBoxRef<[u8]>, String>;
+                         -> Result<MetadataRef, String>;
     fn get_dylib_metadata(&self,
                           target: &Target,
                           filename: &Path)
-                          -> Result<ErasedBoxRef<[u8]>, String>;
+                          -> Result<MetadataRef, String>;
 }
 
 #[derive(Clone)]
@@ -258,8 +256,7 @@ pub trait CrateStore {
     // utility functions
     fn encode_metadata<'a, 'tcx>(&self,
                                  tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                 link_meta: &LinkMeta,
-                                 reachable: &NodeSet)
+                                 link_meta: &LinkMeta)
                                  -> EncodedMetadata;
     fn metadata_encoding_version(&self) -> &[u8];
 }
@@ -342,8 +339,7 @@ impl CrateStore for DummyCrateStore {
     fn extern_mod_stmt_cnum_untracked(&self, emod_id: ast::NodeId) -> Option<CrateNum> { None }
     fn encode_metadata<'a, 'tcx>(&self,
                                  tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                 link_meta: &LinkMeta,
-                                 reachable: &NodeSet)
+                                 link_meta: &LinkMeta)
                                  -> EncodedMetadata {
         bug!("encode_metadata")
     }

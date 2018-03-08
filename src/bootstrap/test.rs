@@ -528,6 +528,7 @@ impl Step for Tidy {
         println!("tidy check ({})", host);
         let mut cmd = builder.tool_cmd(Tool::Tidy);
         cmd.arg(build.src.join("src"));
+        cmd.arg(&build.initial_cargo);
         if !build.config.vendor {
             cmd.arg("--no-vendor");
         }
@@ -914,7 +915,7 @@ impl Step for Compiletest {
         }
 
         if build.config.llvm_enabled {
-            let llvm_config = build.llvm_config(target);
+            let llvm_config = build.llvm_config(build.config.build);
             let llvm_version = output(Command::new(&llvm_config).arg("--version"));
             cmd.arg("--llvm-version").arg(llvm_version);
             if !build.is_rust_llvm(target) {

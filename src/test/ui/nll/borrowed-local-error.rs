@@ -1,4 +1,4 @@
-// Copyright 2017 The Rust Project Developers. See the COPYRIGHT
+// Copyright 2018 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
 // http://rust-lang.org/COPYRIGHT.
 //
@@ -8,7 +8,19 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![wasm_import_memory] //~ ERROR: currently unstable
+// compile-flags: -Znll-dump-cause
 
-fn main() {}
+#![feature(nll)]
 
+fn gimme(x: &(u32,)) -> &u32 {
+    &x.0
+}
+
+fn main() {
+    let x = gimme({
+        let v = (22,);
+        &v
+        //~^ ERROR `v` does not live long enough [E0597]
+    });
+    println!("{:?}", x);
+}

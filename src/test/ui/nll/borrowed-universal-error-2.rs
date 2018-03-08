@@ -1,4 +1,4 @@
-// Copyright 2014-2015 The Rust Project Developers. See the COPYRIGHT
+// Copyright 2018 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
 // http://rust-lang.org/COPYRIGHT.
 //
@@ -8,10 +8,15 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-pub fn cmd(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{}.bat", name)
-    } else {
-        name.to_string()
-    }
+// compile-flags: -Znll-dump-cause
+
+#![feature(nll)]
+#![allow(warnings)]
+
+fn foo<'a>(x: &'a (u32,)) -> &'a u32 {
+    let v = 22;
+    &v
+    //~^ ERROR `v` does not live long enough [E0597]
 }
+
+fn main() {}

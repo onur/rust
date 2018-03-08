@@ -212,9 +212,9 @@ impl<'tcx> QueryDescription<'tcx> for queries::item_attrs<'tcx> {
     }
 }
 
-impl<'tcx> QueryDescription<'tcx> for queries::is_exported_symbol<'tcx> {
+impl<'tcx> QueryDescription<'tcx> for queries::is_reachable_non_generic<'tcx> {
     fn describe(_: TyCtxt, _: DefId) -> String {
-        bug!("is_exported_symbol")
+        bug!("is_reachable_non_generic")
     }
 }
 
@@ -383,7 +383,7 @@ impl<'tcx> QueryDescription<'tcx> for queries::is_sanitizer_runtime<'tcx> {
     }
 }
 
-impl<'tcx> QueryDescription<'tcx> for queries::exported_symbol_ids<'tcx> {
+impl<'tcx> QueryDescription<'tcx> for queries::reachable_non_generics<'tcx> {
     fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
         format!("looking up the exported symbols of a crate")
     }
@@ -593,6 +593,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::fully_normalize_monormophic_ty<'t
     }
 }
 
+impl<'tcx> QueryDescription<'tcx> for queries::features_query<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up enabled feature gates")
+    }
+}
+
 impl<'tcx> QueryDescription<'tcx> for queries::typeck_tables_of<'tcx> {
     #[inline]
     fn cache_on_disk(def_id: Self::Key) -> bool {
@@ -681,8 +687,8 @@ impl_disk_cacheable_query!(borrowck, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(mir_borrowck, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(mir_const_qualif, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(check_match, |def_id| def_id.is_local());
-impl_disk_cacheable_query!(contains_extern_indicator, |_| true);
 impl_disk_cacheable_query!(def_symbol_name, |_| true);
 impl_disk_cacheable_query!(type_of, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(predicates_of, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(used_trait_imports, |def_id| def_id.is_local());
+impl_disk_cacheable_query!(trans_fn_attrs, |_| true);

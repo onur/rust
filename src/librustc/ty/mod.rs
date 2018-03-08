@@ -912,9 +912,6 @@ pub enum Predicate<'tcx> {
     /// would be the type parameters.
     Trait(PolyTraitPredicate<'tcx>),
 
-    /// where `T1 == T2`.
-    Equate(PolyEquatePredicate<'tcx>),
-
     /// where 'a : 'b
     RegionOutlives(PolyRegionOutlivesPredicate<'tcx>),
 
@@ -1023,8 +1020,6 @@ impl<'a, 'gcx, 'tcx> Predicate<'tcx> {
         match *self {
             Predicate::Trait(ty::Binder(ref data)) =>
                 Predicate::Trait(ty::Binder(data.subst(tcx, substs))),
-            Predicate::Equate(ty::Binder(ref data)) =>
-                Predicate::Equate(ty::Binder(data.subst(tcx, substs))),
             Predicate::Subtype(ty::Binder(ref data)) =>
                 Predicate::Subtype(ty::Binder(data.subst(tcx, substs))),
             Predicate::RegionOutlives(ty::Binder(ref data)) =>
@@ -1071,10 +1066,6 @@ impl<'tcx> PolyTraitPredicate<'tcx> {
         self.0.def_id()
     }
 }
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
-pub struct EquatePredicate<'tcx>(pub Ty<'tcx>, pub Ty<'tcx>); // `0 == 1`
-pub type PolyEquatePredicate<'tcx> = ty::Binder<EquatePredicate<'tcx>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub struct OutlivesPredicate<A,B>(pub A, pub B); // `A : B`
@@ -1166,12 +1157,6 @@ impl<'tcx> ToPredicate<'tcx> for PolyTraitRef<'tcx> {
     }
 }
 
-impl<'tcx> ToPredicate<'tcx> for PolyEquatePredicate<'tcx> {
-    fn to_predicate(&self) -> Predicate<'tcx> {
-        Predicate::Equate(self.clone())
-    }
-}
-
 impl<'tcx> ToPredicate<'tcx> for PolyRegionOutlivesPredicate<'tcx> {
     fn to_predicate(&self) -> Predicate<'tcx> {
         Predicate::RegionOutlives(self.clone())
@@ -1198,9 +1183,6 @@ impl<'tcx> Predicate<'tcx> {
         let vec: Vec<_> = match *self {
             ty::Predicate::Trait(ref data) => {
                 data.skip_binder().input_types().collect()
-            }
-            ty::Predicate::Equate(ty::Binder(ref data)) => {
-                vec![data.0, data.1]
             }
             ty::Predicate::Subtype(ty::Binder(SubtypePredicate { a, b, a_is_expected: _ })) => {
                 vec![a, b]
@@ -1242,7 +1224,6 @@ impl<'tcx> Predicate<'tcx> {
                 Some(t.to_poly_trait_ref())
             }
             Predicate::Projection(..) |
-            Predicate::Equate(..) |
             Predicate::Subtype(..) |
             Predicate::RegionOutlives(..) |
             Predicate::WellFormed(..) |
@@ -1262,7 +1243,6 @@ impl<'tcx> Predicate<'tcx> {
             }
             Predicate::Trait(..) |
             Predicate::Projection(..) |
-            Predicate::Equate(..) |
             Predicate::Subtype(..) |
             Predicate::RegionOutlives(..) |
             Predicate::WellFormed(..) |
@@ -2335,7 +2315,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     /// Returns true if the impls are the same polarity and are implementing
     /// a trait which contains no items
     pub fn impls_are_allowed_to_overlap(self, def_id1: DefId, def_id2: DefId) -> bool {
-        if !self.sess.features.borrow().overlapping_marker_traits {
+        if !self.features().overlapping_marker_traits {
             return false;
         }
         let trait1_is_empty = self.impl_trait_ref(def_id1)
@@ -2806,7 +2786,7 @@ impl<'tcx> DtorckConstraint<'tcx> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, RustcEncodable, RustcDecodable)]
 pub struct SymbolName {
     // FIXME: we don't rely on interning or equality here - better have
     // this be a `&'tcx str`.
@@ -2817,6 +2797,14 @@ impl_stable_hash_for!(struct self::SymbolName {
     name
 });
 
+impl SymbolName {
+    pub fn new(name: &str) -> SymbolName {
+        SymbolName {
+            name: Symbol::intern(name).as_str()
+        }
+    }
+}
+
 impl Deref for SymbolName {
     type Target = str;
 
@@ -2824,6 +2812,12 @@ impl Deref for SymbolName {
 }
 
 impl fmt::Display for SymbolName {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&self.name, fmt)
+    }
+}
+
+impl fmt::Debug for SymbolName {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&self.name, fmt)
     }

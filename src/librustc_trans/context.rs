@@ -435,7 +435,7 @@ impl<'b, 'tcx> CodegenCx<'b, 'tcx> {
 
     pub fn type_has_metadata(&self, ty: Ty<'tcx>) -> bool {
         use syntax_pos::DUMMY_SP;
-        if ty.is_sized(self.tcx, ty::ParamEnv::empty(traits::Reveal::All), DUMMY_SP) {
+        if ty.is_sized(self.tcx.at(DUMMY_SP), ty::ParamEnv::empty(traits::Reveal::All)) {
             return false;
         }
 
@@ -596,6 +596,12 @@ fn declare_intrinsic(cx: &CodegenCx, key: &str) -> Option<ValueRef> {
     ifn!("llvm.bswap.i32", fn(t_i32) -> t_i32);
     ifn!("llvm.bswap.i64", fn(t_i64) -> t_i64);
     ifn!("llvm.bswap.i128", fn(t_i128) -> t_i128);
+
+    ifn!("llvm.bitreverse.i8", fn(t_i8) -> t_i8);
+    ifn!("llvm.bitreverse.i16", fn(t_i16) -> t_i16);
+    ifn!("llvm.bitreverse.i32", fn(t_i32) -> t_i32);
+    ifn!("llvm.bitreverse.i64", fn(t_i64) -> t_i64);
+    ifn!("llvm.bitreverse.i128", fn(t_i128) -> t_i128);
 
     ifn!("llvm.sadd.with.overflow.i8", fn(t_i8, t_i8) -> mk_struct!{t_i8, i1});
     ifn!("llvm.sadd.with.overflow.i16", fn(t_i16, t_i16) -> mk_struct!{t_i16, i1});

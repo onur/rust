@@ -1208,7 +1208,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
         // shouldn't affect `is_sized`.
         let gcx = self.tcx().global_tcx();
         let erased_ty = gcx.lift(&self.tcx().erase_regions(&ty)).unwrap();
-        if !erased_ty.is_sized(gcx, self.param_env, span) {
+        if !erased_ty.is_sized(gcx.at(span), self.param_env) {
             // in current MIR construction, all non-control-flow rvalue
             // expressions evaluate through `as_temp` or `into` a return
             // slot or local, so to find all unsized rvalues it is enough
@@ -1587,7 +1587,7 @@ impl MirPass for TypeckMir {
 
         // When NLL is enabled, the borrow checker runs the typeck
         // itself, so we don't need this MIR pass anymore.
-        if tcx.sess.nll() {
+        if tcx.nll() {
             return;
         }
 
