@@ -1,4 +1,4 @@
-// Copyright 2012 The Rust Project Developers. See the COPYRIGHT
+// Copyright 2017 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
 // http://rust-lang.org/COPYRIGHT.
 //
@@ -8,8 +8,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// error-pattern:can't use type parameters from outer function
-fn foo<T>(x: T) {
-    fn bar(f: Box<FnMut(T) -> T>) { }
-}
-fn main() { foo(1); }
+#![crate_name = "foo"]
+
+// @has foo/fn.bar.html
+// @has - '//*[@class="sidebar-elems"]' ''
+pub fn bar() {}
+
+// @has foo/constant.BAR.html
+// @has - '//*[@class="sidebar-elems"]' ''
+pub const BAR: u32 = 0;
