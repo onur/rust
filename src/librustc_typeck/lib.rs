@@ -80,13 +80,14 @@ This API is completely unstable and subject to change.
 #![feature(crate_visibility_modifier)]
 #![feature(from_ref)]
 #![feature(match_default_bindings)]
-#![feature(never_type)]
+#![feature(exhaustive_patterns)]
 #![feature(option_filter)]
 #![feature(quote)]
 #![feature(refcell_replace_swap)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_patterns)]
 #![feature(i128_type)]
+#![cfg_attr(stage0, feature(never_type))]
 
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
@@ -110,7 +111,7 @@ use rustc::infer::InferOk;
 use rustc::ty::subst::Substs;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::maps::Providers;
-use rustc::traits::{FulfillmentContext, ObligationCause, ObligationCauseCode, Reveal};
+use rustc::traits::{FulfillmentContext, ObligationCause, ObligationCauseCode};
 use session::{CompileIncomplete, config};
 use util::common::time;
 
@@ -158,7 +159,7 @@ fn require_same_types<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                                 actual: Ty<'tcx>)
                                 -> bool {
     tcx.infer_ctxt().enter(|ref infcx| {
-        let param_env = ty::ParamEnv::empty(Reveal::UserFacing);
+        let param_env = ty::ParamEnv::empty();
         let mut fulfill_cx = FulfillmentContext::new();
         match infcx.at(&cause, param_env).eq(expected, actual) {
             Ok(InferOk { obligations, .. }) => {
@@ -173,7 +174,7 @@ fn require_same_types<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         match fulfill_cx.select_all_or_error(infcx) {
             Ok(()) => true,
             Err(errors) => {
-                infcx.report_fulfillment_errors(&errors, None);
+                infcx.report_fulfillment_errors(&errors, None, false);
                 false
             }
         }

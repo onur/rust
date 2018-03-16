@@ -10,6 +10,7 @@
 
 #![deny(warnings)]
 
+#![feature(ascii_ctype)]
 #![feature(box_syntax)]
 #![feature(core_float)]
 #![feature(core_private_bignum)]
@@ -22,8 +23,7 @@
 #![feature(fmt_internals)]
 #![feature(iterator_step_by)]
 #![feature(i128_type)]
-#![feature(inclusive_range)]
-#![feature(inclusive_range_syntax)]
+#![cfg_attr(stage0, feature(inclusive_range_syntax))]
 #![feature(iterator_try_fold)]
 #![feature(iterator_flatten)]
 #![feature(conservative_impl_trait)]
@@ -47,12 +47,15 @@
 #![feature(exact_chunks)]
 #![feature(atomic_nand)]
 #![feature(reverse_bits)]
+#![feature(inclusive_range_fields)]
 
 extern crate core;
 extern crate test;
+extern crate rand;
 
 mod any;
 mod array;
+mod ascii;
 mod atomic;
 mod cell;
 mod char;

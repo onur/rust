@@ -334,7 +334,7 @@ fn compare_predicate_entailment<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         // Check that all obligations are satisfied by the implementation's
         // version.
         if let Err(ref errors) = inh.fulfillment_cx.borrow_mut().select_all_or_error(&infcx) {
-            infcx.report_fulfillment_errors(errors, None);
+            infcx.report_fulfillment_errors(errors, None, false);
             return Err(ErrorReported);
         }
 
@@ -501,7 +501,7 @@ fn compare_self_type<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             ty::TraitContainer(_) => tcx.mk_self_type()
         };
         let self_arg_ty = *tcx.fn_sig(method.def_id).input(0).skip_binder();
-        let param_env = ty::ParamEnv::empty(Reveal::All);
+        let param_env = ty::ParamEnv::reveal_all();
 
         tcx.infer_ctxt().enter(|infcx| {
             let self_arg_ty = tcx.liberate_late_bound_regions(
@@ -759,7 +759,7 @@ pub fn compare_const_impl<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     debug!("compare_const_impl(impl_trait_ref={:?})", impl_trait_ref);
 
     tcx.infer_ctxt().enter(|infcx| {
-        let param_env = ty::ParamEnv::empty(Reveal::UserFacing);
+        let param_env = ty::ParamEnv::empty();
         let inh = Inherited::new(infcx, impl_c.def_id);
         let infcx = &inh.infcx;
 
@@ -839,7 +839,7 @@ pub fn compare_const_impl<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         // Check that all obligations are satisfied by the implementation's
         // version.
         if let Err(ref errors) = inh.fulfillment_cx.borrow_mut().select_all_or_error(&infcx) {
-            infcx.report_fulfillment_errors(errors, None);
+            infcx.report_fulfillment_errors(errors, None, false);
             return;
         }
 
