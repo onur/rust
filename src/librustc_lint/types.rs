@@ -12,10 +12,8 @@
 
 use rustc::hir::map as hir_map;
 use rustc::ty::subst::Substs;
-use rustc::ty::{self, AdtKind, Ty, TyCtxt};
+use rustc::ty::{self, AdtKind, ParamEnv, Ty, TyCtxt};
 use rustc::ty::layout::{self, LayoutOf};
-use middle::const_val::ConstVal;
-use rustc_const_eval::ConstContext;
 use util::nodemap::FxHashSet;
 use lint::{LateContext, LintContext, LintArray};
 use lint::{LintPass, LateLintPass};
@@ -23,7 +21,7 @@ use lint::{LintPass, LateLintPass};
 use std::cmp;
 use std::{i8, i16, i32, i64, u8, u16, u32, u64, f32, f64};
 
-use syntax::ast;
+use syntax::{ast, attr};
 use syntax::abi::Abi;
 use syntax_pos::Span;
 use syntax::codemap;
@@ -40,12 +38,6 @@ declare_lint! {
     OVERFLOWING_LITERALS,
     Warn,
     "literal out of range for its type"
-}
-
-declare_lint! {
-    EXCEEDING_BITSHIFTS,
-    Deny,
-    "shift exceeds the type's number of bits"
 }
 
 declare_lint! {
@@ -69,8 +61,7 @@ impl TypeLimits {
 impl LintPass for TypeLimits {
     fn get_lints(&self) -> LintArray {
         lint_array!(UNUSED_COMPARISONS,
-                    OVERFLOWING_LITERALS,
-                    EXCEEDING_BITSHIFTS)
+                    OVERFLOWING_LITERALS)
     }
 }
 
@@ -88,49 +79,6 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                     cx.span_lint(UNUSED_COMPARISONS,
                                  e.span,
                                  "comparison is useless due to type limits");
-                }
-
-                if binop.node.is_shift() {
-                    let opt_ty_bits = match cx.tables.node_id_to_type(l.hir_id).sty {
-                        ty::TyInt(t) => Some(int_ty_bits(t, cx.sess().target.isize_ty)),
-                        ty::TyUint(t) => Some(uint_ty_bits(t, cx.sess().target.usize_ty)),
-                        _ => None,
-                    };
-
-                    if let Some(bits) = opt_ty_bits {
-                        let exceeding = if let hir::ExprLit(ref lit) = r.node {
-                            if let ast::LitKind::Int(shift, _) = lit.node {
-                                shift as u64 >= bits
-                            } else {
-                                false
-                            }
-                        } else {
-                            // HACK(eddyb) This might be quite inefficient.
-                            // This would be better left to MIR constant propagation,
-                            // perhaps even at trans time (like is the case already
-                            // when the value being shifted is *also* constant).
-                            let parent_item = cx.tcx.hir.get_parent(e.id);
-                            let parent_def_id = cx.tcx.hir.local_def_id(parent_item);
-                            let substs = Substs::identity_for_item(cx.tcx, parent_def_id);
-                            let const_cx = ConstContext::new(cx.tcx,
-                                                             cx.param_env.and(substs),
-                                                             cx.tables);
-                            match const_cx.eval(&r) {
-                                Ok(&ty::Const { val: ConstVal::Integral(i), .. }) => {
-                                    i.is_negative() ||
-                                    i.to_u64()
-                                        .map(|i| i >= bits)
-                                        .unwrap_or(true)
-                                }
-                                _ => false,
-                            }
-                        };
-                        if exceeding {
-                            cx.span_lint(EXCEEDING_BITSHIFTS,
-                                         e.span,
-                                         "bitshift exceeds the type's number of bits");
-                        }
-                    };
                 }
             }
             hir::ExprLit(ref lit) => {
@@ -150,11 +98,23 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
 
                                 // Detect literal value out of range [min, max] inclusive
                                 // avoiding use of -min to prevent overflow/panic
-                                if (negative && v > max + 1) ||
-                                   (!negative && v > max) {
-                                    cx.span_lint(OVERFLOWING_LITERALS,
-                                                 e.span,
-                                                 &format!("literal out of range for {:?}", t));
+                                if (negative && v > max + 1) || (!negative && v > max) {
+                                    if let Some(repr_str) = get_bin_hex_repr(cx, lit) {
+                                        report_bin_hex_error(
+                                            cx,
+                                            e,
+                                            ty::TyInt(t),
+                                            repr_str,
+                                            v,
+                                            negative,
+                                        );
+                                        return;
+                                    }
+                                    cx.span_lint(
+                                        OVERFLOWING_LITERALS,
+                                        e.span,
+                                        &format!("literal out of range for {:?}", t),
+                                    );
                                     return;
                                 }
                             }
@@ -182,7 +142,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                                         let mut err = cx.struct_span_lint(
                                                              OVERFLOWING_LITERALS,
                                                              parent_expr.span,
-                                                             "only u8 can be casted into char");
+                                                             "only u8 can be cast into char");
                                         err.span_suggestion(parent_expr.span,
                                                             &"use a char literal instead",
                                                             format!("'\\u{{{:X}}}'", lit_val));
@@ -191,9 +151,22 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                                     }
                                 }
                             }
-                            cx.span_lint(OVERFLOWING_LITERALS,
-                                         e.span,
-                                         &format!("literal out of range for {:?}", t));
+                            if let Some(repr_str) = get_bin_hex_repr(cx, lit) {
+                                report_bin_hex_error(
+                                    cx,
+                                    e,
+                                    ty::TyUint(t),
+                                    repr_str,
+                                    lit_val,
+                                    false,
+                                );
+                                return;
+                            }
+                            cx.span_lint(
+                                OVERFLOWING_LITERALS,
+                                e.span,
+                                &format!("literal out of range for {:?}", t),
+                            );
                         }
                     }
                     ty::TyFloat(t) => {
@@ -265,28 +238,6 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
             }
         }
 
-        fn int_ty_bits(int_ty: ast::IntTy, isize_ty: ast::IntTy) -> u64 {
-            match int_ty {
-                ast::IntTy::Isize => int_ty_bits(isize_ty, isize_ty),
-                ast::IntTy::I8 => 8,
-                ast::IntTy::I16 => 16 as u64,
-                ast::IntTy::I32 => 32,
-                ast::IntTy::I64 => 64,
-                ast::IntTy::I128 => 128,
-            }
-        }
-
-        fn uint_ty_bits(uint_ty: ast::UintTy, usize_ty: ast::UintTy) -> u64 {
-            match uint_ty {
-                ast::UintTy::Usize => uint_ty_bits(usize_ty, usize_ty),
-                ast::UintTy::U8 => 8,
-                ast::UintTy::U16 => 16,
-                ast::UintTy::U32 => 32,
-                ast::UintTy::U64 => 64,
-                ast::UintTy::U128 => 128,
-            }
-        }
-
         fn check_limits(cx: &LateContext,
                         binop: hir::BinOp,
                         l: &hir::Expr,
@@ -337,6 +288,122 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                 hir::BiEq | hir::BiLt | hir::BiLe | hir::BiNe | hir::BiGe | hir::BiGt => true,
                 _ => false,
             }
+        }
+
+        fn get_bin_hex_repr(cx: &LateContext, lit: &ast::Lit) -> Option<String> {
+            let src = cx.sess().codemap().span_to_snippet(lit.span).ok()?;
+            let firstch = src.chars().next()?;
+
+            if firstch == '0' {
+                match src.chars().nth(1) {
+                    Some('x') | Some('b') => return Some(src),
+                    _ => return None,
+                }
+            }
+
+            None
+        }
+
+        // This function finds the next fitting type and generates a suggestion string.
+        // It searches for fitting types in the following way (`X < Y`):
+        //  - `iX`: if literal fits in `uX` => `uX`, else => `iY`
+        //  - `-iX` => `iY`
+        //  - `uX` => `uY`
+        //
+        // No suggestion for: `isize`, `usize`.
+        fn get_type_suggestion<'a>(
+            t: &ty::TypeVariants,
+            val: u128,
+            negative: bool,
+        ) -> Option<String> {
+            use syntax::ast::IntTy::*;
+            use syntax::ast::UintTy::*;
+            macro_rules! find_fit {
+                ($ty:expr, $val:expr, $negative:expr,
+                 $($type:ident => [$($utypes:expr),*] => [$($itypes:expr),*]),+) => {
+                    {
+                        let _neg = if negative { 1 } else { 0 };
+                        match $ty {
+                            $($type => {
+                                $(if !negative && val <= uint_ty_range($utypes).1 {
+                                    return Some(format!("{:?}", $utypes))
+                                })*
+                                $(if val <= int_ty_range($itypes).1 as u128 + _neg {
+                                    return Some(format!("{:?}", $itypes))
+                                })*
+                                None
+                            },)*
+                            _ => None
+                        }
+                    }
+                }
+            }
+            match t {
+                &ty::TyInt(i) => find_fit!(i, val, negative,
+                              I8 => [U8] => [I16, I32, I64, I128],
+                              I16 => [U16] => [I32, I64, I128],
+                              I32 => [U32] => [I64, I128],
+                              I64 => [U64] => [I128],
+                              I128 => [U128] => []),
+                &ty::TyUint(u) => find_fit!(u, val, negative,
+                              U8 => [U8, U16, U32, U64, U128] => [],
+                              U16 => [U16, U32, U64, U128] => [],
+                              U32 => [U32, U64, U128] => [],
+                              U64 => [U64, U128] => [],
+                              U128 => [U128] => []),
+                _ => None,
+            }
+        }
+
+        fn report_bin_hex_error(
+            cx: &LateContext,
+            expr: &hir::Expr,
+            ty: ty::TypeVariants,
+            repr_str: String,
+            val: u128,
+            negative: bool,
+        ) {
+            let (t, actually) = match ty {
+                ty::TyInt(t) => {
+                    let ity = attr::IntType::SignedInt(t);
+                    let bits = layout::Integer::from_attr(cx.tcx, ity).size().bits();
+                    let actually = (val << (128 - bits)) as i128 >> (128 - bits);
+                    (format!("{:?}", t), actually.to_string())
+                }
+                ty::TyUint(t) => {
+                    let ity = attr::IntType::UnsignedInt(t);
+                    let bits = layout::Integer::from_attr(cx.tcx, ity).size().bits();
+                    let actually = (val << (128 - bits)) >> (128 - bits);
+                    (format!("{:?}", t), actually.to_string())
+                }
+                _ => bug!(),
+            };
+            let mut err = cx.struct_span_lint(
+                OVERFLOWING_LITERALS,
+                expr.span,
+                &format!("literal out of range for {}", t),
+            );
+            err.note(&format!(
+                "the literal `{}` (decimal `{}`) does not fit into \
+                 an `{}` and will become `{}{}`",
+                repr_str, val, t, actually, t
+            ));
+            if let Some(sugg_ty) =
+                get_type_suggestion(&cx.tables.node_id_to_type(expr.hir_id).sty, val, negative)
+            {
+                if let Some(pos) = repr_str.chars().position(|c| c == 'i' || c == 'u') {
+                    let (sans_suffix, _) = repr_str.split_at(pos);
+                    err.span_suggestion(
+                        expr.span,
+                        &format!("consider using `{}` instead", sugg_ty),
+                        format!("{}{}", sans_suffix, sugg_ty),
+                    );
+                } else {
+                    err.help(&format!("consider using `{}` instead", sugg_ty));
+                }
+            }
+
+            err.emit();
         }
     }
 }
@@ -442,8 +509,9 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                         // make sure the fields are actually safe.
                         let mut all_phantom = true;
                         for field in &def.non_enum_variant().fields {
-                            let field_ty = cx.fully_normalize_associated_types_in(
-                                &field.ty(cx, substs)
+                            let field_ty = cx.normalize_erasing_regions(
+                                ParamEnv::reveal_all(),
+                                field.ty(cx, substs),
                             );
                             // repr(transparent) types are allowed to have arbitrary ZSTs, not just
                             // PhantomData -- skip checking all ZST fields
@@ -489,8 +557,9 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
 
                         let mut all_phantom = true;
                         for field in &def.non_enum_variant().fields {
-                            let field_ty = cx.fully_normalize_associated_types_in(
-                                &field.ty(cx, substs)
+                            let field_ty = cx.normalize_erasing_regions(
+                                ParamEnv::reveal_all(),
+                                field.ty(cx, substs),
                             );
                             let r = self.check_type_for_ffi(cache, field_ty);
                             match r {
@@ -529,8 +598,9 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                         // Check the contained variants.
                         for variant in &def.variants {
                             for field in &variant.fields {
-                                let arg = cx.fully_normalize_associated_types_in(
-                                    &field.ty(cx, substs)
+                                let arg = cx.normalize_erasing_regions(
+                                    ParamEnv::reveal_all(),
+                                    field.ty(cx, substs),
                                 );
                                 let r = self.check_type_for_ffi(cache, arg);
                                 match r {
@@ -649,7 +719,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
     fn check_type_for_ffi_and_report_errors(&mut self, sp: Span, ty: Ty<'tcx>) {
         // it is only OK to use this function because extern fns cannot have
         // any generic types right now:
-        let ty = self.cx.tcx.fully_normalize_associated_types_in(&ty);
+        let ty = self.cx.tcx.normalize_erasing_regions(ParamEnv::reveal_all(), ty);
 
         match self.check_type_for_ffi(&mut FxHashSet(), ty) {
             FfiResult::FfiSafe => {}

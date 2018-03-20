@@ -34,6 +34,7 @@ use rustc::middle::privacy::AccessLevels;
 use rustc::middle::resolve_lifetime as rl;
 use rustc::ty::fold::TypeFolder;
 use rustc::middle::lang_items;
+use rustc::mir::interpret::GlobalId;
 use rustc::hir::{self, HirVec};
 use rustc::hir::def::{self, Def, CtorKind};
 use rustc::hir::def_id::{CrateNum, DefId, DefIndex, CRATE_DEF_INDEX, LOCAL_CRATE};
@@ -51,7 +52,6 @@ use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
 use std::fmt;
 
-use rustc_const_math::ConstInt;
 use std::default::Default;
 use std::{mem, slice, vec};
 use std::iter::{FromIterator, once};
@@ -1322,7 +1322,7 @@ fn external_path_params(cx: &DocContext, trait_did: Option<DefId>, has_self: boo
         Some(did) if cx.tcx.lang_items().fn_trait_kind(did).is_some() => {
             assert_eq!(types.len(), 1);
             let inputs = match types[0].sty {
-                ty::TyTuple(ref tys, _) => tys.iter().map(|t| t.clean(cx)).collect(),
+                ty::TyTuple(ref tys) => tys.iter().map(|t| t.clean(cx)).collect(),
                 _ => {
                     return PathParameters::AngleBracketed {
                         lifetimes,
@@ -1334,7 +1334,7 @@ fn external_path_params(cx: &DocContext, trait_did: Option<DefId>, has_self: boo
             let output = None;
             // FIXME(#20299) return type comes from a projection now
             // match types[1].sty {
-            //     ty::TyTuple(ref v, _) if v.is_empty() => None, // -> ()
+            //     ty::TyTuple(ref v) if v.is_empty() => None, // -> ()
             //     _ => Some(types[1].clean(cx))
             // };
             PathParameters::Parenthesized {
@@ -1377,7 +1377,7 @@ impl<'tcx> Clean<TyParamBound> for ty::TraitRef<'tcx> {
         // collect any late bound regions
         let mut late_bounds = vec![];
         for ty_s in self.input_types().skip(1) {
-            if let ty::TyTuple(ts, _) = ty_s.sty {
+            if let ty::TyTuple(ts) = ty_s.sty {
                 for &ty_s in ts {
                     if let ty::TyRef(ref reg, _) = ty_s.sty {
                         if let &ty::RegionKind::ReLateBound(..) = *reg {
@@ -1490,6 +1490,7 @@ impl Clean<Option<Lifetime>> for ty::RegionKind {
             ty::ReSkolemized(..) |
             ty::ReEmpty |
             ty::ReClosureBound(_) |
+            ty::ReCanonical(_) |
             ty::ReErased => None
         }
     }
@@ -1535,7 +1536,6 @@ impl<'a> Clean<WherePredicate> for ty::Predicate<'a> {
 
         match *self {
             Predicate::Trait(ref pred) => pred.clean(cx),
-            Predicate::Equate(ref pred) => pred.clean(cx),
             Predicate::Subtype(ref pred) => pred.clean(cx),
             Predicate::RegionOutlives(ref pred) => pred.clean(cx),
             Predicate::TypeOutlives(ref pred) => pred.clean(cx),
@@ -1553,16 +1553,6 @@ impl<'a> Clean<WherePredicate> for ty::TraitPredicate<'a> {
         WherePredicate::BoundPredicate {
             ty: self.trait_ref.self_ty().clean(cx),
             bounds: vec![self.trait_ref.clean(cx)]
-        }
-    }
-}
-
-impl<'tcx> Clean<WherePredicate> for ty::EquatePredicate<'tcx> {
-    fn clean(&self, cx: &DocContext) -> WherePredicate {
-        let ty::EquatePredicate(ref lhs, ref rhs) = *self;
-        WherePredicate::EqPredicate {
-            lhs: lhs.clean(cx),
-            rhs: rhs.clean(cx)
         }
     }
 }
@@ -2512,23 +2502,17 @@ impl Clean<Type> for hir::Ty {
                 let def_id = cx.tcx.hir.body_owner_def_id(n);
                 let param_env = cx.tcx.param_env(def_id);
                 let substs = Substs::identity_for_item(cx.tcx, def_id);
-                let n = cx.tcx.const_eval(param_env.and((def_id, substs))).unwrap_or_else(|_| {
+                let cid = GlobalId {
+                    instance: ty::Instance::new(def_id, substs),
+                    promoted: None
+                };
+                let n = cx.tcx.const_eval(param_env.and(cid)).unwrap_or_else(|_| {
                     cx.tcx.mk_const(ty::Const {
                         val: ConstVal::Unevaluated(def_id, substs),
                         ty: cx.tcx.types.usize
                     })
                 });
-                let n = if let ConstVal::Integral(ConstInt::Usize(n)) = n.val {
-                    n.to_string()
-                } else if let ConstVal::Unevaluated(def_id, _) = n.val {
-                    if let Some(node_id) = cx.tcx.hir.as_local_node_id(def_id) {
-                        print_const_expr(cx, cx.tcx.hir.body_owned_by(node_id))
-                    } else {
-                        inline::print_inlined_const(cx, def_id)
-                    }
-                } else {
-                    format!("{:?}", n)
-                };
+                let n = print_const(cx, n);
                 Array(box ty.clean(cx), n)
             },
             TyTup(ref tys) => Tuple(tys.clean(cx)),
@@ -2647,21 +2631,15 @@ impl<'tcx> Clean<Type> for Ty<'tcx> {
                 let mut n = cx.tcx.lift(&n).unwrap();
                 if let ConstVal::Unevaluated(def_id, substs) = n.val {
                     let param_env = cx.tcx.param_env(def_id);
-                    if let Ok(new_n) = cx.tcx.const_eval(param_env.and((def_id, substs))) {
+                    let cid = GlobalId {
+                        instance: ty::Instance::new(def_id, substs),
+                        promoted: None
+                    };
+                    if let Ok(new_n) = cx.tcx.const_eval(param_env.and(cid)) {
                         n = new_n;
                     }
                 };
-                let n = if let ConstVal::Integral(ConstInt::Usize(n)) = n.val {
-                    n.to_string()
-                } else if let ConstVal::Unevaluated(def_id, _) = n.val {
-                    if let Some(node_id) = cx.tcx.hir.as_local_node_id(def_id) {
-                        print_const_expr(cx, cx.tcx.hir.body_owned_by(node_id))
-                    } else {
-                        inline::print_inlined_const(cx, def_id)
-                    }
-                } else {
-                    format!("{:?}", n)
-                };
+                let n = print_const(cx, n);
                 Array(box ty.clean(cx), n)
             }
             ty::TyRawPtr(mt) => RawPointer(mt.mutbl.clean(cx), box mt.ty.clean(cx)),
@@ -2753,7 +2731,7 @@ impl<'tcx> Clean<Type> for Ty<'tcx> {
                     Never
                 }
             }
-            ty::TyTuple(ref t, _) => Tuple(t.clean(cx)),
+            ty::TyTuple(ref t) => Tuple(t.clean(cx)),
 
             ty::TyProjection(ref data) => data.clean(cx),
 
@@ -3641,6 +3619,28 @@ fn name_from_pat(p: &hir::Pat) -> String {
             let mid = mid.as_ref().map(|p| format!("..{}", name_from_pat(&**p))).into_iter();
             let end = end.iter().map(|p| name_from_pat(&**p));
             format!("[{}]", begin.chain(mid).chain(end).collect::<Vec<_>>().join(", "))
+        },
+    }
+}
+
+fn print_const(cx: &DocContext, n: &ty::Const) -> String {
+    match n.val {
+        ConstVal::Unevaluated(def_id, _) => {
+            if let Some(node_id) = cx.tcx.hir.as_local_node_id(def_id) {
+                print_const_expr(cx, cx.tcx.hir.body_owned_by(node_id))
+            } else {
+                inline::print_inlined_const(cx, def_id)
+            }
+        },
+        ConstVal::Value(val) => {
+            let mut s = String::new();
+            ::rustc::mir::print_miri_value(val, n.ty, &mut s).unwrap();
+            // array lengths are obviously usize
+            if s.ends_with("usize") {
+                let n = s.len() - "usize".len();
+                s.truncate(n);
+            }
+            s
         },
     }
 }

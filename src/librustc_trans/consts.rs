@@ -13,7 +13,6 @@ use llvm::{SetUnnamedAddr};
 use llvm::{ValueRef, True};
 use rustc::hir::def_id::DefId;
 use rustc::hir::map as hir_map;
-use rustc::middle::const_val::ConstEvalErr;
 use debuginfo;
 use base;
 use monomorphize::MonoItem;
@@ -134,7 +133,7 @@ pub fn get_static(cx: &CodegenCx, def_id: DefId) -> ValueRef {
 
                 let g = declare::define_global(cx, &sym[..], llty).unwrap();
 
-                if !cx.tcx.is_exported_symbol(def_id) {
+                if !cx.tcx.is_reachable_non_generic(def_id) {
                     unsafe {
                         llvm::LLVMRustSetVisibility(g, llvm::Visibility::Hidden);
                     }
@@ -146,20 +145,12 @@ pub fn get_static(cx: &CodegenCx, def_id: DefId) -> ValueRef {
             hir_map::NodeForeignItem(&hir::ForeignItem {
                 ref attrs, span, node: hir::ForeignItemStatic(..), ..
             }) => {
-
-                let g = if let Some(name) =
-                        attr::first_attr_value_str_by_name(&attrs, "linkage") {
+                let g = if let Some(linkage) = cx.tcx.trans_fn_attrs(def_id).linkage {
                     // If this is a static with a linkage specified, then we need to handle
                     // it a little specially. The typesystem prevents things like &T and
                     // extern "C" fn() from being non-null, so we can't just declare a
                     // static and call it a day. Some linkages (like weak) will make it such
                     // that the static actually has a null value.
-                    let linkage = match base::linkage_by_name(&name.as_str()) {
-                        Some(linkage) => linkage,
-                        None => {
-                            cx.sess().span_fatal(span, "invalid linkage specified");
-                        }
-                    };
                     let llty2 = match ty.sty {
                         ty::TyRawPtr(ref mt) => cx.layout_of(mt.ty).llvm_type(cx),
                         _ => {
@@ -255,12 +246,15 @@ pub fn get_static(cx: &CodegenCx, def_id: DefId) -> ValueRef {
 pub fn trans_static<'a, 'tcx>(cx: &CodegenCx<'a, 'tcx>,
                               def_id: DefId,
                               is_mutable: bool,
-                              attrs: &[ast::Attribute])
-                              -> Result<ValueRef, ConstEvalErr<'tcx>> {
+                              attrs: &[ast::Attribute]) {
     unsafe {
         let g = get_static(cx, def_id);
 
-        let v = ::mir::trans_static_initializer(cx, def_id)?;
+        let v = match ::mir::trans_static_initializer(cx, def_id) {
+            Ok(v) => v,
+            // Error has already been reported
+            Err(_) => return,
+        };
 
         // boolean SSA values are i1, but they have to be stored in i8 slots,
         // otherwise some LLVM optimization passes don't work as expected
@@ -324,7 +318,5 @@ pub fn trans_static<'a, 'tcx>(cx: &CodegenCx<'a, 'tcx>,
             let cast = llvm::LLVMConstPointerCast(g, Type::i8p(cx).to_ref());
             cx.used_statics.borrow_mut().push(cast);
         }
-
-        Ok(g)
     }
 }

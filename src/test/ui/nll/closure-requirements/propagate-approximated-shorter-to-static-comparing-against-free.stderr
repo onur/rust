@@ -79,8 +79,8 @@ LL |     let cell = Cell::new(&a);
 LL | }
    | - borrowed value only lives until here
    |
-   = note: borrowed value must be valid for lifetime '_#2r...
+   = note: borrowed value must be valid for the static lifetime...
 
 error: aborting due to 2 previous errors
 
-If you want more information on this error, try using "rustc --explain E0597"
+For more information about this error, try `rustc --explain E0597`.

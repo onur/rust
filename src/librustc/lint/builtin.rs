@@ -17,8 +17,13 @@
 use errors::DiagnosticBuilder;
 use lint::{LintPass, LateLintPass, LintArray};
 use session::Session;
-use session::config::Epoch;
 use syntax::codemap::Span;
+
+declare_lint! {
+    pub EXCEEDING_BITSHIFTS,
+    Deny,
+    "shift exceeds the type's number of bits"
+}
 
 declare_lint! {
     pub CONST_ERR,
@@ -147,13 +152,6 @@ declare_lint! {
 }
 
 declare_lint! {
-    pub RESOLVE_TRAIT_ON_DEFAULTED_UNIT,
-    Deny,
-    "attempt to resolve a trait on an expression whose type cannot be inferred but which \
-     currently defaults to ()"
-}
-
-declare_lint! {
     pub SAFE_EXTERN_STATICS,
     Deny,
     "safe access to extern statics was erroneously allowed"
@@ -233,12 +231,6 @@ declare_lint! {
 }
 
 declare_lint! {
-    pub COERCE_NEVER,
-    Deny,
-    "detect coercion to !"
-}
-
-declare_lint! {
     pub SINGLE_USE_LIFETIME,
     Allow,
    "detects single use lifetimes"
@@ -258,9 +250,14 @@ declare_lint! {
 
 declare_lint! {
     pub BARE_TRAIT_OBJECT,
+    Allow,
+    "suggest using `dyn Trait` for trait objects"
+}
+
+declare_lint! {
+    pub ILLEGAL_FLOATING_POINT_LITERAL_PATTERN,
     Warn,
-    "suggest using `dyn Trait` for trait objects",
-    Epoch::Epoch2018
+    "floating-point literals cannot be used in patterns"
 }
 
 /// Does nothing as a lint pass, but registers some `Lint`s
@@ -271,6 +268,8 @@ pub struct HardwiredLints;
 impl LintPass for HardwiredLints {
     fn get_lints(&self) -> LintArray {
         lint_array!(
+            ILLEGAL_FLOATING_POINT_LITERAL_PATTERN,
+            EXCEEDING_BITSHIFTS,
             UNUSED_IMPORTS,
             UNUSED_EXTERN_CRATES,
             UNUSED_QUALIFICATIONS,
@@ -292,7 +291,6 @@ impl LintPass for HardwiredLints {
             INVALID_TYPE_PARAM_DEFAULT,
             CONST_ERR,
             RENAMED_AND_REMOVED_LINTS,
-            RESOLVE_TRAIT_ON_DEFAULTED_UNIT,
             SAFE_EXTERN_STATICS,
             SAFE_PACKED_BORROWS,
             PATTERNS_IN_FNS_WITHOUT_BODY,
@@ -306,7 +304,6 @@ impl LintPass for HardwiredLints {
             DEPRECATED,
             UNUSED_UNSAFE,
             UNUSED_MUT,
-            COERCE_NEVER,
             SINGLE_USE_LIFETIME,
             TYVAR_BEHIND_RAW_POINTER,
             ELIDED_LIFETIME_IN_PATH,

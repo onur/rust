@@ -2831,9 +2831,10 @@ impl<'a> Parser<'a> {
                 let (span, e) = self.interpolated_or_expr_span(e)?;
                 let span_of_tilde = lo;
                 let mut err = self.diagnostic().struct_span_err(span_of_tilde,
-                        "`~` can not be used as a unary operator");
-                err.span_label(span_of_tilde, "did you mean `!`?");
-                err.help("use `!` instead of `~` if you meant to perform bitwise negation");
+                        "`~` cannot be used as a unary operator");
+                err.span_suggestion_short(span_of_tilde,
+                                          "use `!` to perform bitwise negation",
+                                          "!".to_owned());
                 err.emit();
                 (lo.to(span), self.mk_unary(UnOp::Not, e))
             }
@@ -3114,7 +3115,7 @@ impl<'a> Parser<'a> {
                         let expr_str = self.sess.codemap().span_to_snippet(expr.span)
                                                 .unwrap_or(pprust::expr_to_string(&expr));
                         err.span_suggestion(expr.span,
-                                            &format!("try {} the casted value", op_verb),
+                                            &format!("try {} the cast value", op_verb),
                                             format!("({})", expr_str));
                         err.emit();
 
@@ -3318,7 +3319,7 @@ impl<'a> Parser<'a> {
                           mut attrs: ThinVec<Attribute>) -> PResult<'a, P<Expr>> {
         // Parse: `for <src_pat> in <src_expr> <src_loop_block>`
 
-        let pat = self.parse_pat()?;
+        let pat = self.parse_top_level_pat()?;
         if !self.eat_keyword(keywords::In) {
             let in_span = self.prev_span.between(self.span);
             let mut err = self.sess.span_diagnostic
@@ -3389,7 +3390,7 @@ impl<'a> Parser<'a> {
                                                None)?;
         if let Err(mut e) = self.expect(&token::OpenDelim(token::Brace)) {
             if self.token == token::Token::Semi {
-                e.span_note(match_span, "did you mean to remove this `match` keyword?");
+                e.span_suggestion_short(match_span, "try removing this `match`", "".to_owned());
             }
             return Err(e)
         }
@@ -3528,7 +3529,7 @@ impl<'a> Parser<'a> {
     fn parse_pats(&mut self) -> PResult<'a, Vec<P<Pat>>> {
         let mut pats = Vec::new();
         loop {
-            pats.push(self.parse_pat()?);
+            pats.push(self.parse_top_level_pat()?);
 
             if self.token == token::OrOr {
                 let mut err = self.struct_span_err(self.span,
@@ -3554,7 +3555,12 @@ impl<'a> Parser<'a> {
     // Trailing commas are significant because (p) and (p,) are different patterns.
     fn parse_parenthesized_pat_list(&mut self) -> PResult<'a, (Vec<P<Pat>>, Option<usize>, bool)> {
         self.expect(&token::OpenDelim(token::Paren))?;
+        let result = self.parse_pat_list()?;
+        self.expect(&token::CloseDelim(token::Paren))?;
+        Ok(result)
+    }
 
+    fn parse_pat_list(&mut self) -> PResult<'a, (Vec<P<Pat>>, Option<usize>, bool)> {
         let mut fields = Vec::new();
         let mut ddpos = None;
         let mut trailing_comma = false;
@@ -3583,8 +3589,6 @@ impl<'a> Parser<'a> {
             // `..` needs to be followed by `)` or `, pat`, `..,)` is disallowed.
             self.span_err(self.prev_span, "trailing comma is not permitted after `..`");
         }
-
-        self.expect(&token::CloseDelim(token::Paren))?;
 
         Ok((fields, ddpos, trailing_comma))
     }
@@ -3767,8 +3771,45 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// A wrapper around `parse_pat` with some special error handling for the
+    /// "top-level" patterns in a match arm, `for` loop, `let`, &c. (in contast
+    /// to subpatterns within such).
+    pub fn parse_top_level_pat(&mut self) -> PResult<'a, P<Pat>> {
+        let pat = self.parse_pat()?;
+        if self.token == token::Comma {
+            // An unexpected comma after a top-level pattern is a clue that the
+            // user (perhaps more accustomed to some other language) forgot the
+            // parentheses in what should have been a tuple pattern; return a
+            // suggestion-enhanced error here rather than choking on the comma
+            // later.
+            let comma_span = self.span;
+            self.bump();
+            if let Err(mut err) = self.parse_pat_list() {
+                // We didn't expect this to work anyway; we just wanted
+                // to advance to the end of the comma-sequence so we know
+                // the span to suggest parenthesizing
+                err.cancel();
+            }
+            let seq_span = pat.span.to(self.prev_span);
+            let mut err = self.struct_span_err(comma_span,
+                                               "unexpected `,` in pattern");
+            if let Ok(seq_snippet) = self.sess.codemap().span_to_snippet(seq_span) {
+                err.span_suggestion(seq_span, "try adding parentheses",
+                                    format!("({})", seq_snippet));
+            }
+            return Err(err);
+        }
+        Ok(pat)
+    }
+
     /// Parse a pattern.
     pub fn parse_pat(&mut self) -> PResult<'a, P<Pat>> {
+        self.parse_pat_with_range_pat(true)
+    }
+
+    /// Parse a pattern, with a setting whether modern range patterns e.g. `a..=b`, `a..b` are
+    /// allowed.
+    fn parse_pat_with_range_pat(&mut self, allow_range_pat: bool) -> PResult<'a, P<Pat>> {
         maybe_whole!(self, NtPat, |x| x);
 
         let lo = self.span;
@@ -3789,7 +3830,7 @@ impl<'a> Parser<'a> {
                     err.span_label(self.span, "unexpected lifetime");
                     return Err(err);
                 }
-                let subpat = self.parse_pat()?;
+                let subpat = self.parse_pat_with_range_pat(false)?;
                 pat = PatKind::Ref(subpat, mutbl);
             }
             token::OpenDelim(token::Paren) => {
@@ -3828,7 +3869,7 @@ impl<'a> Parser<'a> {
                 pat = self.parse_pat_ident(BindingMode::ByRef(mutbl))?;
             } else if self.eat_keyword(keywords::Box) {
                 // Parse box pat
-                let subpat = self.parse_pat()?;
+                let subpat = self.parse_pat_with_range_pat(false)?;
                 pat = PatKind::Box(subpat);
             } else if self.token.is_ident() && !self.token.is_reserved_ident() &&
                       self.parse_as_ident() {
@@ -3933,6 +3974,25 @@ impl<'a> Parser<'a> {
         let pat = Pat { node: pat, span: lo.to(self.prev_span), id: ast::DUMMY_NODE_ID };
         let pat = self.maybe_recover_from_bad_qpath(pat, true)?;
 
+        if !allow_range_pat {
+            match pat.node {
+                PatKind::Range(_, _, RangeEnd::Included(RangeSyntax::DotDotDot)) => {}
+                PatKind::Range(..) => {
+                    let mut err = self.struct_span_err(
+                        pat.span,
+                        "the range pattern here has ambiguous interpretation",
+                    );
+                    err.span_suggestion(
+                        pat.span,
+                        "add parentheses to clarify the precedence",
+                        format!("({})", pprust::pat_to_string(&pat)),
+                    );
+                    return Err(err);
+                }
+                _ => {}
+            }
+        }
+
         Ok(P(pat))
     }
 
@@ -3969,7 +4029,7 @@ impl<'a> Parser<'a> {
     /// Parse a local variable declaration
     fn parse_local(&mut self, attrs: ThinVec<Attribute>) -> PResult<'a, P<Local>> {
         let lo = self.prev_span;
-        let pat = self.parse_pat()?;
+        let pat = self.parse_top_level_pat()?;
 
         let (err, ty) = if self.eat(&token::Colon) {
             // Save the state of the parser before parsing type normally, in case there is a `:`
@@ -4917,6 +4977,7 @@ impl<'a> Parser<'a> {
                         }
                     ));
                 // FIXME: Decide what should be used here, `=` or `==`.
+                // FIXME: We are just dropping the binders in lifetime_defs on the floor here.
                 } else if self.eat(&token::Eq) || self.eat(&token::EqEq) {
                     let rhs_ty = self.parse_ty()?;
                     where_clause.predicates.push(ast::WherePredicate::EqPredicate(
@@ -5326,7 +5387,9 @@ impl<'a> Parser<'a> {
                 if is_macro_rules {
                     let mut err = self.diagnostic()
                         .struct_span_err(sp, "can't qualify macro_rules invocation with `pub`");
-                    err.help("did you mean #[macro_export]?");
+                    err.span_suggestion(sp,
+                                        "try exporting the macro",
+                                        "#[macro_export]".to_owned());
                     Err(err)
                 } else {
                     let mut err = self.diagnostic()
@@ -5574,18 +5637,8 @@ impl<'a> Parser<'a> {
             self.expect_lt()?;
             let params = self.parse_generic_params()?;
             self.expect_gt()?;
-
-            let first_non_lifetime_param_span = params.iter()
-                .filter_map(|param| match *param {
-                    ast::GenericParam::Lifetime(_) => None,
-                    ast::GenericParam::Type(ref t) => Some(t.span),
-                })
-                .next();
-
-            if let Some(span) = first_non_lifetime_param_span {
-                self.span_err(span, "only lifetime parameters can be used in this context");
-            }
-
+            // We rely on AST validation to rule out invalid cases: There must not be type
+            // parameters, and the lifetime parameters must not have bounds.
             Ok(params)
         } else {
             Ok(Vec::new())
@@ -7012,7 +7065,11 @@ impl<'a> Parser<'a> {
 
     fn parse_rename(&mut self) -> PResult<'a, Option<Ident>> {
         if self.eat_keyword(keywords::As) {
-            self.parse_ident().map(Some)
+            if self.eat(&token::Underscore) {
+                Ok(Some(Ident::with_empty_ctxt(Symbol::gensym("_"))))
+            } else {
+                self.parse_ident().map(Some)
+            }
         } else {
             Ok(None)
         }

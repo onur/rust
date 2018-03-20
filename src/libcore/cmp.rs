@@ -427,6 +427,7 @@ impl<T: Ord> Ord for Reverse<T> {
 ///     }
 /// }
 /// ```
+#[cfg_attr(not(stage0), lang = "ord")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait Ord: Eq + PartialOrd<Self> {
     /// This method returns an `Ordering` between `self` and `other`.
@@ -596,7 +597,8 @@ impl PartialOrd for Ordering {
 /// assert_eq!(x < y, true);
 /// assert_eq!(x.lt(&y), true);
 /// ```
-#[lang = "ord"]
+#[cfg_attr(stage0, lang = "ord")]
+#[cfg_attr(not(stage0), lang = "partial_ord")]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_on_unimplemented = "can't compare `{Self}` with `{Rhs}`"]
 pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
@@ -880,24 +882,24 @@ mod impls {
 
     ord_impl! { char usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 
-    #[unstable(feature = "never_type", issue = "35121")]
+    #[stable(feature = "never_type", since = "1.26.0")]
     impl PartialEq for ! {
         fn eq(&self, _: &!) -> bool {
             *self
         }
     }
 
-    #[unstable(feature = "never_type", issue = "35121")]
+    #[stable(feature = "never_type", since = "1.26.0")]
     impl Eq for ! {}
 
-    #[unstable(feature = "never_type", issue = "35121")]
+    #[stable(feature = "never_type", since = "1.26.0")]
     impl PartialOrd for ! {
         fn partial_cmp(&self, _: &!) -> Option<Ordering> {
             *self
         }
     }
 
-    #[unstable(feature = "never_type", issue = "35121")]
+    #[stable(feature = "never_type", since = "1.26.0")]
     impl Ord for ! {
         fn cmp(&self, _: &!) -> Ordering {
             *self

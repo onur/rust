@@ -28,7 +28,7 @@ use build_helper::output;
 
 use {Build, Compiler, Mode};
 use channel;
-use util::{cp_r, libdir, is_dylib, cp_filtered, copy, replace_in_file};
+use util::{cp_r, libdir, is_dylib, cp_filtered, copy, replace_in_file, exe};
 use builder::{Builder, RunConfig, ShouldRun, Step};
 use compile;
 use native;
@@ -70,7 +70,6 @@ pub struct Docs {
 impl Step for Docs {
     type Output = PathBuf;
     const DEFAULT: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         run.path("src/doc")
@@ -271,7 +270,6 @@ pub struct Mingw {
 impl Step for Mingw {
     type Output = Option<PathBuf>;
     const DEFAULT: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         run.never()
@@ -331,7 +329,6 @@ impl Step for Rustc {
     type Output = PathBuf;
     const DEFAULT: bool = true;
     const ONLY_HOSTS: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         run.path("src/librustc")
@@ -443,6 +440,22 @@ impl Step for Rustc {
             t!(fs::create_dir_all(&backends_dst));
             cp_r(&backends_src, &backends_dst);
 
+            // Copy over lld if it's there
+            if builder.config.lld_enabled {
+                let exe = exe("lld", &compiler.host);
+                let src = builder.sysroot_libdir(compiler, host)
+                    .parent()
+                    .unwrap()
+                    .join("bin")
+                    .join(&exe);
+                let dst = image.join("lib/rustlib")
+                    .join(&*host)
+                    .join("bin")
+                    .join(&exe);
+                t!(fs::create_dir_all(&dst.parent().unwrap()));
+                copy(&src, &dst);
+            }
+
             // Man pages
             t!(fs::create_dir_all(image.join("share/man/man1")));
             let man_src = build.src.join("src/doc/man");
@@ -545,7 +558,6 @@ pub struct Std {
 impl Step for Std {
     type Output = PathBuf;
     const DEFAULT: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         run.path("src/libstd")
@@ -553,7 +565,7 @@ impl Step for Std {
 
     fn make_run(run: RunConfig) {
         run.builder.ensure(Std {
-            compiler: run.builder.compiler(run.builder.top_stage, run.host),
+            compiler: run.builder.compiler(run.builder.top_stage, run.builder.build.build),
             target: run.target,
         });
     }
@@ -590,7 +602,10 @@ impl Step for Std {
         let mut src = builder.sysroot_libdir(compiler, target).to_path_buf();
         src.pop(); // Remove the trailing /lib folder from the sysroot_libdir
         cp_filtered(&src, &dst, &|path| {
-            path.file_name().and_then(|s| s.to_str()) != Some("codegen-backends")
+            let name = path.file_name().and_then(|s| s.to_str());
+            name != Some(build.config.rust_codegen_backends_dir.as_str()) &&
+                name != Some("bin")
+
         });
 
         let mut cmd = rust_installer(builder);
@@ -619,7 +634,6 @@ pub struct Analysis {
 impl Step for Analysis {
     type Output = PathBuf;
     const DEFAULT: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         let builder = run.builder;
@@ -628,7 +642,7 @@ impl Step for Analysis {
 
     fn make_run(run: RunConfig) {
         run.builder.ensure(Analysis {
-            compiler: run.builder.compiler(run.builder.top_stage, run.host),
+            compiler: run.builder.compiler(run.builder.top_stage, run.builder.build.build),
             target: run.target,
         });
     }
@@ -736,8 +750,6 @@ impl Step for Src {
     type Output = PathBuf;
     const DEFAULT: bool = true;
     const ONLY_HOSTS: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
-    const ONLY_BUILD: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         run.path("src")
@@ -791,6 +803,7 @@ impl Step for Src {
             "src/libterm",
             "src/jemalloc",
             "src/libprofiler_builtins",
+            "src/stdsimd",
         ];
         let std_src_dirs_exclude = [
             "src/libcompiler_builtins/compiler-rt/test",
@@ -831,8 +844,6 @@ impl Step for PlainSourceTarball {
     type Output = PathBuf;
     const DEFAULT: bool = true;
     const ONLY_HOSTS: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
-    const ONLY_BUILD: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         let builder = run.builder;
@@ -987,7 +998,6 @@ pub struct Cargo {
 
 impl Step for Cargo {
     type Output = PathBuf;
-    const ONLY_BUILD_TARGETS: bool = true;
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
@@ -1075,7 +1085,6 @@ pub struct Rls {
 
 impl Step for Rls {
     type Output = Option<PathBuf>;
-    const ONLY_BUILD_TARGETS: bool = true;
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
@@ -1157,7 +1166,6 @@ pub struct Rustfmt {
 
 impl Step for Rustfmt {
     type Output = Option<PathBuf>;
-    const ONLY_BUILD_TARGETS: bool = true;
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
@@ -1243,7 +1251,6 @@ pub struct Extended {
 impl Step for Extended {
     type Output = ();
     const DEFAULT: bool = true;
-    const ONLY_BUILD_TARGETS: bool = true;
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
@@ -1254,7 +1261,7 @@ impl Step for Extended {
     fn make_run(run: RunConfig) {
         run.builder.ensure(Extended {
             stage: run.builder.top_stage,
-            host: run.host,
+            host: run.builder.build.build,
             target: run.target,
         });
     }
@@ -1672,9 +1679,7 @@ pub struct HashSign;
 
 impl Step for HashSign {
     type Output = ();
-    const ONLY_BUILD_TARGETS: bool = true;
     const ONLY_HOSTS: bool = true;
-    const ONLY_BUILD: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         run.path("hash-and-sign")

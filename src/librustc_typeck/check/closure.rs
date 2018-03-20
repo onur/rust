@@ -140,7 +140,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // the `closures` table.
         let sig = bound_sig.map_bound(|sig| {
             self.tcx.mk_fn_sig(
-                iter::once(self.tcx.intern_tup(sig.inputs(), false)),
+                iter::once(self.tcx.intern_tup(sig.inputs())),
                 sig.output(),
                 sig.variadic,
                 sig.unsafety,
@@ -255,7 +255,6 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 let opt_trait_ref = match obligation.predicate {
                     ty::Predicate::Projection(ref data) => Some(data.to_poly_trait_ref(self.tcx)),
                     ty::Predicate::Trait(ref data) => Some(data.to_poly_trait_ref()),
-                    ty::Predicate::Equate(..) => None,
                     ty::Predicate::Subtype(..) => None,
                     ty::Predicate::RegionOutlives(..) => None,
                     ty::Predicate::TypeOutlives(..) => None,
@@ -313,7 +312,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         );
 
         let input_tys = match arg_param_ty.sty {
-            ty::TyTuple(tys, _) => tys.into_iter(),
+            ty::TyTuple(tys) => tys.into_iter(),
             _ => {
                 return None;
             }

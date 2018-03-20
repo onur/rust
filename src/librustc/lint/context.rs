@@ -34,7 +34,6 @@ use lint::levels::{LintLevelSets, LintLevelsBuilder};
 use middle::privacy::AccessLevels;
 use rustc_serialize::{Decoder, Decodable, Encoder, Encodable};
 use session::{config, early_error, Session};
-use traits::Reveal;
 use ty::{self, TyCtxt, Ty};
 use ty::layout::{LayoutError, LayoutOf, TyLayout};
 use util::nodemap::FxHashMap;
@@ -42,6 +41,7 @@ use util::nodemap::FxHashMap;
 use std::default::Default as StdDefault;
 use std::cell::{Ref, RefCell};
 use syntax::ast;
+use syntax::epoch;
 use syntax_pos::{MultiSpan, Span};
 use errors::DiagnosticBuilder;
 use hir;
@@ -105,7 +105,7 @@ pub struct FutureIncompatibleInfo {
     pub reference: &'static str,
     /// If this is an epoch fixing lint, the epoch in which
     /// this lint becomes obsolete
-    pub epoch: Option<config::Epoch>,
+    pub epoch: Option<epoch::Epoch>,
 }
 
 /// The target of the `by_name` map, which accounts for renaming/deprecation.
@@ -201,7 +201,7 @@ impl LintStore {
                                         sess: Option<&Session>,
                                         lints: Vec<FutureIncompatibleInfo>) {
 
-        for epoch in config::ALL_EPOCHS {
+        for epoch in epoch::ALL_EPOCHS {
             let lints = lints.iter().filter(|f| f.epoch == Some(*epoch)).map(|f| f.id)
                              .collect::<Vec<_>>();
             if !lints.is_empty() {
@@ -823,6 +823,17 @@ impl<'a, 'tcx> hir_visit::Visitor<'tcx> for LateContext<'a, 'tcx> {
         hir_visit::walk_generics(self, g);
     }
 
+    fn visit_where_predicate(&mut self, p: &'tcx hir::WherePredicate) {
+        run_lints!(self, check_where_predicate, late_passes, p);
+        hir_visit::walk_where_predicate(self, p);
+    }
+
+    fn visit_poly_trait_ref(&mut self, t: &'tcx hir::PolyTraitRef,
+                            m: hir::TraitBoundModifier) {
+        run_lints!(self, check_poly_trait_ref, late_passes, t, m);
+        hir_visit::walk_poly_trait_ref(self, t, m);
+    }
+
     fn visit_trait_item(&mut self, trait_item: &'tcx hir::TraitItem) {
         let generics = self.generics.take();
         self.generics = Some(&trait_item.generics);
@@ -985,6 +996,16 @@ impl<'a> ast_visit::Visitor<'a> for EarlyContext<'a> {
         ast_visit::walk_generics(self, g);
     }
 
+    fn visit_where_predicate(&mut self, p: &'a ast::WherePredicate) {
+        run_lints!(self, check_where_predicate, early_passes, p);
+        ast_visit::walk_where_predicate(self, p);
+    }
+
+    fn visit_poly_trait_ref(&mut self, t: &'a ast::PolyTraitRef, m: &'a ast::TraitBoundModifier) {
+        run_lints!(self, check_poly_trait_ref, early_passes, t, m);
+        ast_visit::walk_poly_trait_ref(self, t, m);
+    }
+
     fn visit_trait_item(&mut self, trait_item: &'a ast::TraitItem) {
         self.with_lint_attrs(trait_item.id, &trait_item.attrs, |cx| {
             run_lints!(cx, check_trait_item, early_passes, trait_item);
@@ -1033,7 +1054,7 @@ pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     let mut cx = LateContext {
         tcx,
         tables: &ty::TypeckTables::empty(None),
-        param_env: ty::ParamEnv::empty(Reveal::UserFacing),
+        param_env: ty::ParamEnv::empty(),
         access_levels,
         lint_sess: LintSession::new(&tcx.sess.lint_store),
         last_ast_node_with_lint_attrs: ast::CRATE_NODE_ID,

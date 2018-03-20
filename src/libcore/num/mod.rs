@@ -321,6 +321,33 @@ $EndFeature, "
             (self as $UnsignedT).swap_bytes() as Self
         }
 
+        /// Reverses the bit pattern of the integer.
+        ///
+        /// # Examples
+        ///
+        /// Please note that this example is shared between integer types.
+        /// Which explains why `i16` is used here.
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(reverse_bits)]
+        ///
+        /// let n: i16 = 0b0000000_01010101;
+        /// assert_eq!(n, 85);
+        ///
+        /// let m = n.reverse_bits();
+        ///
+        /// assert_eq!(m as u16, 0b10101010_00000000);
+        /// assert_eq!(m, -22016);
+        /// ```
+        #[unstable(feature = "reverse_bits", issue = "48763")]
+        #[cfg(not(stage0))]
+        #[inline]
+        pub fn reverse_bits(self) -> Self {
+            (self as $UnsignedT).reverse_bits() as Self
+        }
+
         doc_comment! {
             concat!("Converts an integer from big endian to the target's endianness.
 
@@ -1771,6 +1798,33 @@ assert_eq!(n.trailing_zeros(), 3);", $EndFeature, "
         #[inline]
         pub fn swap_bytes(self) -> Self {
             unsafe { intrinsics::bswap(self as $ActualT) as Self }
+        }
+
+        /// Reverses the bit pattern of the integer.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// Please note that this example is shared between integer types.
+        /// Which explains why `u16` is used here.
+        ///
+        /// ```
+        /// #![feature(reverse_bits)]
+        ///
+        /// let n: u16 = 0b0000000_01010101;
+        /// assert_eq!(n, 85);
+        ///
+        /// let m = n.reverse_bits();
+        ///
+        /// assert_eq!(m, 0b10101010_00000000);
+        /// assert_eq!(m, 43520);
+        /// ```
+        #[unstable(feature = "reverse_bits", issue = "48763")]
+        #[cfg(not(stage0))]
+        #[inline]
+        pub fn reverse_bits(self) -> Self {
+            unsafe { intrinsics::bitreverse(self as $ActualT) as Self }
         }
 
         doc_comment! {
@@ -3846,6 +3900,13 @@ fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32) -> Result<T, Par
 /// This error is used as the error type for the `from_str_radix()` functions
 /// on the primitive integer types, such as [`i8::from_str_radix`].
 ///
+/// # Potential causes
+///
+/// Among other causes, `ParseIntError` can be thrown because of leading or trailing whitespace
+/// in the string e.g. when it is obtained from the standard input.
+/// Using the [`str.trim()`] method ensures that no whitespace remains before parsing.
+///
+/// [`str.trim()`]: ../../std/primitive.str.html#method.trim
 /// [`i8::from_str_radix`]: ../../std/primitive.i8.html#method.from_str_radix
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[stable(feature = "rust1", since = "1.0.0")]

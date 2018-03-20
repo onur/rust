@@ -114,7 +114,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 }
             };
             if pat_adjustments.len() > 0 {
-                if tcx.sess.features.borrow().match_default_bindings {
+                if tcx.features().match_default_bindings {
                     debug!("default binding mode is now {:?}", def_bm);
                     self.inh.tables.borrow_mut()
                         .pat_adjustments_mut()
@@ -319,7 +319,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 let mut expected_len = elements.len();
                 if ddpos.is_some() {
                     // Require known type only when `..` is present
-                    if let ty::TyTuple(ref tys, _) =
+                    if let ty::TyTuple(ref tys) =
                             self.structurally_resolved_type(pat.span, expected).sty {
                         expected_len = tys.len();
                     }
@@ -332,7 +332,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                     ty::UniverseIndex::ROOT,
                     TypeVariableOrigin::TypeInference(pat.span)));
                 let element_tys = tcx.mk_type_list(element_tys_iter);
-                let pat_ty = tcx.mk_ty(ty::TyTuple(element_tys, false));
+                let pat_ty = tcx.mk_ty(ty::TyTuple(element_tys));
                 self.demand_eqtype(pat.span, expected, pat_ty);
                 for (i, elem) in elements.iter().enumerate_and_adjust(max_len, ddpos) {
                     self.check_pat_walk(elem, &element_tys[i], def_bm, true);
@@ -413,7 +413,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 let expected_ty = self.structurally_resolved_type(pat.span, expected);
                 let (inner_ty, slice_ty) = match expected_ty.sty {
                     ty::TyArray(inner_ty, size) => {
-                        let size = size.val.to_const_int().unwrap().to_u64().unwrap();
+                        let size = size.val.unwrap_u64();
                         let min_len = before.len() as u64 + after.len() as u64;
                         if slice.is_none() {
                             if min_len != size {

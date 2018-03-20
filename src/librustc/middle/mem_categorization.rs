@@ -913,8 +913,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
 
         // Always promote `[T; 0]` (even when e.g. borrowed mutably).
         let promotable = match expr_ty.sty {
-            ty::TyArray(_, len) if
-                len.val.to_const_int().and_then(|i| i.to_u64()) == Some(0) => true,
+            ty::TyArray(_, len) if len.val.to_raw_bits() == Some(0) => true,
             _ => promotable,
         };
 
@@ -1299,7 +1298,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
           PatKind::Tuple(ref subpats, ddpos) => {
             // (p1, ..., pN)
             let expected_len = match self.pat_ty(&pat)?.sty {
-                ty::TyTuple(ref tys, _) => tys.len(),
+                ty::TyTuple(ref tys) => tys.len(),
                 ref ty => span_bug!(pat.span, "tuple pattern unexpected type {:?}", ty),
             };
             for (i, subpat) in subpats.iter().enumerate_and_adjust(expected_len, ddpos) {

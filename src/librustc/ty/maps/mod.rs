@@ -12,11 +12,11 @@ use dep_graph::{DepConstructor, DepNode};
 use errors::DiagnosticBuilder;
 use hir::def_id::{CrateNum, DefId, DefIndex};
 use hir::def::{Def, Export};
-use hir::{self, TraitCandidate, ItemLocalId};
+use hir::{self, TraitCandidate, ItemLocalId, TransFnAttrs};
 use hir::svh::Svh;
+use infer::canonical::{Canonical, QueryResult};
 use lint;
 use middle::borrowck::BorrowCheckResult;
-use middle::const_val;
 use middle::cstore::{ExternCrate, LinkagePreference, NativeLibrary,
                      ExternBodyNestedBodies};
 use middle::cstore::{NativeLibraryKind, DepKind, CrateSource, ExternConstBody};
@@ -26,14 +26,19 @@ use middle::region;
 use middle::resolve_lifetime::{ResolveLifetimes, Region, ObjectLifetimeDefault};
 use middle::stability::{self, DeprecationEntry};
 use middle::lang_items::{LanguageItems, LangItem};
-use middle::exported_symbols::SymbolExportLevel;
+use middle::exported_symbols::{SymbolExportLevel, ExportedSymbol};
+use middle::const_val::EvalResult;
 use mir::mono::{CodegenUnit, Stats};
 use mir;
+use mir::interpret::{GlobalId};
 use session::{CompileResult, CrateDisambiguator};
 use session::config::OutputFilenames;
 use traits::Vtable;
+use traits::query::{CanonicalProjectionGoal, CanonicalTyGoal, NoSolution};
+use traits::query::dropck_outlives::{DtorckConstraint, DropckOutlivesResult};
+use traits::query::normalize::NormalizationResult;
 use traits::specialization_graph;
-use ty::{self, CrateInherentImpls, Ty, TyCtxt};
+use ty::{self, CrateInherentImpls, ParamEnvAnd, Ty, TyCtxt};
 use ty::steal::Steal;
 use ty::subst::Substs;
 use util::nodemap::{DefIdSet, DefIdMap, ItemLocalSet};
@@ -52,6 +57,7 @@ use syntax_pos::{Span, DUMMY_SP};
 use syntax_pos::symbol::InternedString;
 use syntax::attr;
 use syntax::ast;
+use syntax::feature_gate;
 use syntax::symbol::Symbol;
 
 #[macro_use]
@@ -80,7 +86,7 @@ pub use self::on_disk_cache::OnDiskCache;
 // the driver creates (using several `rustc_*` crates).
 //
 // The result of query must implement Clone. They must also implement ty::maps::values::Value
-// which produces an appropiate error value if the query resulted in a query cycle.
+// which produces an appropriate error value if the query resulted in a query cycle.
 // Queries marked with `fatal_cycle` do not need that implementation
 // as they will raise an fatal error on query cycles instead.
 define_maps! { <'tcx>
@@ -109,7 +115,9 @@ define_maps! { <'tcx>
     [] fn adt_def: AdtDefOfItem(DefId) -> &'tcx ty::AdtDef,
     [] fn adt_destructor: AdtDestructor(DefId) -> Option<ty::Destructor>,
     [] fn adt_sized_constraint: SizedConstraint(DefId) -> &'tcx [Ty<'tcx>],
-    [] fn adt_dtorck_constraint: DtorckConstraint(DefId) -> ty::DtorckConstraint<'tcx>,
+    [] fn adt_dtorck_constraint: DtorckConstraint(
+        DefId
+    ) -> Result<DtorckConstraint<'tcx>, NoSolution>,
 
     /// True if this is a const fn
     [] fn is_const_fn: IsConstFn(DefId) -> bool,
@@ -209,8 +217,8 @@ define_maps! { <'tcx>
 
     /// Results of evaluating const items or constants embedded in
     /// other items (such as enum variant explicit discriminants).
-    [] fn const_eval: const_eval_dep_node(ty::ParamEnvAnd<'tcx, (DefId, &'tcx Substs<'tcx>)>)
-        -> const_val::EvalResult<'tcx>,
+    [] fn const_eval: const_eval_dep_node(ty::ParamEnvAnd<'tcx, GlobalId<'tcx>>)
+        -> EvalResult<'tcx>,
 
     [] fn check_match: CheckMatch(DefId)
         -> Result<(), ErrorReported>,
@@ -234,10 +242,10 @@ define_maps! { <'tcx>
     [] fn lookup_stability: LookupStability(DefId) -> Option<&'tcx attr::Stability>,
     [] fn lookup_deprecation_entry: LookupDeprecationEntry(DefId) -> Option<DeprecationEntry>,
     [] fn item_attrs: ItemAttrs(DefId) -> Lrc<[ast::Attribute]>,
+    [] fn trans_fn_attrs: trans_fn_attrs(DefId) -> TransFnAttrs,
     [] fn fn_arg_names: FnArgNames(DefId) -> Vec<ast::Name>,
     [] fn impl_parent: ImplParent(DefId) -> Option<DefId>,
     [] fn trait_of_item: TraitOfItem(DefId) -> Option<DefId>,
-    [] fn is_exported_symbol: IsExportedSymbol(DefId) -> bool,
     [] fn item_body_nested_bodies: ItemBodyNestedBodies(DefId) -> ExternBodyNestedBodies,
     [] fn const_is_rvalue_promotable_to_static: ConstIsRvaluePromotableToStatic(DefId) -> bool,
     [] fn rvalue_promotable_map: RvaluePromotableMap(DefId) -> Lrc<ItemLocalSet>,
@@ -289,7 +297,23 @@ define_maps! { <'tcx>
     [] fn lint_levels: lint_levels_node(CrateNum) -> Lrc<lint::LintLevelMap>,
 
     [] fn impl_defaultness: ImplDefaultness(DefId) -> hir::Defaultness,
-    [] fn exported_symbol_ids: ExportedSymbolIds(CrateNum) -> Lrc<DefIdSet>,
+
+    // The DefIds of all non-generic functions and statics in the given crate
+    // that can be reached from outside the crate.
+    //
+    // We expect this items to be available for being linked to.
+    //
+    // This query can also be called for LOCAL_CRATE. In this case it will
+    // compute which items will be reachable to other crates, taking into account
+    // the kind of crate that is currently compiled. Crates with only a
+    // C interface have fewer reachable things.
+    //
+    // Does not include external symbols that don't have a corresponding DefId,
+    // like the compiler-generated `main` function and so on.
+    [] fn reachable_non_generics: ReachableNonGenerics(CrateNum) -> Lrc<DefIdSet>,
+    [] fn is_reachable_non_generic: IsReachableNonGeneric(DefId) -> bool,
+
+
     [] fn native_libraries: NativeLibraries(CrateNum) -> Lrc<Vec<NativeLibrary>>,
     [] fn plugin_registrar_fn: PluginRegistrarFn(CrateNum) -> Option<DefId>,
     [] fn derive_registrar_fn: DeriveRegistrarFn(CrateNum) -> Option<DefId>,
@@ -342,12 +366,10 @@ define_maps! { <'tcx>
     [] fn all_crate_nums: all_crate_nums_node(CrateNum) -> Lrc<Vec<CrateNum>>,
 
     [] fn exported_symbols: ExportedSymbols(CrateNum)
-        -> Arc<Vec<(String, Option<DefId>, SymbolExportLevel)>>,
+        -> Arc<Vec<(ExportedSymbol, SymbolExportLevel)>>,
     [] fn collect_and_partition_translation_items:
         collect_and_partition_translation_items_node(CrateNum)
         -> (Arc<DefIdSet>, Arc<Vec<Arc<CodegenUnit<'tcx>>>>),
-    [] fn export_name: ExportName(DefId) -> Option<Symbol>,
-    [] fn contains_extern_indicator: ContainsExternIndicator(DefId) -> bool,
     [] fn symbol_export_level: GetSymbolExportLevel(DefId) -> SymbolExportLevel,
     [] fn is_translated_item: IsTranslatedItem(DefId) -> bool,
     [] fn codegen_unit: CodegenUnit(InternedString) -> Arc<CodegenUnit<'tcx>>,
@@ -362,23 +384,53 @@ define_maps! { <'tcx>
     // Normally you would just use `tcx.erase_regions(&value)`,
     // however, which uses this query as a kind of cache.
     [] fn erase_regions_ty: erase_regions_ty(Ty<'tcx>) -> Ty<'tcx>,
-    [] fn fully_normalize_monormophic_ty: normalize_ty_node(Ty<'tcx>) -> Ty<'tcx>,
+
+    /// Do not call this query directly: invoke `normalize` instead.
+    [] fn normalize_projection_ty: NormalizeProjectionTy(
+        CanonicalProjectionGoal<'tcx>
+    ) -> Result<
+        Lrc<Canonical<'tcx, QueryResult<'tcx, NormalizationResult<'tcx>>>>,
+        NoSolution,
+    >,
+
+    /// Do not call this query directly: invoke `normalize_erasing_regions` instead.
+    [] fn normalize_ty_after_erasing_regions: NormalizeTyAfterErasingRegions(
+        ParamEnvAnd<'tcx, Ty<'tcx>>
+    ) -> Ty<'tcx>,
+
+    /// Do not call this query directly: invoke `infcx.at().dropck_outlives()` instead.
+    [] fn dropck_outlives: DropckOutlives(
+        CanonicalTyGoal<'tcx>
+    ) -> Result<
+        Lrc<Canonical<'tcx, QueryResult<'tcx, DropckOutlivesResult<'tcx>>>>,
+        NoSolution,
+    >,
 
     [] fn substitute_normalize_and_test_predicates:
         substitute_normalize_and_test_predicates_node((DefId, &'tcx Substs<'tcx>)) -> bool,
 
     [] fn target_features_whitelist:
         target_features_whitelist_node(CrateNum) -> Lrc<FxHashSet<String>>,
-    [] fn target_features_enabled: TargetFeaturesEnabled(DefId) -> Lrc<Vec<String>>,
 
     // Get an estimate of the size of an InstanceDef based on its MIR for CGU partitioning.
     [] fn instance_def_size_estimate: instance_def_size_estimate_dep_node(ty::InstanceDef<'tcx>)
         -> usize,
+
+    [] fn features_query: features_node(CrateNum) -> Lrc<feature_gate::Features>,
 }
 
 //////////////////////////////////////////////////////////////////////
 // These functions are little shims used to find the dep-node for a
 // given query when there is not a *direct* mapping:
+
+
+fn features_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::Features
+}
+
+fn trans_fn_attrs<'tcx>(id: DefId) -> DepConstructor<'tcx> {
+    DepConstructor::TransFnAttrs { 0: id }
+}
 
 fn erase_regions_ty<'tcx>(ty: Ty<'tcx>) -> DepConstructor<'tcx> {
     DepConstructor::EraseRegionsTy { ty }
@@ -425,7 +477,7 @@ fn typeck_item_bodies_dep_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
     DepConstructor::TypeckBodiesKrate
 }
 
-fn const_eval_dep_node<'tcx>(param_env: ty::ParamEnvAnd<'tcx, (DefId, &'tcx Substs<'tcx>)>)
+fn const_eval_dep_node<'tcx>(param_env: ty::ParamEnvAnd<'tcx, GlobalId<'tcx>>)
                              -> DepConstructor<'tcx> {
     DepConstructor::ConstEval { param_env }
 }
@@ -510,9 +562,6 @@ fn output_filenames_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
 
 fn vtable_methods_node<'tcx>(trait_ref: ty::PolyTraitRef<'tcx>) -> DepConstructor<'tcx> {
     DepConstructor::VtableMethods{ trait_ref }
-}
-fn normalize_ty_node<'tcx>(_: Ty<'tcx>) -> DepConstructor<'tcx> {
-    DepConstructor::NormalizeTy
 }
 
 fn substitute_normalize_and_test_predicates_node<'tcx>(key: (DefId, &'tcx Substs<'tcx>))

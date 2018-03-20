@@ -32,6 +32,7 @@
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_patterns)]
+#![cfg_attr(stage0, feature(never_type))]
 
 #[macro_use]
 extern crate syntax;
@@ -39,15 +40,16 @@ extern crate syntax;
 extern crate rustc;
 #[macro_use]
 extern crate log;
-extern crate rustc_const_eval;
+extern crate rustc_mir;
 extern crate syntax_pos;
 
 use rustc::lint;
-use rustc::middle;
+use rustc::lint::builtin::BARE_TRAIT_OBJECT;
 use rustc::session;
 use rustc::util;
 
 use session::Session;
+use syntax::epoch::Epoch;
 use lint::LintId;
 use lint::FutureIncompatibleInfo;
 
@@ -107,8 +109,8 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                        UnusedParens,
                        UnusedImportBraces,
                        AnonymousParameters,
-                       IllegalFloatLiteralPattern,
                        UnusedDocComment,
+                       IgnoredGenericBounds,
                        );
 
     add_early_builtin_with_new!(sess,
@@ -178,6 +180,11 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                     UNUSED_FEATURES,
                     UNUSED_PARENS);
 
+    add_lint_group!(sess,
+                    "rust_2018_idioms",
+                    BARE_TRAIT_OBJECT,
+                    UNREACHABLE_PUB);
+
     // Guidelines for creating a future incompatibility lint:
     //
     // - Create a lint defaulting to warn as normal, with ideally the same error
@@ -229,11 +236,6 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
             epoch: None,
         },
         FutureIncompatibleInfo {
-            id: LintId::of(RESOLVE_TRAIT_ON_DEFAULTED_UNIT),
-            reference: "issue #39216 <https://github.com/rust-lang/rust/issues/39216>",
-            epoch: None,
-        },
-        FutureIncompatibleInfo {
             id: LintId::of(MISSING_FRAGMENT_SPECIFIER),
             reference: "issue #40107 <https://github.com/rust-lang/rust/issues/40107>",
             epoch: None,
@@ -269,20 +271,10 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
             epoch: None,
         },
         FutureIncompatibleInfo {
-            id: LintId::of(COERCE_NEVER),
-            reference: "issue #46325 <https://github.com/rust-lang/rust/issues/46325>",
-            epoch: None,
-        },
-        FutureIncompatibleInfo {
             id: LintId::of(TYVAR_BEHIND_RAW_POINTER),
             reference: "issue #46906 <https://github.com/rust-lang/rust/issues/46906>",
-            epoch: None,
-        },
-         FutureIncompatibleInfo {
-             id: LintId::of(lint::builtin::BARE_TRAIT_OBJECT),
-             reference: "issue #48457 <https://github.com/rust-lang/rust/issues/48457>",
-             epoch: Some(session::config::Epoch::Epoch2018),
-         }
+            epoch: Some(Epoch::Epoch2018),
+        }
         ]);
 
     // Register renamed and removed lints
@@ -314,4 +306,8 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
         "converted into hard error, see https://github.com/rust-lang/rust/issues/36892");
     store.register_removed("extra_requirement_in_impl",
         "converted into hard error, see https://github.com/rust-lang/rust/issues/37166");
+    store.register_removed("coerce_never",
+        "converted into hard error, see https://github.com/rust-lang/rust/issues/48950");
+    store.register_removed("resolve_trait_on_defaulted_unit",
+        "converted into hard error, see https://github.com/rust-lang/rust/issues/48950");
 }

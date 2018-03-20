@@ -20,8 +20,8 @@ pub use self::ObligationCauseCode::*;
 use hir;
 use hir::def_id::DefId;
 use infer::outlives::env::OutlivesEnvironment;
-use middle::const_val::ConstEvalErr;
 use middle::region;
+use middle::const_val::ConstEvalErr;
 use ty::subst::Substs;
 use ty::{self, AdtKind, Ty, TyCtxt, TypeFoldable, ToPredicate};
 use ty::error::{ExpectedFound, TypeError};
@@ -62,6 +62,8 @@ mod specialize;
 mod structural_impls;
 pub mod trans;
 mod util;
+
+pub mod query;
 
 // Whether to enable bug compatibility with issue #43355
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -203,9 +205,6 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// Computing common supertype of an if expression with no else counter-part
     IfExpressionWithNoElse,
-
-    /// `where a == b`
-    EquatePredicate,
 
     /// `main` has wrong type
     MainFunctionType,
@@ -581,7 +580,7 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         ) {
             Ok(predicates) => predicates,
             Err(errors) => {
-                infcx.report_fulfillment_errors(&errors, None);
+                infcx.report_fulfillment_errors(&errors, None, false);
                 // An unnormalized env is better than nothing.
                 return elaborated_env;
             }
@@ -698,7 +697,7 @@ fn normalize_and_test_predicates<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
            predicates);
 
     let result = tcx.infer_ctxt().enter(|infcx| {
-        let param_env = ty::ParamEnv::empty(Reveal::All);
+        let param_env = ty::ParamEnv::reveal_all();
         let mut selcx = SelectionContext::new(&infcx);
         let mut fulfill_cx = FulfillmentContext::new();
         let cause = ObligationCause::dummy();
@@ -771,7 +770,10 @@ fn vtable_methods<'a, 'tcx>(
                 // the trait type may have higher-ranked lifetimes in it;
                 // so erase them if they appear, so that we get the type
                 // at some particular call site
-                let substs = tcx.erase_late_bound_regions_and_normalize(&ty::Binder(substs));
+                let substs = tcx.normalize_erasing_late_bound_regions(
+                    ty::ParamEnv::reveal_all(),
+                    &ty::Binder(substs),
+                );
 
                 // It's possible that the method relies on where clauses that
                 // do not hold for this particular set of type parameters.
@@ -851,19 +853,6 @@ impl<'tcx, N> Vtable<'tcx, N> {
             VtableGenerator(c) => c.nested,
             VtableObject(d) => d.nested,
             VtableFnPointer(d) => d.nested,
-        }
-    }
-
-    fn nested_obligations_mut(&mut self) -> &mut Vec<N> {
-        match self {
-            &mut VtableImpl(ref mut i) => &mut i.nested,
-            &mut VtableParam(ref mut n) => n,
-            &mut VtableBuiltin(ref mut i) => &mut i.nested,
-            &mut VtableAutoImpl(ref mut d) => &mut d.nested,
-            &mut VtableGenerator(ref mut c) => &mut c.nested,
-            &mut VtableClosure(ref mut c) => &mut c.nested,
-            &mut VtableObject(ref mut d) => &mut d.nested,
-            &mut VtableFnPointer(ref mut d) => &mut d.nested,
         }
     }
 

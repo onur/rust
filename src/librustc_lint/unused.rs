@@ -58,7 +58,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
 
         let t = cx.tables.expr_ty(&expr);
         let ty_warned = match t.sty {
-            ty::TyTuple(ref tys, _) if tys.is_empty() => return,
+            ty::TyTuple(ref tys) if tys.is_empty() => return,
             ty::TyNever => return,
             ty::TyAdt(def, _) => {
                 if def.variants.is_empty() {
@@ -72,7 +72,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
 
         let mut fn_warned = false;
         let mut op_warned = false;
-        if cx.tcx.sess.features.borrow().fn_must_use {
+        if cx.tcx.features().fn_must_use {
             let maybe_def = match expr.node {
                 hir::ExprCall(ref callee, _) => {
                     match callee.node {

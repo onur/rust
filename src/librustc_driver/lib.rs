@@ -35,7 +35,6 @@ extern crate rustc;
 extern crate rustc_allocator;
 extern crate rustc_back;
 extern crate rustc_borrowck;
-extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_errors as errors;
 extern crate rustc_passes;
@@ -47,6 +46,7 @@ extern crate rustc_metadata;
 extern crate rustc_mir;
 extern crate rustc_resolve;
 extern crate rustc_save_analysis;
+extern crate rustc_traits;
 extern crate rustc_trans_utils;
 extern crate rustc_typeck;
 extern crate serialize;
@@ -303,7 +303,9 @@ fn get_trans_sysroot(backend_name: &str) -> fn() -> Box<TransCrate> {
     let sysroot = sysroot_candidates.iter()
         .map(|sysroot| {
             let libdir = filesearch::relative_target_lib_path(&sysroot, &target);
-            sysroot.join(libdir).with_file_name("codegen-backends")
+            sysroot.join(libdir)
+                .with_file_name(option_env!("CFG_CODEGEN_BACKENDS_DIR")
+                                .unwrap_or("codegen-backends"))
         })
         .filter(|f| {
             info!("codegen backend candidate: {}", f.display());
@@ -445,6 +447,17 @@ pub fn run_compiler<'a>(args: &[String],
                         file_loader: Option<Box<FileLoader + 'static>>,
                         emitter_dest: Option<Box<Write + Send>>)
                         -> (CompileResult, Option<Session>)
+{
+    syntax::with_globals(|| {
+        run_compiler_impl(args, callbacks, file_loader, emitter_dest)
+    })
+}
+
+fn run_compiler_impl<'a>(args: &[String],
+                         callbacks: &mut CompilerCalls<'a>,
+                         file_loader: Option<Box<FileLoader + 'static>>,
+                         emitter_dest: Option<Box<Write + Send>>)
+                         -> (CompileResult, Option<Session>)
 {
     macro_rules! do_or_return {($expr: expr, $sess: expr) => {
         match $expr {
@@ -913,7 +926,7 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
 pub fn enable_save_analysis(control: &mut CompileController) {
     control.keep_ast = true;
     control.after_analysis.callback = box |state| {
-        time(state.session.time_passes(), "save analysis", || {
+        time(state.session, "save analysis", || {
             save::process_crate(state.tcx.unwrap(),
                                 state.expanded_crate.unwrap(),
                                 state.analysis.unwrap(),
@@ -1132,6 +1145,15 @@ fn usage(verbose: bool, include_unstable_options: bool) {
              options.usage(&message),
              nightly_help,
              verbose_help);
+}
+
+fn print_wall_help() {
+    println!("
+The flag `-Wall` does not exist in `rustc`. Most useful lints are enabled by
+default. Use `rustc -W help` to see all available lints. It's more common to put
+warning settings in the crate root using `#![warn(LINT_NAME)]` instead of using
+the command line flag directly.
+");
 }
 
 fn describe_lints(sess: &Session, lint_store: &lint::LintStore, loaded_plugins: bool) {
@@ -1378,6 +1400,13 @@ pub fn handle_options(args: &[String]) -> Option<getopts::Matches> {
         return None;
     }
 
+    // Handle the special case of -Wall.
+    let wall = matches.opt_strs("W");
+    if wall.iter().any(|x| *x == "all") {
+        print_wall_help();
+        return None;
+    }
+
     // Don't handle -W help here, because we might first load plugins.
     let r = matches.opt_strs("Z");
     if r.iter().any(|x| *x == "help") {
@@ -1453,6 +1482,12 @@ fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
     let mut args = Vec::new();
     for arg in env::args_os() {
         args.push(arg.to_string_lossy().to_string());
+    }
+
+    // Avoid printing help because of empty args. This can suggest the compiler
+    // itself is not the program root (consider RLS).
+    if args.len() < 2 {
+        return None;
     }
 
     let matches = if let Some(matches) = handle_options(&args) {
@@ -1564,7 +1599,6 @@ pub fn diagnostics_registry() -> errors::registry::Registry {
     // FIXME: need to figure out a way to get these back in here
     // all_errors.extend_from_slice(get_trans(sess).diagnostics());
     all_errors.extend_from_slice(&rustc_trans_utils::DIAGNOSTICS);
-    all_errors.extend_from_slice(&rustc_const_eval::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_metadata::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_passes::DIAGNOSTICS);
     all_errors.extend_from_slice(&rustc_plugin::DIAGNOSTICS);
@@ -1574,8 +1608,14 @@ pub fn diagnostics_registry() -> errors::registry::Registry {
     Registry::new(&all_errors)
 }
 
+/// This allows tools to enable rust logging without having to magically match rustc's
+/// log crate version
+pub fn init_rustc_env_logger() {
+    env_logger::init();
+}
+
 pub fn main() {
-    env_logger::init().unwrap();
+    init_rustc_env_logger();
     let result = run(|| {
         let args = env::args_os().enumerate()
             .map(|(i, arg)| arg.into_string().unwrap_or_else(|arg| {

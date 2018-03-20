@@ -100,7 +100,7 @@ pub fn trans_intrinsic_call<'a, 'tcx>(bx: &Builder<'a, 'tcx>,
     };
 
     let sig = callee_ty.fn_sig(tcx);
-    let sig = tcx.erase_late_bound_regions_and_normalize(&sig);
+    let sig = tcx.normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), &sig);
     let arg_tys = sig.inputs();
     let ret_ty = sig.output();
     let name = &*tcx.item_name(def_id);
@@ -287,8 +287,8 @@ pub fn trans_intrinsic_call<'a, 'tcx>(bx: &Builder<'a, 'tcx>,
             ], None)
         },
         "ctlz" | "ctlz_nonzero" | "cttz" | "cttz_nonzero" | "ctpop" | "bswap" |
-        "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" |
-        "overflowing_add" | "overflowing_sub" | "overflowing_mul" |
+        "bitreverse" | "add_with_overflow" | "sub_with_overflow" |
+        "mul_with_overflow" | "overflowing_add" | "overflowing_sub" | "overflowing_mul" |
         "unchecked_div" | "unchecked_rem" | "unchecked_shl" | "unchecked_shr" => {
             let ty = arg_tys[0];
             match int_type_width_signed(ty, cx) {
@@ -314,6 +314,10 @@ pub fn trans_intrinsic_call<'a, 'tcx>(bx: &Builder<'a, 'tcx>,
                                 bx.call(cx.get_intrinsic(&format!("llvm.bswap.i{}", width)),
                                         &[args[0].immediate()], None)
                             }
+                        }
+                        "bitreverse" => {
+                            bx.call(cx.get_intrinsic(&format!("llvm.bitreverse.i{}", width)),
+                                &[args[0].immediate()], None)
                         }
                         "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" => {
                             let intrinsic = format!("llvm.{}{}.with.overflow.i{}",
@@ -1031,7 +1035,10 @@ fn generic_simd_intrinsic<'a, 'tcx>(
 
 
     let tcx = bx.tcx();
-    let sig = tcx.erase_late_bound_regions_and_normalize(&callee_ty.fn_sig(tcx));
+    let sig = tcx.normalize_erasing_late_bound_regions(
+        ty::ParamEnv::reveal_all(),
+        &callee_ty.fn_sig(tcx),
+    );
     let arg_tys = sig.inputs();
 
     // every intrinsic takes a SIMD vector as its first argument
