@@ -51,13 +51,11 @@ use libc::MSG_NOSIGNAL;
 const MSG_NOSIGNAL: libc::c_int = 0x0;
 
 fn sun_path_offset() -> usize {
-    unsafe {
-        // Work with an actual instance of the type since using a null pointer is UB
-        let addr: libc::sockaddr_un = mem::uninitialized();
-        let base = &addr as *const _ as usize;
-        let path = &addr.sun_path as *const _ as usize;
-        path - base
-    }
+    // Work with an actual instance of the type since using a null pointer is UB
+    let addr: libc::sockaddr_un = unsafe { mem::uninitialized() };
+    let base = &addr as *const _ as usize;
+    let path = &addr.sun_path as *const _ as usize;
+    path - base
 }
 
 unsafe fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
@@ -216,7 +214,10 @@ impl SocketAddr {
         let path = unsafe { mem::transmute::<&[libc::c_char], &[u8]>(&self.addr.sun_path) };
 
         // macOS seems to return a len of 16 and a zeroed sun_path for unnamed addresses
-        if len == 0 || (cfg!(not(target_os = "linux")) && self.addr.sun_path[0] == 0) {
+        if len == 0
+            || (cfg!(not(any(target_os = "linux", target_os = "android")))
+                && self.addr.sun_path[0] == 0)
+        {
             AddressKind::Unnamed
         } else if self.addr.sun_path[0] == 0 {
             AddressKind::Abstract(&path[1..len])

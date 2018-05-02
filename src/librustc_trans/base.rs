@@ -36,6 +36,7 @@ use llvm;
 use metadata;
 use rustc::hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc::middle::lang_items::StartFnLangItem;
+use rustc::middle::weak_lang_items;
 use rustc::mir::mono::{Linkage, Visibility, Stats};
 use rustc::middle::cstore::{EncodedMetadata};
 use rustc::ty::{self, Ty, TyCtxt};
@@ -72,14 +73,17 @@ use type_::Type;
 use type_of::LayoutLlvmExt;
 use rustc::util::nodemap::{FxHashMap, FxHashSet, DefIdSet};
 use CrateInfo;
+use rustc_data_structures::sync::Lrc;
+use rustc_target::spec::TargetTriple;
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::str;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use std::{i32, usize};
-use std::iter;
+use std::i32;
+use std::cmp;
 use std::sync::mpsc;
 use syntax_pos::Span;
 use syntax_pos::symbol::InternedString;
@@ -488,7 +492,7 @@ pub fn trans_instance<'a, 'tcx>(cx: &CodegenCx<'a, 'tcx>, instance: Instance<'tc
     // You can also find more info on why Windows is whitelisted here in:
     //      https://bugzilla.mozilla.org/show_bug.cgi?id=1302078
     if !cx.sess().no_landing_pads() ||
-       cx.sess().target.target.options.is_like_windows {
+       cx.sess().target.target.options.requires_uwtable {
         attributes::emit_uwtable(lldecl, true);
     }
 
@@ -514,7 +518,7 @@ pub fn set_link_section(cx: &CodegenCx,
 /// users main function.
 fn maybe_create_entry_wrapper(cx: &CodegenCx) {
     let (main_def_id, span) = match *cx.sess().entry_fn.borrow() {
-        Some((id, span)) => {
+        Some((id, span, _)) => {
             (cx.tcx.hir.local_def_id(id), span)
         }
         None => return,
@@ -530,11 +534,11 @@ fn maybe_create_entry_wrapper(cx: &CodegenCx) {
 
     let main_llfn = callee::get_fn(cx, instance);
 
-    let et = cx.sess().entry_type.get().unwrap();
+    let et = cx.sess().entry_fn.get().map(|e| e.2);
     match et {
-        config::EntryMain => create_entry_fn(cx, span, main_llfn, main_def_id, true),
-        config::EntryStart => create_entry_fn(cx, span, main_llfn, main_def_id, false),
-        config::EntryNone => {}    // Do nothing.
+        Some(config::EntryMain) => create_entry_fn(cx, span, main_llfn, main_def_id, true),
+        Some(config::EntryStart) => create_entry_fn(cx, span, main_llfn, main_def_id, false),
+        None => {}    // Do nothing.
     }
 
     fn create_entry_fn<'cx>(cx: &'cx CodegenCx,
@@ -550,7 +554,9 @@ fn maybe_create_entry_wrapper(cx: &CodegenCx) {
         // late-bound regions, since late-bound
         // regions must appear in the argument
         // listing.
-        let main_ret_ty = main_ret_ty.no_late_bound_regions().unwrap();
+        let main_ret_ty = cx.tcx.erase_regions(
+            &main_ret_ty.no_late_bound_regions().unwrap(),
+        );
 
         if declare::get_defined_value(cx, "main").is_some() {
             // FIXME: We should be smart and show a better diagnostic here.
@@ -577,8 +583,11 @@ fn maybe_create_entry_wrapper(cx: &CodegenCx) {
 
         let (start_fn, args) = if use_start_lang_item {
             let start_def_id = cx.tcx.require_lang_item(StartFnLangItem);
-            let start_fn = callee::resolve_and_get_fn(cx, start_def_id, cx.tcx.mk_substs(
-                iter::once(Kind::from(main_ret_ty))));
+            let start_fn = callee::resolve_and_get_fn(
+                cx,
+                start_def_id,
+                cx.tcx.intern_substs(&[Kind::from(main_ret_ty)]),
+            );
             (start_fn, vec![bx.pointercast(rust_main, Type::i8p(cx).ptr_to()),
                             arg_argc, arg_argv])
         } else {
@@ -706,6 +715,13 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         }
     }
 
+    if (tcx.sess.opts.debugging_opts.pgo_gen.is_some() ||
+        !tcx.sess.opts.debugging_opts.pgo_use.is_empty()) &&
+        unsafe { !llvm::LLVMRustPGOAvailable() }
+    {
+        tcx.sess.fatal("this compiler's LLVM does not support PGO");
+    }
+
     let crate_hash = tcx.crate_hash(LOCAL_CRATE);
     let link_meta = link::build_link_meta(crate_hash);
 
@@ -722,7 +738,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         source: ModuleSource::Translated(ModuleLlvm {
             llcx: metadata_llcx,
             llmod: metadata_llmod,
-            tm: create_target_machine(tcx.sess),
+            tm: create_target_machine(tcx.sess, false),
         }),
         kind: ModuleKind::Metadata,
     };
@@ -780,7 +796,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         codegen_units.len());
 
     // Translate an allocator shim, if any
-    let allocator_module = if let Some(kind) = tcx.sess.allocator_kind.get() {
+    let allocator_module = if let Some(kind) = *tcx.sess.allocator_kind.get() {
         unsafe {
             let llmod_id = "allocator";
             let (llcx, llmod) =
@@ -788,7 +804,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             let modules = ModuleLlvm {
                 llmod,
                 llcx,
-                tm: create_target_machine(tcx.sess),
+                tm: create_target_machine(tcx.sess, false),
             };
             time(tcx.sess, "write allocator module", || {
                 allocator::trans(tcx, &modules, kind)
@@ -815,7 +831,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     // a bit more efficiently.
     let codegen_units = {
         let mut codegen_units = codegen_units;
-        codegen_units.sort_by_key(|cgu| usize::MAX - cgu.size_estimate());
+        codegen_units.sort_by_cached_key(|cgu| cmp::Reverse(cgu.size_estimate()));
         codegen_units
     };
 
@@ -1021,7 +1037,7 @@ fn collect_and_partition_translation_items<'a, 'tcx>(
                 cgus.dedup();
                 for &(ref cgu_name, (linkage, _)) in cgus.iter() {
                     output.push_str(" ");
-                    output.push_str(&cgu_name);
+                    output.push_str(&cgu_name.as_str());
 
                     let linkage_abbrev = match linkage {
                         Linkage::External => "External",
@@ -1070,7 +1086,28 @@ impl CrateInfo {
             used_crates_dynamic: cstore::used_crates(tcx, LinkagePreference::RequireDynamic),
             used_crates_static: cstore::used_crates(tcx, LinkagePreference::RequireStatic),
             used_crate_source: FxHashMap(),
+            wasm_custom_sections: BTreeMap::new(),
+            wasm_imports: FxHashMap(),
+            lang_item_to_crate: FxHashMap(),
+            missing_lang_items: FxHashMap(),
         };
+        let lang_items = tcx.lang_items();
+
+        let load_wasm_items = tcx.sess.crate_types.borrow()
+            .iter()
+            .any(|c| *c != config::CrateTypeRlib) &&
+            tcx.sess.opts.target_triple == TargetTriple::from_triple("wasm32-unknown-unknown");
+
+        if load_wasm_items {
+            info!("attempting to load all wasm sections");
+            for &id in tcx.wasm_custom_sections(LOCAL_CRATE).iter() {
+                let (name, contents) = fetch_wasm_section(tcx, id);
+                info.wasm_custom_sections.entry(name)
+                    .or_insert(Vec::new())
+                    .extend(contents);
+            }
+            info.load_wasm_imports(tcx, LOCAL_CRATE);
+        }
 
         for &cnum in tcx.crates().iter() {
             info.native_libraries.insert(cnum, tcx.native_libraries(cnum));
@@ -1091,10 +1128,40 @@ impl CrateInfo {
             if tcx.is_no_builtins(cnum) {
                 info.is_no_builtins.insert(cnum);
             }
+            if load_wasm_items {
+                for &id in tcx.wasm_custom_sections(cnum).iter() {
+                    let (name, contents) = fetch_wasm_section(tcx, id);
+                    info.wasm_custom_sections.entry(name)
+                        .or_insert(Vec::new())
+                        .extend(contents);
+                }
+                info.load_wasm_imports(tcx, cnum);
+            }
+            let missing = tcx.missing_lang_items(cnum);
+            for &item in missing.iter() {
+                if let Ok(id) = lang_items.require(item) {
+                    info.lang_item_to_crate.insert(item, id.krate);
+                }
+            }
+
+            // No need to look for lang items that are whitelisted and don't
+            // actually need to exist.
+            let missing = missing.iter()
+                .cloned()
+                .filter(|&l| !weak_lang_items::whitelisted(tcx, l))
+                .collect();
+            info.missing_lang_items.insert(cnum, missing);
         }
 
-
         return info
+    }
+
+    fn load_wasm_imports(&mut self, tcx: TyCtxt, cnum: CrateNum) {
+        for (&id, module) in tcx.wasm_import_module_map(cnum).iter() {
+            let instance = Instance::mono(tcx, id);
+            let import_name = tcx.symbol_name(instance);
+            self.wasm_imports.insert(import_name.to_string(), module.clone());
+        }
     }
 }
 
@@ -1194,7 +1261,7 @@ fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             let llvm_module = ModuleLlvm {
                 llcx: cx.llcx,
                 llmod: cx.llmod,
-                tm: create_target_machine(cx.sess()),
+                tm: create_target_machine(cx.sess(), false),
             };
 
             ModuleTranslation {
@@ -1223,6 +1290,39 @@ pub fn provide(providers: &mut Providers) {
             .expect(&format!("failed to find cgu with name {:?}", name))
     };
     providers.compile_codegen_unit = compile_codegen_unit;
+
+    provide_extern(providers);
+}
+
+pub fn provide_extern(providers: &mut Providers) {
+    providers.dllimport_foreign_items = |tcx, krate| {
+        let module_map = tcx.foreign_modules(krate);
+        let module_map = module_map.iter()
+            .map(|lib| (lib.def_id, lib))
+            .collect::<FxHashMap<_, _>>();
+
+        let dllimports = tcx.native_libraries(krate)
+            .iter()
+            .filter(|lib| {
+                if lib.kind != cstore::NativeLibraryKind::NativeUnknown {
+                    return false
+                }
+                let cfg = match lib.cfg {
+                    Some(ref cfg) => cfg,
+                    None => return true,
+                };
+                attr::cfg_matches(cfg, &tcx.sess.parse_sess, None)
+            })
+            .filter_map(|lib| lib.foreign_module)
+            .map(|id| &module_map[&id])
+            .flat_map(|module| module.foreign_items.iter().cloned())
+            .collect();
+        Lrc::new(dllimports)
+    };
+
+    providers.is_dllimport_foreign_item = |tcx, def_id| {
+        tcx.dllimport_foreign_items(def_id.krate).contains(&def_id)
+    };
 }
 
 pub fn linkage_to_llvm(linkage: Linkage) -> llvm::Linkage {
@@ -1269,4 +1369,45 @@ mod temp_stable_hash_impls {
             // do nothing
         }
     }
+}
+
+fn fetch_wasm_section(tcx: TyCtxt, id: DefId) -> (String, Vec<u8>) {
+    use rustc::mir::interpret::{GlobalId, Value, PrimVal};
+    use rustc::middle::const_val::ConstVal;
+
+    info!("loading wasm section {:?}", id);
+
+    let section = tcx.get_attrs(id)
+        .iter()
+        .find(|a| a.check_name("wasm_custom_section"))
+        .expect("missing #[wasm_custom_section] attribute")
+        .value_str()
+        .expect("malformed #[wasm_custom_section] attribute");
+
+    let instance = ty::Instance::mono(tcx, id);
+    let cid = GlobalId {
+        instance,
+        promoted: None
+    };
+    let param_env = ty::ParamEnv::reveal_all();
+    let val = tcx.const_eval(param_env.and(cid)).unwrap();
+
+    let val = match val.val {
+        ConstVal::Value(val) => val,
+        ConstVal::Unevaluated(..) => bug!("should be evaluated"),
+    };
+    let val = match val {
+        Value::ByRef(ptr, _align) => ptr.into_inner_primval(),
+        ref v => bug!("should be ByRef, was {:?}", v),
+    };
+    let mem = match val {
+        PrimVal::Ptr(mem) => mem,
+        ref v => bug!("should be Ptr, was {:?}", v),
+    };
+    assert_eq!(mem.offset, 0);
+    let alloc = tcx
+        .interpret_interner
+        .get_alloc(mem.alloc_id)
+        .expect("miri allocation never successfully created");
+    (section.to_string(), alloc.bytes.clone())
 }

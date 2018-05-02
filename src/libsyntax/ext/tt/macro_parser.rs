@@ -86,7 +86,6 @@ use self::TokenTreeOrTokenTreeVec::*;
 
 use ast::Ident;
 use syntax_pos::{self, BytePos, Span};
-use codemap::Spanned;
 use errors::FatalError;
 use ext::tt::quoted::{self, TokenTree};
 use parse::{Directory, ParseSess};
@@ -364,9 +363,9 @@ pub fn parse_failure_msg(tok: Token) -> String {
 
 /// Perform a token equality check, ignoring syntax context (that is, an unhygienic comparison)
 fn token_name_eq(t1: &Token, t2: &Token) -> bool {
-    if let (Some(id1), Some(id2)) = (t1.ident(), t2.ident()) {
-        id1.name == id2.name
-    } else if let (&token::Lifetime(id1), &token::Lifetime(id2)) = (t1, t2) {
+    if let (Some((id1, is_raw1)), Some((id2, is_raw2))) = (t1.ident(), t2.ident()) {
+        id1.name == id2.name && is_raw1 == is_raw2
+    } else if let (Some(id1), Some(id2)) = (t1.lifetime(), t2.lifetime()) {
         id1.name == id2.name
     } else {
         *t1 == *t2
@@ -709,6 +708,16 @@ pub fn parse(
     }
 }
 
+/// The token is an identifier, but not `_`.
+/// We prohibit passing `_` to macros expecting `ident` for now.
+fn get_macro_ident(token: &Token) -> Option<(Ident, bool)> {
+    match *token {
+        token::Ident(ident, is_raw) if ident.name != keywords::Underscore.name() =>
+            Some((ident, is_raw)),
+        _ => None,
+    }
+}
+
 /// Checks whether a non-terminal may begin with a particular token.
 ///
 /// Returning `false` is a *stability guarantee* that such a matcher will *never* begin with that
@@ -725,10 +734,10 @@ fn may_begin_with(name: &str, token: &Token) -> bool {
     match name {
         "expr" => token.can_begin_expr(),
         "ty" => token.can_begin_type(),
-        "ident" => token.is_ident(),
+        "ident" => get_macro_ident(token).is_some(),
         "vis" => match *token {
             // The follow-set of :vis + "priv" keyword + interpolated
-            Token::Comma | Token::Ident(_) | Token::Interpolated(_) => true,
+            Token::Comma | Token::Ident(..) | Token::Interpolated(_) => true,
             _ => token.can_begin_type(),
         },
         "block" => match *token {
@@ -737,7 +746,7 @@ fn may_begin_with(name: &str, token: &Token) -> bool {
                 token::NtItem(_)
                 | token::NtPat(_)
                 | token::NtTy(_)
-                | token::NtIdent(_)
+                | token::NtIdent(..)
                 | token::NtMeta(_)
                 | token::NtPath(_)
                 | token::NtVis(_) => false, // none of these may start with '{'.
@@ -746,7 +755,7 @@ fn may_begin_with(name: &str, token: &Token) -> bool {
             _ => false,
         },
         "path" | "meta" => match *token {
-            Token::ModSep | Token::Ident(_) => true,
+            Token::ModSep | Token::Ident(..) => true,
             Token::Interpolated(ref nt) => match nt.0 {
                 token::NtPath(_) | token::NtMeta(_) => true,
                 _ => may_be_ident(&nt.0),
@@ -754,7 +763,7 @@ fn may_begin_with(name: &str, token: &Token) -> bool {
             _ => false,
         },
         "pat" => match *token {
-            Token::Ident(_) |               // box, ref, mut, and other identifiers (can stricten)
+            Token::Ident(..) |               // box, ref, mut, and other identifiers (can stricten)
             Token::OpenDelim(token::Paren) |    // tuple pattern
             Token::OpenDelim(token::Bracket) |  // slice pattern
             Token::BinOp(token::And) |          // reference
@@ -765,8 +774,7 @@ fn may_begin_with(name: &str, token: &Token) -> bool {
             Token::DotDotDot |                  // range pattern (future compat)
             Token::ModSep |                     // path
             Token::Lt |                         // path (UFCS constant)
-            Token::BinOp(token::Shl) |          // path (double UFCS)
-            Token::Underscore => true,          // placeholder
+            Token::BinOp(token::Shl) => true,   // path (double UFCS)
             Token::Interpolated(ref nt) => may_be_ident(&nt.0),
             _ => false,
         },
@@ -815,25 +823,19 @@ fn parse_nt<'a>(p: &mut Parser<'a>, sp: Span, name: &str) -> Nonterminal {
         "expr" => token::NtExpr(panictry!(p.parse_expr())),
         "ty" => token::NtTy(panictry!(p.parse_ty())),
         // this could be handled like a token, since it is one
-        "ident" => match p.token {
-            token::Ident(sn) => {
-                p.bump();
-                token::NtIdent(Spanned::<Ident> {
-                    node: sn,
-                    span: p.prev_span,
-                })
-            }
-            _ => {
-                let token_str = pprust::token_to_string(&p.token);
-                p.fatal(&format!("expected ident, found {}", &token_str[..]))
-                    .emit();
-                FatalError.raise()
-            }
-        },
+        "ident" => if let Some((ident, is_raw)) = get_macro_ident(&p.token) {
+            let span = p.span;
+            p.bump();
+            token::NtIdent(Ident::new(ident.name, span), is_raw)
+        } else {
+            let token_str = pprust::token_to_string(&p.token);
+            p.fatal(&format!("expected ident, found {}", &token_str)).emit();
+            FatalError.raise()
+        }
         "path" => token::NtPath(panictry!(p.parse_path_common(PathStyle::Type, false))),
         "meta" => token::NtMeta(panictry!(p.parse_meta_item())),
         "vis" => token::NtVis(panictry!(p.parse_visibility(true))),
-        "lifetime" => token::NtLifetime(p.expect_lifetime()),
+        "lifetime" => token::NtLifetime(p.expect_lifetime().ident),
         // this is not supposed to happen, since it has been checked
         // when compiling the macro.
         _ => p.span_bug(sp, "invalid fragment specifier"),

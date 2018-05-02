@@ -133,9 +133,27 @@ pub fn trait_borrow(_: &Drop) {
 pub fn trait_box(_: Box<Drop>) {
 }
 
+// CHECK: { i8*, i8* } @trait_option(i8* noalias %x.0, i8* %x.1)
+#[no_mangle]
+pub fn trait_option(x: Option<Box<Drop>>) -> Option<Box<Drop>> {
+  x
+}
+
 // CHECK: { [0 x i16]*, [[USIZE]] } @return_slice([0 x i16]* noalias nonnull readonly %x.0, [[USIZE]] %x.1)
 #[no_mangle]
 pub fn return_slice(x: &[u16]) -> &[u16] {
+  x
+}
+
+// CHECK: { i16, i16 } @enum_id_1(i16 %x.0, i16 %x.1)
+#[no_mangle]
+pub fn enum_id_1(x: Option<Result<u16, u16>>) -> Option<Result<u16, u16>> {
+  x
+}
+
+// CHECK: i16 @enum_id_2(i16)
+#[no_mangle]
+pub fn enum_id_2(x: Option<u8>) -> Option<u8> {
   x
 }
 

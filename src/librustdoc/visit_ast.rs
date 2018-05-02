@@ -13,7 +13,7 @@
 
 use std::mem;
 
-use syntax::abi;
+use rustc_target::spec::abi;
 use syntax::ast;
 use syntax::attr;
 use syntax_pos::Span;
@@ -49,7 +49,6 @@ pub struct RustdocVisitor<'a, 'tcx: 'a, 'rcx: 'a> {
     inlining: bool,
     /// Is the current module and all of its parents public?
     inside_public_path: bool,
-    reexported_macros: FxHashSet<DefId>,
     exact_paths: Option<FxHashMap<DefId, Vec<String>>>,
 }
 
@@ -66,7 +65,6 @@ impl<'a, 'tcx, 'rcx> RustdocVisitor<'a, 'tcx, 'rcx> {
             view_item_stack: stack,
             inlining: false,
             inside_public_path: true,
-            reexported_macros: FxHashSet(),
             exact_paths: Some(FxHashMap()),
             cstore,
         }
@@ -221,7 +219,7 @@ impl<'a, 'tcx, 'rcx> RustdocVisitor<'a, 'tcx, 'rcx> {
         if let Some(exports) = self.cx.tcx.module_exports(def_id) {
             for export in exports.iter().filter(|e| e.vis == Visibility::Public) {
                 if let Def::Macro(def_id, ..) = export.def {
-                    if def_id.krate == LOCAL_CRATE || self.reexported_macros.contains(&def_id) {
+                    if def_id.krate == LOCAL_CRATE {
                         continue // These are `krate.exported_macros`, handled in `self.visit()`.
                     }
 
@@ -297,17 +295,6 @@ impl<'a, 'tcx, 'rcx> RustdocVisitor<'a, 'tcx, 'rcx> {
         // Don't inline doc(hidden) imports so they can be stripped at a later stage.
         let is_no_inline = use_attrs.lists("doc").has_word("no_inline") ||
                            use_attrs.lists("doc").has_word("hidden");
-
-        // Memoize the non-inlined `pub use`'d macros so we don't push an extra
-        // declaration in `visit_mod_contents()`
-        if !def_did.is_local() {
-            if let Def::Macro(did, _) = def {
-                if please_inline { return true }
-                debug!("memoizing non-inlined macro export: {:?}", def);
-                self.reexported_macros.insert(did);
-                return false;
-            }
-        }
 
         // For cross-crate impl inlining we need to know whether items are
         // reachable in documentation - a previously nonreachable item can be
@@ -406,13 +393,13 @@ impl<'a, 'tcx, 'rcx> RustdocVisitor<'a, 'tcx, 'rcx> {
             // If we're inlining, skip private items.
             _ if self.inlining && item.vis != hir::Public => {}
             hir::ItemGlobalAsm(..) => {}
-            hir::ItemExternCrate(ref p) => {
+            hir::ItemExternCrate(orig_name) => {
                 let def_id = self.cx.tcx.hir.local_def_id(item.id);
                 om.extern_crates.push(ExternCrate {
                     cnum: self.cx.tcx.extern_mod_stmt_cnum(def_id)
                                 .unwrap_or(LOCAL_CRATE),
                     name,
-                    path: p.map(|x|x.to_string()),
+                    path: orig_name.map(|x|x.to_string()),
                     vis: item.vis.clone(),
                     attrs: item.attrs.clone(),
                     whence: item.span,

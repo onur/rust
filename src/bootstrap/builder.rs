@@ -9,7 +9,7 @@
 // except according to those terms.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Debug;
@@ -18,6 +18,8 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Instant, Duration};
+use std::collections::HashMap;
 
 use compile;
 use install;
@@ -34,12 +36,20 @@ use native;
 
 pub use Compiler;
 
+use petgraph::Graph;
+use petgraph::graph::NodeIndex;
+
 pub struct Builder<'a> {
     pub build: &'a Build,
     pub top_stage: u32,
     pub kind: Kind,
     cache: Cache,
     stack: RefCell<Vec<Box<Any>>>,
+    time_spent_on_dependencies: Cell<Duration>,
+    pub paths: Vec<PathBuf>,
+    graph_nodes: RefCell<HashMap<String, NodeIndex>>,
+    graph: RefCell<Graph<String, bool>>,
+    parent: Cell<Option<NodeIndex>>,
 }
 
 impl<'a> Deref for Builder<'a> {
@@ -144,18 +154,17 @@ impl StepDescription {
             eprintln!("{:?} not skipped for {:?} -- not in {:?}", pathset,
                 self.name, builder.config.exclude);
         }
-        let build = builder.build;
-        let hosts = &build.hosts;
+        let hosts = &builder.hosts;
 
         // Determine the targets participating in this rule.
         let targets = if self.only_hosts {
-            if !build.config.run_host_only {
+            if !builder.config.run_host_only {
                 return; // don't run anything
             } else {
-                &build.hosts
+                &builder.hosts
             }
         } else {
-            &build.targets
+            &builder.targets
         };
 
         for host in hosts {
@@ -301,26 +310,32 @@ impl<'a> Builder<'a> {
                 tool::Compiletest, tool::RemoteTestServer, tool::RemoteTestClient,
                 tool::RustInstaller, tool::Cargo, tool::Rls, tool::Rustdoc, tool::Clippy,
                 native::Llvm, tool::Rustfmt, tool::Miri, native::Lld),
-            Kind::Check => describe!(check::Std, check::Test, check::Rustc),
+            Kind::Check => describe!(check::Std, check::Test, check::Rustc, check::CodegenBackend,
+                check::Rustdoc),
             Kind::Test => describe!(test::Tidy, test::Bootstrap, test::Ui, test::RunPass,
                 test::CompileFail, test::ParseFail, test::RunFail, test::RunPassValgrind,
                 test::MirOpt, test::Codegen, test::CodegenUnits, test::Incremental, test::Debuginfo,
                 test::UiFullDeps, test::RunPassFullDeps, test::RunFailFullDeps,
                 test::CompileFailFullDeps, test::IncrementalFullDeps, test::Rustdoc, test::Pretty,
                 test::RunPassPretty, test::RunFailPretty, test::RunPassValgrindPretty,
-                test::RunPassFullDepsPretty, test::RunFailFullDepsPretty, test::RunMake,
-                test::Crate, test::CrateLibrustc, test::Rustdoc, test::Linkcheck, test::Cargotest,
-                test::Cargo, test::Rls, test::ErrorIndex, test::Distcheck,
+                test::RunPassFullDepsPretty, test::RunFailFullDepsPretty,
+                test::Crate, test::CrateLibrustc, test::CrateRustdoc, test::Linkcheck,
+                test::Cargotest, test::Cargo, test::Rls, test::ErrorIndex, test::Distcheck,
+                test::RunMakeFullDeps,
                 test::Nomicon, test::Reference, test::RustdocBook, test::RustByExample,
-                test::TheBook, test::UnstableBook,
-                test::Rustfmt, test::Miri, test::Clippy, test::RustdocJS, test::RustdocTheme),
+                test::TheBook, test::UnstableBook, test::RustcBook,
+                test::Rustfmt, test::Miri, test::Clippy, test::RustdocJS, test::RustdocTheme,
+                // Run run-make last, since these won't pass without make on Windows
+                test::RunMake, test::RustdocUi),
             Kind::Bench => describe!(test::Crate, test::CrateLibrustc),
             Kind::Doc => describe!(doc::UnstableBook, doc::UnstableBookGen, doc::TheBook,
-                doc::Standalone, doc::Std, doc::Test, doc::Rustc, doc::ErrorIndex, doc::Nomicon,
-                doc::Reference, doc::Rustdoc, doc::RustByExample, doc::CargoBook),
-            Kind::Dist => describe!(dist::Docs, dist::Mingw, dist::Rustc, dist::DebuggerScripts,
-                dist::Std, dist::Analysis, dist::Src, dist::PlainSourceTarball, dist::Cargo,
-                dist::Rls, dist::Rustfmt, dist::Extended, dist::HashSign),
+                doc::Standalone, doc::Std, doc::Test, doc::WhitelistedRustc, doc::Rustc,
+                doc::ErrorIndex, doc::Nomicon, doc::Reference, doc::Rustdoc, doc::RustByExample,
+                doc::RustcBook, doc::CargoBook),
+            Kind::Dist => describe!(dist::Docs, dist::RustcDocs, dist::Mingw, dist::Rustc,
+                dist::DebuggerScripts, dist::Std, dist::Analysis, dist::Src,
+                dist::PlainSourceTarball, dist::Cargo, dist::Rls, dist::Rustfmt, dist::Extended,
+                dist::HashSign),
             Kind::Install => describe!(install::Docs, install::Std, install::Cargo, install::Rls,
                 install::Rustfmt, install::Analysis, install::Src, install::Rustc),
         }
@@ -343,6 +358,11 @@ impl<'a> Builder<'a> {
             kind,
             cache: Cache::new(),
             stack: RefCell::new(Vec::new()),
+            time_spent_on_dependencies: Cell::new(Duration::new(0, 0)),
+            paths: vec![],
+            graph_nodes: RefCell::new(HashMap::new()),
+            graph: RefCell::new(Graph::new()),
+            parent: Cell::new(None),
         };
 
         let builder = &builder;
@@ -359,7 +379,7 @@ impl<'a> Builder<'a> {
         Some(help)
     }
 
-    pub fn run(build: &Build) {
+    pub fn new(build: &Build) -> Builder {
         let (kind, paths) = match build.config.cmd {
             Subcommand::Build { ref paths } => (Kind::Build, &paths[..]),
             Subcommand::Check { ref paths } => (Kind::Check, &paths[..]),
@@ -371,32 +391,40 @@ impl<'a> Builder<'a> {
             Subcommand::Clean { .. } => panic!(),
         };
 
-        if let Some(path) = paths.get(0) {
-            if path == Path::new("nonexistent/path/to/trigger/cargo/metadata") {
-                return;
-            }
-        }
-
         let builder = Builder {
             build,
             top_stage: build.config.stage.unwrap_or(2),
             kind,
             cache: Cache::new(),
             stack: RefCell::new(Vec::new()),
+            time_spent_on_dependencies: Cell::new(Duration::new(0, 0)),
+            paths: paths.to_owned(),
+            graph_nodes: RefCell::new(HashMap::new()),
+            graph: RefCell::new(Graph::new()),
+            parent: Cell::new(None),
         };
 
         if kind == Kind::Dist {
-            assert!(!build.config.test_miri, "Do not distribute with miri enabled.\n\
+            assert!(!builder.config.test_miri, "Do not distribute with miri enabled.\n\
                 The distributed libraries would include all MIR (increasing binary size).
                 The distributed MIR would include validation statements.");
         }
 
-        StepDescription::run(&Builder::get_step_descriptions(builder.kind), &builder, paths);
+        builder
+    }
+
+    pub fn execute_cli(&self) -> Graph<String, bool> {
+        self.run_step_descriptions(&Builder::get_step_descriptions(self.kind), &self.paths);
+        self.graph.borrow().clone()
     }
 
     pub fn default_doc(&self, paths: Option<&[PathBuf]>) {
         let paths = paths.unwrap_or(&[]);
-        StepDescription::run(&Builder::get_step_descriptions(Kind::Doc), self, paths);
+        self.run_step_descriptions(&Builder::get_step_descriptions(Kind::Doc), paths);
+    }
+
+    fn run_step_descriptions(&self, v: &[StepDescription], paths: &[PathBuf]) {
+        StepDescription::run(v, self, paths);
     }
 
     /// Obtain a compiler at a given stage and for a given host. Explicitly does
@@ -448,7 +476,7 @@ impl<'a> Builder<'a> {
 
     pub fn sysroot_codegen_backends(&self, compiler: Compiler) -> PathBuf {
         self.sysroot_libdir(compiler, compiler.host)
-            .with_file_name(self.build.config.rust_codegen_backends_dir.clone())
+            .with_file_name(self.config.rust_codegen_backends_dir.clone())
     }
 
     /// Returns the compiler's libdir where it stores the dynamic libraries that
@@ -458,7 +486,7 @@ impl<'a> Builder<'a> {
     /// Windows.
     pub fn rustc_libdir(&self, compiler: Compiler) -> PathBuf {
         if compiler.is_snapshot(self) {
-            self.build.rustc_snapshot_libdir()
+            self.rustc_snapshot_libdir()
         } else {
             self.sysroot(compiler).join(libdir(&compiler.host))
         }
@@ -495,12 +523,12 @@ impl<'a> Builder<'a> {
         let compiler = self.compiler(self.top_stage, host);
         cmd.env("RUSTC_STAGE", compiler.stage.to_string())
            .env("RUSTC_SYSROOT", self.sysroot(compiler))
-           .env("RUSTDOC_LIBDIR", self.sysroot_libdir(compiler, self.build.build))
-           .env("CFG_RELEASE_CHANNEL", &self.build.config.channel)
+           .env("RUSTDOC_LIBDIR", self.sysroot_libdir(compiler, self.config.build))
+           .env("CFG_RELEASE_CHANNEL", &self.config.channel)
            .env("RUSTDOC_REAL", self.rustdoc(host))
-           .env("RUSTDOC_CRATE_VERSION", self.build.rust_version())
+           .env("RUSTDOC_CRATE_VERSION", self.rust_version())
            .env("RUSTC_BOOTSTRAP", "1");
-        if let Some(linker) = self.build.linker(host) {
+        if let Some(linker) = self.linker(host) {
             cmd.env("RUSTC_TARGET_LINKER", linker);
         }
         cmd
@@ -525,6 +553,12 @@ impl<'a> Builder<'a> {
              .arg("--target")
              .arg(target);
 
+        // Set a flag for `check` so that certain build scripts can do less work
+        // (e.g. not building/requiring LLVM).
+        if cmd == "check" {
+            cargo.env("RUST_CHECK", "1");
+        }
+
         // If we were invoked from `make` then that's already got a jobserver
         // set up for us so no need to tell Cargo about jobs all over again.
         if env::var_os("MAKEFLAGS").is_none() && env::var_os("MFLAGS").is_none() {
@@ -546,7 +580,9 @@ impl<'a> Builder<'a> {
         let mut extra_args = env::var(&format!("RUSTFLAGS_STAGE_{}", stage)).unwrap_or_default();
         if stage != 0 {
             let s = env::var("RUSTFLAGS_STAGE_NOT_0").unwrap_or_default();
-            extra_args.push_str(" ");
+            if !extra_args.is_empty() {
+                extra_args.push_str(" ");
+            }
             extra_args.push_str(&s);
         }
 
@@ -579,23 +615,27 @@ impl<'a> Builder<'a> {
              .env("TEST_MIRI", self.config.test_miri.to_string())
              .env("RUSTC_ERROR_METADATA_DST", self.extended_error_dir());
 
-        if let Some(host_linker) = self.build.linker(compiler.host) {
+        if let Some(host_linker) = self.linker(compiler.host) {
             cargo.env("RUSTC_HOST_LINKER", host_linker);
         }
-        if let Some(target_linker) = self.build.linker(target) {
+        if let Some(target_linker) = self.linker(target) {
             cargo.env("RUSTC_TARGET_LINKER", target_linker);
         }
         if let Some(ref error_format) = self.config.rustc_error_format {
             cargo.env("RUSTC_ERROR_FORMAT", error_format);
         }
         if cmd != "build" && cmd != "check" {
-            cargo.env("RUSTDOC_LIBDIR", self.rustc_libdir(self.compiler(2, self.build.build)));
+            cargo.env("RUSTDOC_LIBDIR", self.rustc_libdir(self.compiler(2, self.config.build)));
         }
 
-        if mode != Mode::Tool {
-            // Tools don't get debuginfo right now, e.g. cargo and rls don't
-            // get compiled with debuginfo.
-            // Adding debuginfo increases their sizes by a factor of 3-4.
+        if mode == Mode::Tool {
+            // Tools like cargo and rls don't get debuginfo by default right now, but this can be
+            // enabled in the config.  Adding debuginfo makes them several times larger.
+            if self.config.rust_debuginfo_tools {
+                cargo.env("RUSTC_DEBUGINFO", self.config.rust_debuginfo.to_string());
+                cargo.env("RUSTC_DEBUGINFO_LINES", self.config.rust_debuginfo_lines.to_string());
+            }
+        } else {
             cargo.env("RUSTC_DEBUGINFO", self.config.rust_debuginfo.to_string());
             cargo.env("RUSTC_DEBUGINFO_LINES", self.config.rust_debuginfo_lines.to_string());
             cargo.env("RUSTC_FORCE_UNSTABLE", "1");
@@ -643,7 +683,7 @@ impl<'a> Builder<'a> {
         //
         // If LLVM support is disabled we need to use the snapshot compiler to compile
         // build scripts, as the new compiler doesn't support executables.
-        if mode == Mode::Libstd || !self.build.config.llvm_enabled {
+        if mode == Mode::Libstd || !self.config.llvm_enabled {
             cargo.env("RUSTC_SNAPSHOT", &self.initial_rustc)
                  .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_snapshot_libdir());
         } else {
@@ -662,7 +702,16 @@ impl<'a> Builder<'a> {
             cargo.env("RUSTC_ON_FAIL", on_fail);
         }
 
+        if self.config.print_step_timings {
+            cargo.env("RUSTC_PRINT_STEP_TIMINGS", "1");
+        }
+
         cargo.env("RUSTC_VERBOSE", format!("{}", self.verbosity));
+
+        // in std, we want to avoid denying warnings for stage 0 as that makes cfg's painful.
+        if self.config.deny_warnings && !(mode == Mode::Libstd && stage == 0) {
+            cargo.env("RUSTC_DENY_WARNINGS", "1");
+        }
 
         // Throughout the build Cargo can execute a number of build scripts
         // compiling C/C++ code and we need to pass compilers, archivers, flags, etc
@@ -713,12 +762,14 @@ impl<'a> Builder<'a> {
             }
         }
 
-        if mode == Mode::Libstd && self.config.extended && compiler.is_final_stage(self) {
+        if cmd == "build" && mode == Mode::Libstd
+            && self.config.extended && compiler.is_final_stage(self)
+        {
             cargo.env("RUSTC_SAVE_ANALYSIS", "api".to_string());
         }
 
         // For `cargo doc` invocations, make rustdoc print the Rust version into the docs
-        cargo.env("RUSTDOC_CRATE_VERSION", self.build.rust_version());
+        cargo.env("RUSTDOC_CRATE_VERSION", self.rust_version());
 
         // Environment variables *required* throughout the build
         //
@@ -726,7 +777,7 @@ impl<'a> Builder<'a> {
         cargo.env("CFG_COMPILER_HOST_TRIPLE", target);
 
         // Set this for all builds to make sure doc builds also get it.
-        cargo.env("CFG_RELEASE_CHANNEL", &self.build.config.channel);
+        cargo.env("CFG_RELEASE_CHANNEL", &self.config.channel);
 
         // This one's a bit tricky. As of the time of this writing the compiler
         // links to the `winapi` crate on crates.io. This crate provides raw
@@ -763,7 +814,7 @@ impl<'a> Builder<'a> {
             cargo.env("WINAPI_NO_BUNDLED_LIBRARIES", "1");
         }
 
-        if self.is_very_verbose() {
+        for _ in 1..self.verbosity {
             cargo.arg("-v");
         }
 
@@ -792,7 +843,7 @@ impl<'a> Builder<'a> {
         cargo
     }
 
-    /// Ensure that a given step is built, returning it's output. This will
+    /// Ensure that a given step is built, returning its output. This will
     /// cache the step, so it is safe (and good!) to call this as often as
     /// needed to ensure that all dependencies are built.
     pub fn ensure<S: Step>(&'a self, step: S) -> S::Output {
@@ -811,21 +862,545 @@ impl<'a> Builder<'a> {
                 panic!(out);
             }
             if let Some(out) = self.cache.get(&step) {
-                self.build.verbose(&format!("{}c {:?}", "  ".repeat(stack.len()), step));
+                self.verbose(&format!("{}c {:?}", "  ".repeat(stack.len()), step));
+
+                {
+                    let mut graph = self.graph.borrow_mut();
+                    let parent = self.parent.get();
+                    let us = *self.graph_nodes.borrow_mut()
+                        .entry(format!("{:?}", step))
+                        .or_insert_with(|| graph.add_node(format!("{:?}", step)));
+                    if let Some(parent) = parent {
+                        graph.add_edge(parent, us, false);
+                    }
+                }
 
                 return out;
             }
-            self.build.verbose(&format!("{}> {:?}", "  ".repeat(stack.len()), step));
+            self.verbose(&format!("{}> {:?}", "  ".repeat(stack.len()), step));
             stack.push(Box::new(step.clone()));
         }
-        let out = step.clone().run(self);
+
+        let prev_parent = self.parent.get();
+
+        {
+            let mut graph = self.graph.borrow_mut();
+            let parent = self.parent.get();
+            let us = *self.graph_nodes.borrow_mut()
+                .entry(format!("{:?}", step))
+                .or_insert_with(|| graph.add_node(format!("{:?}", step)));
+            self.parent.set(Some(us));
+            if let Some(parent) = parent {
+                graph.add_edge(parent, us, true);
+            }
+        }
+
+        let (out, dur) = {
+            let start = Instant::now();
+            let zero = Duration::new(0, 0);
+            let parent = self.time_spent_on_dependencies.replace(zero);
+            let out = step.clone().run(self);
+            let dur = start.elapsed();
+            let deps = self.time_spent_on_dependencies.replace(parent + dur);
+            (out, dur - deps)
+        };
+
+        self.parent.set(prev_parent);
+
+        if self.config.print_step_timings && dur > Duration::from_millis(100) {
+            println!("[TIMING] {:?} -- {}.{:03}",
+                     step,
+                     dur.as_secs(),
+                     dur.subsec_nanos() / 1_000_000);
+        }
+
         {
             let mut stack = self.stack.borrow_mut();
             let cur_step = stack.pop().expect("step stack empty");
             assert_eq!(cur_step.downcast_ref(), Some(&step));
         }
-        self.build.verbose(&format!("{}< {:?}", "  ".repeat(self.stack.borrow().len()), step));
+        self.verbose(&format!("{}< {:?}", "  ".repeat(self.stack.borrow().len()), step));
         self.cache.put(step, out.clone());
         out
+    }
+}
+
+#[cfg(test)]
+mod __test {
+    use config::Config;
+    use std::thread;
+    use super::*;
+
+    fn configure(host: &[&str], target: &[&str]) -> Config {
+        let mut config = Config::default_opts();
+        // don't save toolstates
+        config.save_toolstates = None;
+        config.run_host_only = true;
+        config.dry_run = true;
+        // try to avoid spurious failures in dist where we create/delete each others file
+        let dir = config.out.join("tmp-rustbuild-tests")
+            .join(&thread::current().name().unwrap_or("unknown").replace(":", "-"));
+        t!(fs::create_dir_all(&dir));
+        config.out = dir;
+        config.build = INTERNER.intern_str("A");
+        config.hosts = vec![config.build].clone().into_iter()
+            .chain(host.iter().map(|s| INTERNER.intern_str(s))).collect::<Vec<_>>();
+        config.targets = config.hosts.clone().into_iter()
+            .chain(target.iter().map(|s| INTERNER.intern_str(s))).collect::<Vec<_>>();
+        config
+    }
+
+    fn first<A, B>(v: Vec<(A, B)>) -> Vec<A> {
+        v.into_iter().map(|(a, _)| a).collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn dist_baseline() {
+        let build = Build::new(configure(&[], &[]));
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Dist), &[]);
+
+        let a = INTERNER.intern_str("A");
+
+        assert_eq!(first(builder.cache.all::<dist::Docs>()), &[
+            dist::Docs { stage: 2, host: a },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Mingw>()), &[
+            dist::Mingw { host: a },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Rustc>()), &[
+            dist::Rustc { compiler: Compiler { host: a, stage: 2 } },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Std>()), &[
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Src>()), &[dist::Src]);
+    }
+
+    #[test]
+    fn dist_with_targets() {
+        let build = Build::new(configure(&[], &["B"]));
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Dist), &[]);
+
+        let a = INTERNER.intern_str("A");
+        let b = INTERNER.intern_str("B");
+
+        assert_eq!(first(builder.cache.all::<dist::Docs>()), &[
+            dist::Docs { stage: 2, host: a },
+            dist::Docs { stage: 2, host: b },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Mingw>()), &[
+            dist::Mingw { host: a },
+            dist::Mingw { host: b },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Rustc>()), &[
+            dist::Rustc { compiler: Compiler { host: a, stage: 2 } },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Std>()), &[
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Src>()), &[dist::Src]);
+    }
+
+    #[test]
+    fn dist_with_hosts() {
+        let build = Build::new(configure(&["B"], &[]));
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Dist), &[]);
+
+        let a = INTERNER.intern_str("A");
+        let b = INTERNER.intern_str("B");
+
+        assert_eq!(first(builder.cache.all::<dist::Docs>()), &[
+            dist::Docs { stage: 2, host: a },
+            dist::Docs { stage: 2, host: b },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Mingw>()), &[
+            dist::Mingw { host: a },
+            dist::Mingw { host: b },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Rustc>()), &[
+            dist::Rustc { compiler: Compiler { host: a, stage: 2 } },
+            dist::Rustc { compiler: Compiler { host: b, stage: 2 } },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Std>()), &[
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Src>()), &[dist::Src]);
+    }
+
+    #[test]
+    fn dist_with_targets_and_hosts() {
+        let build = Build::new(configure(&["B"], &["C"]));
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Dist), &[]);
+
+        let a = INTERNER.intern_str("A");
+        let b = INTERNER.intern_str("B");
+        let c = INTERNER.intern_str("C");
+
+        assert_eq!(first(builder.cache.all::<dist::Docs>()), &[
+            dist::Docs { stage: 2, host: a },
+            dist::Docs { stage: 2, host: b },
+            dist::Docs { stage: 2, host: c },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Mingw>()), &[
+            dist::Mingw { host: a },
+            dist::Mingw { host: b },
+            dist::Mingw { host: c },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Rustc>()), &[
+            dist::Rustc { compiler: Compiler { host: a, stage: 2 } },
+            dist::Rustc { compiler: Compiler { host: b, stage: 2 } },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Std>()), &[
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: c,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Src>()), &[dist::Src]);
+    }
+
+    #[test]
+    fn dist_with_target_flag() {
+        let mut config = configure(&["B"], &["C"]);
+        config.run_host_only = false; // as-if --target=C was passed
+        let build = Build::new(config);
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Dist), &[]);
+
+        let a = INTERNER.intern_str("A");
+        let b = INTERNER.intern_str("B");
+        let c = INTERNER.intern_str("C");
+
+        assert_eq!(first(builder.cache.all::<dist::Docs>()), &[
+            dist::Docs { stage: 2, host: a },
+            dist::Docs { stage: 2, host: b },
+            dist::Docs { stage: 2, host: c },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Mingw>()), &[
+            dist::Mingw { host: a },
+            dist::Mingw { host: b },
+            dist::Mingw { host: c },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Rustc>()), &[]);
+        assert_eq!(first(builder.cache.all::<dist::Std>()), &[
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: c,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Src>()), &[]);
+    }
+
+    #[test]
+    fn dist_with_same_targets_and_hosts() {
+        let build = Build::new(configure(&["B"], &["B"]));
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Dist), &[]);
+
+        let a = INTERNER.intern_str("A");
+        let b = INTERNER.intern_str("B");
+
+        assert_eq!(first(builder.cache.all::<dist::Docs>()), &[
+            dist::Docs { stage: 2, host: a },
+            dist::Docs { stage: 2, host: b },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Mingw>()), &[
+            dist::Mingw { host: a },
+            dist::Mingw { host: b },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Rustc>()), &[
+            dist::Rustc { compiler: Compiler { host: a, stage: 2 } },
+            dist::Rustc { compiler: Compiler { host: b, stage: 2 } },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Std>()), &[
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            dist::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<dist::Src>()), &[dist::Src]);
+        assert_eq!(first(builder.cache.all::<compile::Std>()), &[
+            compile::Std {
+                compiler: Compiler { host: a, stage: 0 },
+                target: a,
+            },
+            compile::Std {
+                compiler: Compiler { host: a, stage: 1 },
+                target: a,
+            },
+            compile::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            compile::Std {
+                compiler: Compiler { host: a, stage: 1 },
+                target: b,
+            },
+            compile::Std {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<compile::Test>()), &[
+            compile::Test {
+                compiler: Compiler { host: a, stage: 0 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 1 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 1 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<compile::Assemble>()), &[
+            compile::Assemble {
+                target_compiler: Compiler { host: a, stage: 0 },
+            },
+            compile::Assemble {
+                target_compiler: Compiler { host: a, stage: 1 },
+            },
+            compile::Assemble {
+                target_compiler: Compiler { host: a, stage: 2 },
+            },
+            compile::Assemble {
+                target_compiler: Compiler { host: b, stage: 2 },
+            },
+        ]);
+    }
+
+    #[test]
+    fn build_default() {
+        let build = Build::new(configure(&["B"], &["C"]));
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Build), &[]);
+
+        let a = INTERNER.intern_str("A");
+        let b = INTERNER.intern_str("B");
+        let c = INTERNER.intern_str("C");
+
+        assert!(!builder.cache.all::<compile::Std>().is_empty());
+        assert!(!builder.cache.all::<compile::Assemble>().is_empty());
+        assert_eq!(first(builder.cache.all::<compile::Rustc>()), &[
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 0 },
+                target: a,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 1 },
+                target: a,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: b, stage: 2 },
+                target: a,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 0 },
+                target: b,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 1 },
+                target: b,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: b, stage: 2 },
+                target: b,
+            },
+        ]);
+
+        assert_eq!(first(builder.cache.all::<compile::Test>()), &[
+            compile::Test {
+                compiler: Compiler { host: a, stage: 0 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 1 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: b, stage: 2 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 0 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 1 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: b, stage: 2 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: c,
+            },
+            compile::Test {
+                compiler: Compiler { host: b, stage: 2 },
+                target: c,
+            },
+        ]);
+    }
+
+    #[test]
+    fn build_with_target_flag() {
+        let mut config = configure(&["B"], &["C"]);
+        config.run_host_only = false;
+        let build = Build::new(config);
+        let mut builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Build), &[]);
+
+        let a = INTERNER.intern_str("A");
+        let b = INTERNER.intern_str("B");
+        let c = INTERNER.intern_str("C");
+
+        assert!(!builder.cache.all::<compile::Std>().is_empty());
+        assert_eq!(first(builder.cache.all::<compile::Assemble>()), &[
+            compile::Assemble {
+                target_compiler: Compiler { host: a, stage: 0 },
+            },
+            compile::Assemble {
+                target_compiler: Compiler { host: a, stage: 1 },
+            },
+            compile::Assemble {
+                target_compiler: Compiler { host: b, stage: 1 },
+            },
+            compile::Assemble {
+                target_compiler: Compiler { host: a, stage: 2 },
+            },
+            compile::Assemble {
+                target_compiler: Compiler { host: b, stage: 2 },
+            },
+        ]);
+        assert_eq!(first(builder.cache.all::<compile::Rustc>()), &[
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 0 },
+                target: a,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 1 },
+                target: a,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 0 },
+                target: b,
+            },
+            compile::Rustc {
+                compiler: Compiler { host: a, stage: 1 },
+                target: b,
+            },
+        ]);
+
+        assert_eq!(first(builder.cache.all::<compile::Test>()), &[
+            compile::Test {
+                compiler: Compiler { host: a, stage: 0 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 1 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: b, stage: 2 },
+                target: a,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 0 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 1 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: b, stage: 2 },
+                target: b,
+            },
+            compile::Test {
+                compiler: Compiler { host: a, stage: 2 },
+                target: c,
+            },
+            compile::Test {
+                compiler: Compiler { host: b, stage: 2 },
+                target: c,
+            },
+        ]);
     }
 }

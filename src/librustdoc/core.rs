@@ -18,20 +18,24 @@ use rustc::middle::privacy::AccessLevels;
 use rustc::ty::{self, TyCtxt, AllArenas};
 use rustc::hir::map as hir_map;
 use rustc::lint;
+use rustc::session::config::ErrorOutputType;
 use rustc::util::nodemap::{FxHashMap, FxHashSet};
 use rustc_resolve as resolve;
 use rustc_metadata::creader::CrateLoader;
 use rustc_metadata::cstore::CStore;
+use rustc_target::spec::TargetTriple;
 
 use syntax::ast::NodeId;
 use syntax::codemap;
+use syntax::edition::Edition;
 use syntax::feature_gate::UnstableFeatures;
+use syntax::json::JsonEmitter;
 use errors;
-use errors::emitter::ColorConfig;
+use errors::emitter::{Emitter, EmitterWriter};
 
 use std::cell::{RefCell, Cell};
 use std::mem;
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{self, Lrc};
 use std::rc::Rc;
 use std::path::PathBuf;
 
@@ -40,7 +44,7 @@ use clean;
 use clean::Clean;
 use html::render::RenderInfo;
 
-pub use rustc::session::config::Input;
+pub use rustc::session::config::{Input, CodegenOptions};
 pub use rustc::session::search_paths::SearchPaths;
 
 pub type ExternalPaths = FxHashMap<DefId, (Vec<String>, clean::TypeKind)>;
@@ -72,6 +76,8 @@ pub struct DocContext<'a, 'tcx: 'a, 'rcx: 'a> {
     pub ty_substs: RefCell<FxHashMap<Def, clean::Type>>,
     /// Table node id of lifetime parameter definition -> substituted lifetime
     pub lt_substs: RefCell<FxHashMap<DefId, clean::Lifetime>>,
+    /// Table DefId of `impl Trait` in argument position -> bounds
+    pub impl_trait_bounds: RefCell<FxHashMap<DefId, Vec<clean::TyParamBound>>>,
     pub send_trait: Option<DefId>,
     pub fake_def_ids: RefCell<FxHashMap<CrateNum, DefId>>,
     pub all_fake_def_ids: RefCell<FxHashSet<DefId>>,
@@ -111,16 +117,18 @@ impl DocAccessLevels for AccessLevels<DefId> {
     }
 }
 
-
 pub fn run_core(search_paths: SearchPaths,
                 cfgs: Vec<String>,
                 externs: config::Externs,
                 input: Input,
-                triple: Option<String>,
+                triple: Option<TargetTriple>,
                 maybe_sysroot: Option<PathBuf>,
                 allow_warnings: bool,
                 crate_name: Option<String>,
-                force_unstable_if_unmarked: bool) -> (clean::Crate, RenderInfo)
+                force_unstable_if_unmarked: bool,
+                edition: Edition,
+                cg: CodegenOptions,
+                error_format: ErrorOutputType) -> (clean::Crate, RenderInfo)
 {
     // Parse, resolve, and typecheck the given crate.
 
@@ -131,14 +139,17 @@ pub fn run_core(search_paths: SearchPaths,
 
     let warning_lint = lint::builtin::WARNINGS.name_lower();
 
+    let host_triple = TargetTriple::from_triple(config::host_triple());
+    // plays with error output here!
     let sessopts = config::Options {
         maybe_sysroot,
         search_paths,
         crate_types: vec![config::CrateTypeRlib],
         lint_opts: if !allow_warnings { vec![(warning_lint, lint::Allow)] } else { vec![] },
         lint_cap: Some(lint::Allow),
+        cg,
         externs,
-        target_triple: triple.unwrap_or(config::host_triple().to_string()),
+        target_triple: triple.unwrap_or(host_triple),
         // Ensure that rustdoc works even if rustc is feature-staged
         unstable_features: UnstableFeatures::Allow,
         actually_rustdoc: true,
@@ -146,14 +157,43 @@ pub fn run_core(search_paths: SearchPaths,
             force_unstable_if_unmarked,
             ..config::basic_debugging_options()
         },
+        error_format,
+        edition,
         ..config::basic_options().clone()
     };
 
     let codemap = Lrc::new(codemap::CodeMap::new(sessopts.file_path_mapping()));
-    let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
-                                                               true,
-                                                               false,
-                                                               Some(codemap.clone()));
+    let emitter: Box<dyn Emitter + sync::Send> = match error_format {
+        ErrorOutputType::HumanReadable(color_config) => Box::new(
+            EmitterWriter::stderr(
+                color_config,
+                Some(codemap.clone()),
+                false,
+                sessopts.debugging_opts.teach,
+            ).ui_testing(sessopts.debugging_opts.ui_testing)
+        ),
+        ErrorOutputType::Json(pretty) => Box::new(
+            JsonEmitter::stderr(
+                None,
+                codemap.clone(),
+                pretty,
+                sessopts.debugging_opts.suggestion_applicability,
+            ).ui_testing(sessopts.debugging_opts.ui_testing)
+        ),
+        ErrorOutputType::Short(color_config) => Box::new(
+            EmitterWriter::stderr(color_config, Some(codemap.clone()), true, false)
+        ),
+    };
+
+    let diagnostic_handler = errors::Handler::with_emitter_and_flags(
+        emitter,
+        errors::HandlerFlags {
+            can_emit_warnings: true,
+            treat_err_as_bug: false,
+            external_macro_backtrace: false,
+            ..Default::default()
+        },
+    );
 
     let mut sess = session::build_session_(
         sessopts, cpath, diagnostic_handler, codemap,
@@ -261,6 +301,7 @@ pub fn run_core(search_paths: SearchPaths,
             renderinfo: Default::default(),
             ty_substs: Default::default(),
             lt_substs: Default::default(),
+            impl_trait_bounds: Default::default(),
             mod_ids: Default::default(),
             send_trait: send_trait,
             fake_def_ids: RefCell::new(FxHashMap()),

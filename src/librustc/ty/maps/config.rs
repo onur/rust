@@ -9,24 +9,45 @@
 // except according to those terms.
 
 use dep_graph::SerializedDepNodeIndex;
+use dep_graph::DepNode;
 use hir::def_id::{CrateNum, DefId, DefIndex};
 use mir::interpret::{GlobalId};
-use traits::query::{CanonicalProjectionGoal, CanonicalTyGoal};
+use traits::query::{CanonicalPredicateGoal, CanonicalProjectionGoal, CanonicalTyGoal};
 use ty::{self, ParamEnvAnd, Ty, TyCtxt};
 use ty::subst::Substs;
 use ty::maps::queries;
+use ty::maps::Query;
+use ty::maps::QueryMap;
 
 use std::hash::Hash;
+use std::fmt::Debug;
 use syntax_pos::symbol::InternedString;
+use rustc_data_structures::sync::Lock;
+use rustc_data_structures::stable_hasher::HashStable;
+use ich::StableHashingContext;
 
 /// Query configuration and description traits.
 
-pub trait QueryConfig {
-    type Key: Eq + Hash + Clone;
-    type Value;
+pub trait QueryConfig<'tcx> {
+    const NAME: &'static str;
+
+    type Key: Eq + Hash + Clone + Debug;
+    type Value: Clone + for<'a> HashStable<StableHashingContext<'a>>;
+
+    fn query(key: Self::Key) -> Query<'tcx>;
+
+    // Don't use this method to access query results, instead use the methods on TyCtxt
+    fn query_map<'a>(tcx: TyCtxt<'a, 'tcx, '_>) -> &'a Lock<QueryMap<'tcx, Self>>;
+
+    fn to_dep_node(tcx: TyCtxt<'_, 'tcx, '_>, key: &Self::Key) -> DepNode;
+
+    // Don't use this method to compute query results, instead use the methods on TyCtxt
+    fn compute(tcx: TyCtxt<'_, 'tcx, '_>, key: Self::Key) -> Self::Value;
+
+    fn handle_cycle_error(tcx: TyCtxt<'_, 'tcx, '_>) -> Self::Value;
 }
 
-pub(super) trait QueryDescription<'tcx>: QueryConfig {
+pub trait QueryDescription<'tcx>: QueryConfig<'tcx> {
     fn describe(tcx: TyCtxt, key: Self::Key) -> String;
 
     #[inline]
@@ -41,7 +62,7 @@ pub(super) trait QueryDescription<'tcx>: QueryConfig {
     }
 }
 
-impl<'tcx, M: QueryConfig<Key=DefId>> QueryDescription<'tcx> for M {
+impl<'tcx, M: QueryConfig<'tcx, Key=DefId>> QueryDescription<'tcx> for M {
     default fn describe(tcx: TyCtxt, def_id: DefId) -> String {
         if !tcx.sess.verbose() {
             format!("processing `{}`", tcx.item_path_str(def_id))
@@ -70,6 +91,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::dropck_outlives<'tcx> {
 impl<'tcx> QueryDescription<'tcx> for queries::normalize_ty_after_erasing_regions<'tcx> {
     fn describe(_tcx: TyCtxt, goal: ParamEnvAnd<'tcx, Ty<'tcx>>) -> String {
         format!("normalizing `{:?}`", goal)
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::evaluate_obligation<'tcx> {
+    fn describe(_tcx: TyCtxt, goal: CanonicalPredicateGoal<'tcx>) -> String {
+        format!("evaluating trait selection obligation `{}`", goal.value.value)
     }
 }
 
@@ -131,6 +158,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::coherent_trait<'tcx> {
     }
 }
 
+impl<'tcx> QueryDescription<'tcx> for queries::upstream_monomorphizations<'tcx> {
+    fn describe(_: TyCtxt, k: CrateNum) -> String {
+        format!("collecting available upstream monomorphizations `{:?}`", k)
+    }
+}
+
 impl<'tcx> QueryDescription<'tcx> for queries::crate_inherent_impls<'tcx> {
     fn describe(_: TyCtxt, k: CrateNum) -> String {
         format!("all inherent impls defined in crate `{:?}`", k)
@@ -146,6 +179,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::crate_inherent_impls_overlap_chec
 impl<'tcx> QueryDescription<'tcx> for queries::crate_variances<'tcx> {
     fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
         format!("computing the variances for items in this crate")
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::inferred_outlives_crate<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("computing the inferred outlives predicates for items in this crate")
     }
 }
 
@@ -268,12 +307,6 @@ impl<'tcx> QueryDescription<'tcx> for queries::impl_parent<'tcx> {
 impl<'tcx> QueryDescription<'tcx> for queries::trait_of_item<'tcx> {
     fn describe(_: TyCtxt, _: DefId) -> String {
         bug!("trait_of_item")
-    }
-}
-
-impl<'tcx> QueryDescription<'tcx> for queries::item_body_nested_bodies<'tcx> {
-    fn describe(tcx: TyCtxt, def_id: DefId) -> String {
-        format!("nested item bodies of `{}`", tcx.item_path_str(def_id))
     }
 }
 
@@ -430,6 +463,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::native_libraries<'tcx> {
     }
 }
 
+impl<'tcx> QueryDescription<'tcx> for queries::foreign_modules<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the foreign modules of a linked crate")
+    }
+}
+
 impl<'tcx> QueryDescription<'tcx> for queries::plugin_registrar_fn<'tcx> {
     fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
         format!("looking up the plugin registrar for a crate")
@@ -457,6 +496,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::crate_hash<'tcx> {
 impl<'tcx> QueryDescription<'tcx> for queries::original_crate_name<'tcx> {
     fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
         format!("looking up the original name a crate")
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::extra_filename<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the extra filename for a crate")
     }
 }
 
@@ -568,6 +613,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::stability_index<'tcx> {
     }
 }
 
+impl<'tcx> QueryDescription<'tcx> for queries::all_traits<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("fetching all foreign and local traits")
+    }
+}
+
 impl<'tcx> QueryDescription<'tcx> for queries::all_crate_nums<'tcx> {
     fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
         format!("fetching all foreign CrateNum instances")
@@ -604,21 +655,9 @@ impl<'tcx> QueryDescription<'tcx> for queries::output_filenames<'tcx> {
     }
 }
 
-impl<'tcx> QueryDescription<'tcx> for queries::has_clone_closures<'tcx> {
-    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
-        format!("seeing if the crate has enabled `Clone` closures")
-    }
-}
-
 impl<'tcx> QueryDescription<'tcx> for queries::vtable_methods<'tcx> {
     fn describe(tcx: TyCtxt, key: ty::PolyTraitRef<'tcx> ) -> String {
         format!("finding all methods for trait {}", tcx.item_path_str(key.def_id()))
-    }
-}
-
-impl<'tcx> QueryDescription<'tcx> for queries::has_copy_closures<'tcx> {
-    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
-        format!("seeing if the crate has enabled `Copy` closures")
     }
 }
 
@@ -678,6 +717,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::instance_def_size_estimate<'tcx> 
     }
 }
 
+impl<'tcx> QueryDescription<'tcx> for queries::wasm_custom_sections<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("custom wasm sections for a crate")
+    }
+}
+
 impl<'tcx> QueryDescription<'tcx> for queries::generics_of<'tcx> {
     #[inline]
     fn cache_on_disk(def_id: Self::Key) -> bool {
@@ -690,6 +735,30 @@ impl<'tcx> QueryDescription<'tcx> for queries::generics_of<'tcx> {
         let generics: Option<ty::Generics> = tcx.on_disk_query_result_cache
                                                 .try_load_query_result(tcx, id);
         generics.map(|x| tcx.alloc_generics(x))
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::program_clauses_for<'tcx> {
+    fn describe(_tcx: TyCtxt, _: DefId) -> String {
+        format!("generating chalk-style clauses")
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::program_clauses_for_env<'tcx> {
+    fn describe(_tcx: TyCtxt, _: ty::ParamEnv<'tcx>) -> String {
+        format!("generating chalk-style clauses for param env")
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::wasm_import_module_map<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("wasm import module map")
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::dllimport_foreign_items<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("wasm import module map")
     }
 }
 
@@ -721,3 +790,4 @@ impl_disk_cacheable_query!(type_of, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(predicates_of, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(used_trait_imports, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(trans_fn_attrs, |_| true);
+impl_disk_cacheable_query!(specialization_graph_of, |_| true);

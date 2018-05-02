@@ -420,26 +420,33 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use alloc::Bound;
+#[rustc_deprecated(reason = "moved to `std::ops::Bound`", since = "1.26.0")]
+#[doc(hidden)]
+pub use ops::Bound;
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use alloc::{BinaryHeap, BTreeMap, BTreeSet};
+pub use alloc_crate::{BinaryHeap, BTreeMap, BTreeSet};
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use alloc::{LinkedList, VecDeque};
+pub use alloc_crate::{LinkedList, VecDeque};
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use alloc::{binary_heap, btree_map, btree_set};
+pub use alloc_crate::{binary_heap, btree_map, btree_set};
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use alloc::{linked_list, vec_deque};
+pub use alloc_crate::{linked_list, vec_deque};
 
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::hash_map::HashMap;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::hash_set::HashSet;
 
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use alloc::range;
+#[unstable(feature = "collections_range", issue = "30877")]
+#[rustc_deprecated(reason = "renamed and moved to `std::ops::RangeBounds`", since = "1.26.0")]
+#[doc(hidden)]
+/// Range syntax
+pub mod range {
+    pub use ops::RangeBounds as RangeArgument;
+}
 
 #[unstable(feature = "try_reserve", reason = "new API", issue="48043")]
-pub use alloc::allocator::CollectionAllocErr;
+pub use heap::CollectionAllocErr;
 
 mod hash;
 

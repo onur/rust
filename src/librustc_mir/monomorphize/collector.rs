@@ -212,8 +212,6 @@ use monomorphize::item::{MonoItemExt, DefPathBasedNames, InstantiationMode};
 
 use rustc_data_structures::bitvec::BitVector;
 
-use std::iter;
-
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 pub enum MonoItemCollectionMode {
     Eager,
@@ -327,7 +325,7 @@ fn collect_roots<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let mut roots = Vec::new();
 
     {
-        let entry_fn = tcx.sess.entry_fn.borrow().map(|(node_id, _)| {
+        let entry_fn = tcx.sess.entry_fn.borrow().map(|(node_id, _, _)| {
             tcx.hir.local_def_id(node_id)
         });
 
@@ -459,7 +457,7 @@ fn check_recursion_limit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     // Code that needs to instantiate the same function recursively
     // more than the recursion limit is assumed to be causing an
     // infinite expansion.
-    if recursion_depth > tcx.sess.recursion_limit.get() {
+    if recursion_depth > *tcx.sess.recursion_limit.get() {
         let error = format!("reached the recursion limit while instantiating `{}`",
                             instance);
         if let Some(node_id) = tcx.hir.as_local_node_id(def_id) {
@@ -486,7 +484,7 @@ fn check_type_length_limit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     // which means that rustc basically hangs.
     //
     // Bail out in these cases to avoid that bad user experience.
-    let type_length_limit = tcx.sess.type_length_limit.get();
+    let type_length_limit = *tcx.sess.type_length_limit.get();
     if type_length > type_length_limit {
         // The instance name is already known to be too long for rustc. Use
         // `{:.64}` to avoid blasting the user's terminal with thousands of
@@ -569,7 +567,9 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirNeighborCollector<'a, 'tcx> {
                     ty::TyClosure(def_id, substs) => {
                         let instance = monomorphize::resolve_closure(
                             self.tcx, def_id, substs, ty::ClosureKind::FnOnce);
-                        self.output.push(create_fn_mono_item(instance));
+                        if should_monomorphize_locally(self.tcx, &instance) {
+                            self.output.push(create_fn_mono_item(instance));
+                        }
                     }
                     _ => bug!(),
                 }
@@ -731,14 +731,16 @@ fn should_monomorphize_locally<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, instance: 
         ty::InstanceDef::Intrinsic(_) |
         ty::InstanceDef::CloneShim(..) => return true
     };
-    match tcx.hir.get_if_local(def_id) {
+
+    return match tcx.hir.get_if_local(def_id) {
         Some(hir_map::NodeForeignItem(..)) => {
             false // foreign items are linked against, not translated.
         }
         Some(_) => true,
         None => {
             if tcx.is_reachable_non_generic(def_id) ||
-                tcx.is_foreign_item(def_id)
+                tcx.is_foreign_item(def_id) ||
+                is_available_upstream_generic(tcx, def_id, instance.substs)
             {
                 // We can link to the item in question, no instance needed
                 // in this crate
@@ -750,6 +752,33 @@ fn should_monomorphize_locally<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, instance: 
                 true
             }
         }
+    };
+
+    fn is_available_upstream_generic<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                               def_id: DefId,
+                                               substs: &'tcx Substs<'tcx>)
+                                               -> bool {
+        debug_assert!(!def_id.is_local());
+
+        // If we are not in share generics mode, we don't link to upstream
+        // monomorphizations but always instantiate our own internal versions
+        // instead.
+        if !tcx.share_generics() {
+            return false
+        }
+
+        // If this instance has no type parameters, it cannot be a shared
+        // monomorphization. Non-generic instances are already handled above
+        // by `is_reachable_non_generic()`
+        if substs.types().next().is_none() {
+            return false
+        }
+
+        // Take a look at the available monomorphizations listed in the metadata
+        // of upstream crates.
+        tcx.upstream_monomorphizations_for(def_id)
+           .map(|set| set.contains_key(substs))
+           .unwrap_or(false)
     }
 }
 
@@ -1009,7 +1038,7 @@ impl<'b, 'a, 'v> RootCollector<'b, 'a, 'v> {
     /// the return type of `main`. This is not needed when
     /// the user writes their own `start` manually.
     fn push_extra_entry_roots(&mut self) {
-        if self.tcx.sess.entry_type.get() != Some(config::EntryMain) {
+        if self.tcx.sess.entry_fn.get().map(|e| e.2) != Some(config::EntryMain) {
             return
         }
 
@@ -1030,13 +1059,15 @@ impl<'b, 'a, 'v> RootCollector<'b, 'a, 'v> {
         // late-bound regions, since late-bound
         // regions must appear in the argument
         // listing.
-        let main_ret_ty = main_ret_ty.no_late_bound_regions().unwrap();
+        let main_ret_ty = self.tcx.erase_regions(
+            &main_ret_ty.no_late_bound_regions().unwrap(),
+        );
 
         let start_instance = Instance::resolve(
             self.tcx,
             ty::ParamEnv::reveal_all(),
             start_def_id,
-            self.tcx.mk_substs(iter::once(Kind::from(main_ret_ty)))
+            self.tcx.intern_substs(&[Kind::from(main_ret_ty)])
         ).unwrap();
 
         self.output.push(create_fn_mono_item(start_instance));
@@ -1111,7 +1142,7 @@ fn collect_miri<'a, 'tcx>(
     alloc_id: AllocId,
     output: &mut Vec<MonoItem<'tcx>>,
 ) {
-    if let Some(did) = tcx.interpret_interner.get_corresponding_static_def_id(alloc_id) {
+    if let Some(did) = tcx.interpret_interner.get_static(alloc_id) {
         let instance = Instance::mono(tcx, did);
         if should_monomorphize_locally(tcx, &instance) {
             trace!("collecting static {:?}", did);
@@ -1146,7 +1177,7 @@ fn collect_neighbours<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         param_substs: instance.substs,
     }.visit_mir(&mir);
     let param_env = ty::ParamEnv::reveal_all();
-    for (i, promoted) in mir.promoted.iter().enumerate() {
+    for i in 0..mir.promoted.len() {
         use rustc_data_structures::indexed_vec::Idx;
         let cid = GlobalId {
             instance,
@@ -1154,9 +1185,7 @@ fn collect_neighbours<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         };
         match tcx.const_eval(param_env.and(cid)) {
             Ok(val) => collect_const(tcx, val, instance.substs, output),
-            Err(err) => {
-                err.report(tcx, promoted.span, "promoted");
-            }
+            Err(_) => {},
         }
     }
 }

@@ -14,7 +14,7 @@ use rustc::middle::cstore::{self, NativeLibrary};
 use rustc::session::Session;
 use rustc::ty::TyCtxt;
 use rustc::util::nodemap::FxHashSet;
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::attr;
 use syntax::codemap::Span;
 use syntax::feature_gate::{self, GateIssue};
@@ -105,14 +105,11 @@ impl<'a, 'tcx> ItemLikeVisitor<'tcx> for Collector<'a, 'tcx> {
             } else {
                 None
             };
-            let foreign_items = fm.items.iter()
-                .map(|it| self.tcx.hir.local_def_id(it.id))
-                .collect();
             let lib = NativeLibrary {
                 name: n,
                 kind,
                 cfg,
-                foreign_items,
+                foreign_module: Some(self.tcx.hir.local_def_id(it.id)),
             };
             self.register_native_lib(Some(m.span), lib);
         }
@@ -218,7 +215,7 @@ impl<'a, 'tcx> Collector<'a, 'tcx> {
                     name: Symbol::intern(new_name.unwrap_or(name)),
                     kind: if let Some(k) = kind { k } else { cstore::NativeUnknown },
                     cfg: None,
-                    foreign_items: Vec::new(),
+                    foreign_module: None,
                 };
                 self.register_native_lib(None, lib);
             }

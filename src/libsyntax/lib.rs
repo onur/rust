@@ -18,27 +18,24 @@
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
        test(attr(deny(warnings))))]
-#![deny(warnings)]
 
-#![feature(unicode)]
+#![feature(unicode_internals)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(match_default_bindings)]
+#![feature(slice_sort_by_cached_key)]
 #![feature(non_exhaustive)]
-#![feature(i128_type)]
 #![feature(const_atomic_usize_new)]
 #![feature(rustc_attrs)]
 
-// See librustc_cratesio_shim/Cargo.toml for a comment explaining this.
-#[allow(unused_extern_crates)]
-extern crate rustc_cratesio_shim;
+#![recursion_limit="256"]
 
 #[macro_use] extern crate bitflags;
+extern crate core;
 extern crate serialize;
 #[macro_use] extern crate log;
-extern crate std_unicode;
 pub extern crate rustc_errors as errors;
 extern crate syntax_pos;
 extern crate rustc_data_structures;
+extern crate rustc_target;
 #[macro_use] extern crate scoped_tls;
 
 extern crate serialize as rustc_serialize; // used by deriving
@@ -138,14 +135,13 @@ pub mod syntax {
     pub use ast;
 }
 
-pub mod abi;
 pub mod ast;
 pub mod attr;
 pub mod codemap;
 #[macro_use]
 pub mod config;
 pub mod entry;
-pub mod epoch;
+pub mod edition;
 pub mod feature_gate;
 pub mod fold;
 pub mod parse;

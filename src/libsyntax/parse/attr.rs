@@ -90,7 +90,7 @@ impl<'a> Parser<'a> {
         debug!("parse_attribute_with_inner_parse_policy: inner_parse_policy={:?} self.token={:?}",
                inner_parse_policy,
                self.token);
-        let (span, path, tokens, mut style) = match self.token {
+        let (span, path, tokens, style) = match self.token {
             token::Pound => {
                 let lo = self.span;
                 self.bump();
@@ -129,15 +129,6 @@ impl<'a> Parser<'a> {
             }
         };
 
-        if inner_parse_policy == InnerAttributeParsePolicy::Permitted &&
-           self.token == token::Semi {
-            self.bump();
-            self.span_warn(span,
-                           "this inner attribute syntax is deprecated. The new syntax is \
-                            `#![foo]`, with a bang and no semicolon");
-            style = ast::AttrStyle::Inner;
-        }
-
         Ok(ast::Attribute {
             id: attr::mk_attr_id(),
             style,
@@ -158,8 +149,7 @@ impl<'a> Parser<'a> {
         };
         Ok(if let Some(meta) = meta {
             self.bump();
-            (ast::Path::from_ident(meta.span, ast::Ident::with_empty_ctxt(meta.name)),
-             meta.node.tokens(meta.span))
+            (ast::Path::from_ident(meta.ident), meta.node.tokens(meta.span))
         } else {
             (self.parse_path(PathStyle::Mod)?, self.parse_tokens())
         })
@@ -237,7 +227,7 @@ impl<'a> Parser<'a> {
         let lo = self.span;
         let ident = self.parse_ident()?;
         let node = self.parse_meta_item_kind()?;
-        Ok(ast::MetaItem { name: ident.name, node: node, span: lo.to(self.prev_span) })
+        Ok(ast::MetaItem { ident, node: node, span: lo.to(self.prev_span) })
     }
 
     pub fn parse_meta_item_kind(&mut self) -> PResult<'a, ast::MetaItemKind> {

@@ -21,6 +21,7 @@ use middle::const_val::{ConstEvalErr, ErrKind};
 use super::CodeAmbiguity;
 use super::CodeProjectionError;
 use super::CodeSelectionError;
+use super::engine::TraitEngine;
 use super::{FulfillmentError, FulfillmentErrorCode};
 use super::{ObligationCause, PredicateObligation, Obligation};
 use super::project;
@@ -85,6 +86,59 @@ impl<'a, 'gcx, 'tcx> FulfillmentContext<'tcx> {
         }
     }
 
+    pub fn register_predicate_obligations<I>(&mut self,
+                                             infcx: &InferCtxt<'a, 'gcx, 'tcx>,
+                                             obligations: I)
+        where I: IntoIterator<Item = PredicateObligation<'tcx>>
+    {
+        for obligation in obligations {
+            self.register_predicate_obligation(infcx, obligation);
+        }
+    }
+
+    /// Attempts to select obligations using `selcx`. If `only_new_obligations` is true, then it
+    /// only attempts to select obligations that haven't been seen before.
+    fn select(&mut self, selcx: &mut SelectionContext<'a, 'gcx, 'tcx>)
+              -> Result<(),Vec<FulfillmentError<'tcx>>> {
+        debug!("select(obligation-forest-size={})", self.predicates.len());
+
+        let mut errors = Vec::new();
+
+        loop {
+            debug!("select: starting another iteration");
+
+            // Process pending obligations.
+            let outcome = self.predicates.process_obligations(&mut FulfillProcessor {
+                selcx,
+                register_region_obligations: self.register_region_obligations
+            });
+            debug!("select: outcome={:#?}", outcome);
+
+            // FIXME: if we kept the original cache key, we could mark projection
+            // obligations as complete for the projection cache here.
+
+            errors.extend(
+                outcome.errors.into_iter()
+                              .map(|e| to_fulfillment_error(e)));
+
+            // If nothing new was added, no need to keep looping.
+            if outcome.stalled {
+                break;
+            }
+        }
+
+        debug!("select({} predicates remaining, {} errors) done",
+               self.predicates.len(), errors.len());
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl<'tcx> TraitEngine<'tcx> for FulfillmentContext<'tcx> {
     /// "Normalize" a projection type `<SomeType as SomeTrait>::X` by
     /// creating a fresh type variable `$0` as well as a projection
     /// predicate `<SomeType as SomeTrait>::X == $0`. When the
@@ -92,12 +146,12 @@ impl<'a, 'gcx, 'tcx> FulfillmentContext<'tcx> {
     /// `SomeTrait` or a where clause that lets us unify `$0` with
     /// something concrete. If this fails, we'll unify `$0` with
     /// `projection_ty` again.
-    pub fn normalize_projection_type(&mut self,
-                                     infcx: &InferCtxt<'a, 'gcx, 'tcx>,
-                                     param_env: ty::ParamEnv<'tcx>,
-                                     projection_ty: ty::ProjectionTy<'tcx>,
-                                     cause: ObligationCause<'tcx>)
-                                     -> Ty<'tcx>
+    fn normalize_projection_type<'a, 'gcx>(&mut self,
+                                 infcx: &InferCtxt<'a, 'gcx, 'tcx>,
+                                 param_env: ty::ParamEnv<'tcx>,
+                                 projection_ty: ty::ProjectionTy<'tcx>,
+                                 cause: ObligationCause<'tcx>)
+                                 -> Ty<'tcx>
     {
         debug!("normalize_projection_type(projection_ty={:?})",
                projection_ty);
@@ -125,12 +179,12 @@ impl<'a, 'gcx, 'tcx> FulfillmentContext<'tcx> {
     /// Requires that `ty` must implement the trait with `def_id` in
     /// the given environment. This trait must not have any type
     /// parameters (except for `Self`).
-    pub fn register_bound(&mut self,
-                          infcx: &InferCtxt<'a, 'gcx, 'tcx>,
-                          param_env: ty::ParamEnv<'tcx>,
-                          ty: Ty<'tcx>,
-                          def_id: DefId,
-                          cause: ObligationCause<'tcx>)
+    fn register_bound<'a, 'gcx>(&mut self,
+                      infcx: &InferCtxt<'a, 'gcx, 'tcx>,
+                      param_env: ty::ParamEnv<'tcx>,
+                      ty: Ty<'tcx>,
+                      def_id: DefId,
+                      cause: ObligationCause<'tcx>)
     {
         let trait_ref = ty::TraitRef {
             def_id,
@@ -144,9 +198,9 @@ impl<'a, 'gcx, 'tcx> FulfillmentContext<'tcx> {
         });
     }
 
-    pub fn register_predicate_obligation(&mut self,
-                                         infcx: &InferCtxt<'a, 'gcx, 'tcx>,
-                                         obligation: PredicateObligation<'tcx>)
+    fn register_predicate_obligation<'a, 'gcx>(&mut self,
+                                     infcx: &InferCtxt<'a, 'gcx, 'tcx>,
+                                     obligation: PredicateObligation<'tcx>)
     {
         // this helps to reduce duplicate errors, as well as making
         // debug output much nicer to read and so on.
@@ -162,19 +216,9 @@ impl<'a, 'gcx, 'tcx> FulfillmentContext<'tcx> {
         });
     }
 
-    pub fn register_predicate_obligations<I>(&mut self,
-                                             infcx: &InferCtxt<'a, 'gcx, 'tcx>,
-                                             obligations: I)
-        where I: IntoIterator<Item = PredicateObligation<'tcx>>
-    {
-        for obligation in obligations {
-            self.register_predicate_obligation(infcx, obligation);
-        }
-    }
-
-    pub fn select_all_or_error(&mut self,
-                               infcx: &InferCtxt<'a, 'gcx, 'tcx>)
-                               -> Result<(),Vec<FulfillmentError<'tcx>>>
+    fn select_all_or_error<'a, 'gcx>(&mut self,
+                                     infcx: &InferCtxt<'a, 'gcx, 'tcx>)
+                                     -> Result<(),Vec<FulfillmentError<'tcx>>>
     {
         self.select_where_possible(infcx)?;
 
@@ -190,57 +234,16 @@ impl<'a, 'gcx, 'tcx> FulfillmentContext<'tcx> {
         }
     }
 
-    pub fn select_where_possible(&mut self,
-                                 infcx: &InferCtxt<'a, 'gcx, 'tcx>)
-                                 -> Result<(),Vec<FulfillmentError<'tcx>>>
+    fn select_where_possible<'a, 'gcx>(&mut self,
+                             infcx: &InferCtxt<'a, 'gcx, 'tcx>)
+                             -> Result<(),Vec<FulfillmentError<'tcx>>>
     {
         let mut selcx = SelectionContext::new(infcx);
         self.select(&mut selcx)
     }
 
-    pub fn pending_obligations(&self) -> Vec<PendingPredicateObligation<'tcx>> {
+    fn pending_obligations(&self) -> Vec<PendingPredicateObligation<'tcx>> {
         self.predicates.pending_obligations()
-    }
-
-    /// Attempts to select obligations using `selcx`. If `only_new_obligations` is true, then it
-    /// only attempts to select obligations that haven't been seen before.
-    fn select(&mut self, selcx: &mut SelectionContext<'a, 'gcx, 'tcx>)
-              -> Result<(),Vec<FulfillmentError<'tcx>>> {
-        debug!("select(obligation-forest-size={})", self.predicates.len());
-
-        let mut errors = Vec::new();
-
-        loop {
-            debug!("select: starting another iteration");
-
-            // Process pending obligations.
-            let outcome = self.predicates.process_obligations(&mut FulfillProcessor {
-                selcx,
-                register_region_obligations: self.register_region_obligations
-            });
-            debug!("select: outcome={:?}", outcome);
-
-            // FIXME: if we kept the original cache key, we could mark projection
-            // obligations as complete for the projection cache here.
-
-            errors.extend(
-                outcome.errors.into_iter()
-                              .map(|e| to_fulfillment_error(e)));
-
-            // If nothing new was added, no need to keep looping.
-            if outcome.stalled {
-                break;
-            }
-        }
-
-        debug!("select({} predicates remaining, {} errors) done",
-               self.predicates.len(), errors.len());
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -330,7 +333,7 @@ fn process_predicate<'a, 'gcx, 'tcx>(
             if data.is_global() {
                 // no type variables present, can use evaluation for better caching.
                 // FIXME: consider caching errors too.
-                if selcx.evaluate_obligation_conservatively(&obligation) {
+                if selcx.infcx().predicate_must_hold(&obligation) {
                     debug!("selecting trait `{:?}` at depth {} evaluated to holds",
                            data, obligation.recursion_depth);
                     return Ok(Some(vec![]))

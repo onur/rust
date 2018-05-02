@@ -34,7 +34,7 @@ use mir::mono::Linkage;
 
 use syntax_pos::{Span, DUMMY_SP};
 use syntax::codemap::{self, Spanned};
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::ast::{self, Name, NodeId, DUMMY_NODE_ID, AsmDialect};
 use syntax::ast::{Attribute, Lit, StrStyle, FloatTy, IntTy, UintTy, MetaItem};
 use syntax::attr::InlineAttr;
@@ -203,9 +203,31 @@ pub struct Lifetime {
 
 #[derive(Debug, Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
 pub enum LifetimeName {
+    /// User typed nothing. e.g. the lifetime in `&u32`.
     Implicit,
+
+    /// User typed `'_`.
     Underscore,
+
+    /// Synthetic name generated when user elided a lifetime in an impl header,
+    /// e.g. the lifetimes in cases like these:
+    ///
+    ///     impl Foo for &u32
+    ///     impl Foo<'_> for u32
+    ///
+    /// in that case, we rewrite to
+    ///
+    ///     impl<'f> Foo for &'f u32
+    ///     impl<'f> Foo<'f> for u32
+    ///
+    /// where `'f` is something like `Fresh(0)`. The indices are
+    /// unique per impl, but not necessarily continuous.
+    Fresh(usize),
+
+    /// User wrote `'static`
     Static,
+
+    /// Some user-given name like `'x`
     Name(Name),
 }
 
@@ -214,7 +236,7 @@ impl LifetimeName {
         use self::LifetimeName::*;
         match *self {
             Implicit => keywords::Invalid.name(),
-            Underscore => Symbol::intern("'_"),
+            Fresh(_) | Underscore => keywords::UnderscoreLifetime.name(),
             Static => keywords::StaticLifetime.name(),
             Name(name) => name,
         }
@@ -235,7 +257,13 @@ impl Lifetime {
         use self::LifetimeName::*;
         match self.name {
             Implicit | Underscore => true,
-            Static | Name(_) => false,
+
+            // It might seem surprising that `Fresh(_)` counts as
+            // *not* elided -- but this is because, as far as the code
+            // in the compiler is concerned -- `Fresh(_)` variants act
+            // equivalently to "some fresh name". They correspond to
+            // early-bound regions on an impl, in other words.
+            Fresh(_) | Static | Name(_) => false,
         }
     }
 
@@ -395,6 +423,15 @@ pub enum TyParamBound {
     RegionTyParamBound(Lifetime),
 }
 
+impl TyParamBound {
+    pub fn span(&self) -> Span {
+        match self {
+            &TraitTyParamBound(ref t, ..) => t.span,
+            &RegionTyParamBound(ref l) => l.span,
+        }
+    }
+}
+
 /// A modifier on a bound, currently this is only used for `?Sized`, where the
 /// modifier is `Maybe`. Negative bounds should also be handled here.
 #[derive(Copy, Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
@@ -414,6 +451,7 @@ pub struct TyParam {
     pub span: Span,
     pub pure_wrt_drop: bool,
     pub synthetic: Option<SyntheticTyParamKind>,
+    pub attrs: HirVec<Attribute>,
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
@@ -568,6 +606,16 @@ pub enum WherePredicate {
     RegionPredicate(WhereRegionPredicate),
     /// An equality predicate (unsupported)
     EqPredicate(WhereEqPredicate),
+}
+
+impl WherePredicate {
+    pub fn span(&self) -> Span {
+        match self {
+            &WherePredicate::BoundPredicate(ref p) => p.span,
+            &WherePredicate::RegionPredicate(ref p) => p.span,
+            &WherePredicate::EqPredicate(ref p) => p.span,
+        }
+    }
 }
 
 /// A type bound, eg `for<'c> Foo: Send+Clone+'c`
@@ -779,6 +827,7 @@ impl Pat {
 /// except is_shorthand is true
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct FieldPat {
+    pub id: NodeId,
     /// The identifier for the field
     pub name: Name,
     /// The pattern the field is destructured to
@@ -1124,6 +1173,7 @@ pub struct Arm {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct Field {
+    pub id: NodeId,
     pub name: Spanned<Name>,
     pub expr: P<Expr>,
     pub span: Span,
@@ -1228,7 +1278,6 @@ impl Expr {
             ExprAssign(..) => ExprPrecedence::Assign,
             ExprAssignOp(..) => ExprPrecedence::AssignOp,
             ExprField(..) => ExprPrecedence::Field,
-            ExprTupField(..) => ExprPrecedence::TupField,
             ExprIndex(..) => ExprPrecedence::Index,
             ExprPath(..) => ExprPrecedence::Path,
             ExprAddrOf(..) => ExprPrecedence::AddrOf,
@@ -1315,12 +1364,8 @@ pub enum Expr_ {
     ///
     /// For example, `a += 1`.
     ExprAssignOp(BinOp, P<Expr>, P<Expr>),
-    /// Access of a named struct field (`obj.foo`)
+    /// Access of a named (`obj.foo`) or unnamed (`obj.0`) struct or tuple field
     ExprField(P<Expr>, Spanned<Name>),
-    /// Access of an unnamed field of a struct or tuple-struct
-    ///
-    /// For example, `foo.0`.
-    ExprTupField(P<Expr>, Spanned<usize>),
     /// An indexing operation (`foo[2]`)
     ExprIndex(P<Expr>, P<Expr>),
 
@@ -2011,9 +2056,9 @@ pub struct Item {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum Item_ {
-    /// An `extern crate` item, with optional original crate name,
+    /// An `extern crate` item, with optional *original* crate name if the crate was renamed.
     ///
-    /// e.g. `extern crate foo` or `extern crate foo_bar as foo`
+    /// E.g. `extern crate foo` or `extern crate foo_bar as foo`
     ItemExternCrate(Option<Name>),
 
     /// `use foo::bar::*;` or `use foo::bar::baz as quux;`
@@ -2232,6 +2277,7 @@ bitflags! {
         const NAKED                     = 0b0001_0000;
         const NO_MANGLE                 = 0b0010_0000;
         const RUSTC_STD_INTERNAL_SYMBOL = 0b0100_0000;
+        const NO_DEBUG                  = 0b1000_0000;
     }
 }
 

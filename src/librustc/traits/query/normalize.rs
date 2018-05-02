@@ -17,7 +17,7 @@ use infer::at::At;
 use infer::canonical::{Canonical, Canonicalize, QueryResult};
 use middle::const_val::ConstVal;
 use mir::interpret::GlobalId;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 use traits::{Obligation, ObligationCause, PredicateObligation, Reveal};
 use traits::query::CanonicalProjectionGoal;
 use traits::project::Normalized;
@@ -109,7 +109,7 @@ impl<'cx, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for QueryNormalizer<'cx, 'gcx, 'tcx
                     Reveal::UserFacing => ty,
 
                     Reveal::All => {
-                        let recursion_limit = self.tcx().sess.recursion_limit.get();
+                        let recursion_limit = *self.tcx().sess.recursion_limit.get();
                         if self.anon_depth >= recursion_limit {
                             let obligation = Obligation::with_depth(
                                 self.cause.clone(),
@@ -196,7 +196,7 @@ impl<'cx, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for QueryNormalizer<'cx, 'gcx, 'tcx
         if let ConstVal::Unevaluated(def_id, substs) = constant.val {
             let tcx = self.infcx.tcx.global_tcx();
             if let Some(param_env) = self.tcx().lift_to_global(&self.param_env) {
-                if substs.needs_infer() {
+                if substs.needs_infer() || substs.has_skol() {
                     let identity_substs = Substs::identity_for_item(tcx, def_id);
                     let instance = ty::Instance::resolve(tcx, param_env, def_id, identity_substs);
                     if let Some(instance) = instance {
@@ -259,13 +259,13 @@ impl<'gcx: 'tcx, 'tcx> Canonicalize<'gcx, 'tcx> for ty::ParamEnvAnd<'tcx, ty::Pr
 
 impl<'gcx: 'tcx, 'tcx> Canonicalize<'gcx, 'tcx> for QueryResult<'tcx, NormalizationResult<'tcx>> {
     // we ought to intern this, but I'm too lazy just now
-    type Canonicalized = Rc<Canonical<'gcx, QueryResult<'gcx, NormalizationResult<'gcx>>>>;
+    type Canonicalized = Lrc<Canonical<'gcx, QueryResult<'gcx, NormalizationResult<'gcx>>>>;
 
     fn intern(
         _gcx: TyCtxt<'_, 'gcx, 'gcx>,
         value: Canonical<'gcx, Self::Lifted>,
     ) -> Self::Canonicalized {
-        Rc::new(value)
+        Lrc::new(value)
     }
 }
 

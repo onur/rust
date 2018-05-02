@@ -28,15 +28,16 @@ use ty::error::{ExpectedFound, TypeError, UnconstrainedNumeric};
 use ty::fold::TypeFoldable;
 use ty::relate::RelateResult;
 use traits::{self, ObligationCause, PredicateObligations};
+use rustc_data_structures::lazy_btree_map::LazyBTreeMap;
 use rustc_data_structures::unify as ut;
 use std::cell::{Cell, RefCell, Ref, RefMut};
-use std::collections::BTreeMap;
 use std::fmt;
 use syntax::ast;
 use errors::DiagnosticBuilder;
 use syntax_pos::{self, Span};
+use syntax_pos::symbol::InternedString;
 use util::nodemap::FxHashMap;
-use arena::DroplessArena;
+use arena::SyncDroplessArena;
 
 use self::combine::CombineFields;
 use self::higher_ranked::HrMatchResult;
@@ -186,7 +187,7 @@ pub struct InferCtxt<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
 
 /// A map returned by `skolemize_late_bound_regions()` indicating the skolemized
 /// region that each late-bound region was replaced with.
-pub type SkolemizationMap<'tcx> = BTreeMap<ty::BoundRegion, ty::Region<'tcx>>;
+pub type SkolemizationMap<'tcx> = LazyBTreeMap<ty::BoundRegion, ty::Region<'tcx>>;
 
 /// See `error_reporting` module for more details
 #[derive(Clone, Debug)]
@@ -343,7 +344,7 @@ pub enum RegionVariableOrigin {
     Coercion(Span),
 
     // Region variables created as the values for early-bound regions
-    EarlyBoundRegion(Span, ast::Name),
+    EarlyBoundRegion(Span, InternedString),
 
     // Region variables created for bound regions
     // in a function or method that is called
@@ -406,7 +407,7 @@ impl fmt::Display for FixupError {
 /// F: for<'b, 'tcx> where 'gcx: 'tcx FnOnce(InferCtxt<'b, 'gcx, 'tcx>).
 pub struct InferCtxtBuilder<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     global_tcx: TyCtxt<'a, 'gcx, 'gcx>,
-    arena: DroplessArena,
+    arena: SyncDroplessArena,
     fresh_tables: Option<RefCell<ty::TypeckTables<'tcx>>>,
 }
 
@@ -414,7 +415,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'gcx> {
     pub fn infer_ctxt(self) -> InferCtxtBuilder<'a, 'gcx, 'tcx> {
         InferCtxtBuilder {
             global_tcx: self,
-            arena: DroplessArena::new(),
+            arena: SyncDroplessArena::new(),
             fresh_tables: None,
 
         }
@@ -837,25 +838,18 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         })
     }
 
-    pub fn next_ty_var_id(&self,
-                          universe: ty::UniverseIndex,
-                          diverging: bool,
-                          origin: TypeVariableOrigin)
-                          -> TyVid {
+    pub fn next_ty_var_id(&self, diverging: bool, origin: TypeVariableOrigin) -> TyVid {
         self.type_variables
             .borrow_mut()
-            .new_var(universe, diverging, origin)
+            .new_var(diverging, origin)
     }
 
-    pub fn next_ty_var(&self, universe: ty::UniverseIndex, origin: TypeVariableOrigin) -> Ty<'tcx> {
-        self.tcx.mk_var(self.next_ty_var_id(universe, false, origin))
+    pub fn next_ty_var(&self, origin: TypeVariableOrigin) -> Ty<'tcx> {
+        self.tcx.mk_var(self.next_ty_var_id(false, origin))
     }
 
-    pub fn next_diverging_ty_var(&self,
-                                 universe: ty::UniverseIndex,
-                                 origin: TypeVariableOrigin)
-                                 -> Ty<'tcx> {
-        self.tcx.mk_var(self.next_ty_var_id(universe, true, origin))
+    pub fn next_diverging_ty_var(&self, origin: TypeVariableOrigin) -> Ty<'tcx> {
+        self.tcx.mk_var(self.next_ty_var_id(true, origin))
     }
 
     pub fn next_int_var_id(&self) -> IntVid {
@@ -910,14 +904,12 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     /// use an inference variable for `C` with `[T, U]`
     /// as the substitutions for the default, `(T, U)`.
     pub fn type_var_for_def(&self,
-                            universe: ty::UniverseIndex,
                             span: Span,
                             def: &ty::TypeParameterDef)
                             -> Ty<'tcx> {
         let ty_var_id = self.type_variables
                             .borrow_mut()
-                            .new_var(universe,
-                                     false,
+                            .new_var(false,
                                      TypeVariableOrigin::TypeParameterDefinition(span, def.name));
 
         self.tcx.mk_var(ty_var_id)
@@ -926,14 +918,13 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     /// Given a set of generics defined on a type or impl, returns a substitution mapping each
     /// type/region parameter to a fresh inference variable.
     pub fn fresh_substs_for_item(&self,
-                                 universe: ty::UniverseIndex,
                                  span: Span,
                                  def_id: DefId)
                                  -> &'tcx Substs<'tcx> {
         Substs::for_item(self.tcx, def_id, |def, _| {
             self.region_var_for_def(span, def)
         }, |def, _| {
-            self.type_var_for_def(universe, span, def)
+            self.type_var_for_def(span, def)
         })
     }
 
@@ -1225,7 +1216,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         span: Span,
         lbrct: LateBoundRegionConversionTime,
         value: &ty::Binder<T>)
-        -> (T, BTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
+        -> (T, LazyBTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
         where T : TypeFoldable<'tcx>
     {
         self.tcx.replace_late_bound_regions(

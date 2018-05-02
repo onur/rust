@@ -41,7 +41,7 @@
 //! This order consistency is required in a few places in rustc, for
 //! example generator inference, and possibly also HIR borrowck.
 
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::ast::{NodeId, CRATE_NODE_ID, Name, Attribute};
 use syntax_pos::Span;
 use hir::*;
@@ -404,7 +404,7 @@ pub fn walk_local<'v, V: Visitor<'v>>(visitor: &mut V, local: &'v Local) {
     // Intentionally visiting the expr first - the initialization expr
     // dominates the local's definition.
     walk_list!(visitor, visit_expr, &local.init);
-
+    walk_list!(visitor, visit_attribute, local.attrs.iter());
     visitor.visit_id(local.id);
     visitor.visit_pat(&local.pat);
     walk_list!(visitor, visit_ty, &local.ty);
@@ -420,7 +420,10 @@ pub fn walk_lifetime<'v, V: Visitor<'v>>(visitor: &mut V, lifetime: &'v Lifetime
         LifetimeName::Name(name) => {
             visitor.visit_name(lifetime.span, name);
         }
-        LifetimeName::Static | LifetimeName::Implicit | LifetimeName::Underscore => {}
+        LifetimeName::Fresh(_) |
+        LifetimeName::Static |
+        LifetimeName::Implicit |
+        LifetimeName::Underscore => {}
     }
 }
 
@@ -444,10 +447,10 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item) {
     visitor.visit_vis(&item.vis);
     visitor.visit_name(item.span, item.name);
     match item.node {
-        ItemExternCrate(opt_name) => {
+        ItemExternCrate(orig_name) => {
             visitor.visit_id(item.id);
-            if let Some(name) = opt_name {
-                visitor.visit_name(item.span, name);
+            if let Some(orig_name) = orig_name {
+                visitor.visit_name(item.span, orig_name);
             }
         }
         ItemUse(ref path, _) => {
@@ -655,6 +658,7 @@ pub fn walk_pat<'v, V: Visitor<'v>>(visitor: &mut V, pattern: &'v Pat) {
         PatKind::Struct(ref qpath, ref fields, _) => {
             visitor.visit_qpath(qpath, pattern.id, pattern.span);
             for field in fields {
+                visitor.visit_id(field.node.id);
                 visitor.visit_name(field.span, field.node.name);
                 visitor.visit_pat(&field.node.pat)
             }
@@ -727,6 +731,7 @@ pub fn walk_generic_param<'v, V: Visitor<'v>>(visitor: &mut V, param: &'v Generi
             visitor.visit_name(ty_param.span, ty_param.name);
             walk_list!(visitor, visit_ty_param_bound, &ty_param.bounds);
             walk_list!(visitor, visit_ty, &ty_param.default);
+            walk_list!(visitor, visit_attribute, ty_param.attrs.iter());
         }
     }
 }
@@ -956,6 +961,7 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr) {
         ExprStruct(ref qpath, ref fields, ref optional_base) => {
             visitor.visit_qpath(qpath, expression.id, expression.span);
             for field in fields {
+                visitor.visit_id(field.id);
                 visitor.visit_name(field.name.span, field.name.node);
                 visitor.visit_expr(&field.expr)
             }
@@ -1021,9 +1027,6 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr) {
         ExprField(ref subexpression, ref name) => {
             visitor.visit_expr(subexpression);
             visitor.visit_name(name.span, name.node);
-        }
-        ExprTupField(ref subexpression, _) => {
-            visitor.visit_expr(subexpression);
         }
         ExprIndex(ref main_expression, ref index_expression) => {
             visitor.visit_expr(main_expression);

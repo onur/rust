@@ -8,12 +8,12 @@ use rustc::mir::interpret::EvalResult;
 use super::{EvalContext, Machine};
 
 impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
-    pub fn inc_step_counter_and_check_limit(&mut self, n: usize) -> EvalResult<'tcx> {
-        self.steps_remaining = self.steps_remaining.saturating_sub(n);
-        if self.steps_remaining > 0 {
-            Ok(())
-        } else {
-            err!(ExecutionTimeLimitReached)
+    pub fn inc_step_counter_and_check_limit(&mut self, n: usize) {
+        self.terminators_remaining = self.terminators_remaining.saturating_sub(n);
+        if self.terminators_remaining == 0 {
+            // FIXME(#49980): make this warning a lint
+            self.tcx.sess.span_warn(self.frame().span, "Constant evaluating a complex constant, this might take some time");
+            self.terminators_remaining = 1_000_000;
         }
     }
 
@@ -36,7 +36,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
             return Ok(true);
         }
 
-        self.inc_step_counter_and_check_limit(1)?;
+        self.inc_step_counter_and_check_limit(1);
 
         let terminator = basic_block.terminator();
         assert_eq!(old_frames, self.cur_frame());
@@ -69,13 +69,13 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
 
             // Mark locals as alive
             StorageLive(local) => {
-                let old_val = self.frame_mut().storage_live(local)?;
+                let old_val = self.frame_mut().storage_live(local);
                 self.deallocate_local(old_val)?;
             }
 
             // Mark locals as dead
             StorageDead(local) => {
-                let old_val = self.frame_mut().storage_dead(local)?;
+                let old_val = self.frame_mut().storage_dead(local);
                 self.deallocate_local(old_val)?;
             }
 
@@ -88,6 +88,8 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
             EndRegion(ce) => {
                 M::end_region(self, Some(ce))?;
             }
+
+            UserAssertTy(..) => {}
 
             // Defined to do nothing. These are added by optimization passes, to avoid changing the
             // size of MIR constantly.

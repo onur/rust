@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use borrow_check::borrow_set::BorrowSet;
 use rustc::hir::def_id::DefId;
 use rustc::mir::{ClosureRegionRequirements, ClosureOutlivesSubject, Mir};
 use rustc::infer::InferCtxt;
@@ -73,6 +74,7 @@ pub(in borrow_check) fn compute_regions<'cx, 'gcx, 'tcx>(
     param_env: ty::ParamEnv<'gcx>,
     flow_inits: &mut FlowAtLocation<MaybeInitializedPlaces<'cx, 'gcx, 'tcx>>,
     move_data: &MoveData<'tcx>,
+    _borrow_set: &BorrowSet<'tcx>,
 ) -> (
     RegionInferenceContext<'tcx>,
     Option<ClosureRegionRequirements<'gcx>>,
@@ -202,11 +204,11 @@ fn dump_mir_results<'a, 'gcx, 'tcx>(
     });
 
     // Also dump the inference graph constraints as a graphviz file.
-    let _: io::Result<()> = do catch {
+    let _: io::Result<()> = do_catch! {{
         let mut file =
             pretty::create_dump_file(infcx.tcx, "regioncx.dot", None, "nll", &0, source)?;
-        regioncx.dump_graphviz(&mut file)
-    };
+        regioncx.dump_graphviz(&mut file)?;
+    }};
 }
 
 fn dump_annotation<'a, 'gcx, 'tcx>(

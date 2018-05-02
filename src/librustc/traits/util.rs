@@ -209,13 +209,13 @@ impl<'cx, 'gcx, 'tcx> Elaborator<'cx, 'gcx, 'tcx> {
                                None
                            } else {
                                Some(ty::Predicate::RegionOutlives(
-                                   ty::Binder(ty::OutlivesPredicate(r, r_min))))
+                                   ty::Binder::dummy(ty::OutlivesPredicate(r, r_min))))
                            },
 
                            Component::Param(p) => {
                                let ty = tcx.mk_param(p.idx, p.name);
                                Some(ty::Predicate::TypeOutlives(
-                                   ty::Binder(ty::OutlivesPredicate(ty, r_min))))
+                                   ty::Binder::dummy(ty::OutlivesPredicate(ty, r_min))))
                            },
 
                            Component::UnresolvedInferenceVariable(_) => {
@@ -346,6 +346,11 @@ impl<'tcx,I:Iterator<Item=ty::Predicate<'tcx>>> Iterator for FilterToTraits<I> {
                 }
             }
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (_, upper) = self.base_iterator.size_hint();
+        (0, upper)
     }
 }
 
@@ -509,7 +514,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             def_id: fn_trait_def_id,
             substs: self.mk_substs_trait(self_ty, &[arguments_tuple]),
         };
-        ty::Binder((trait_ref, sig.skip_binder().output()))
+        ty::Binder::bind((trait_ref, sig.skip_binder().output()))
     }
 
     pub fn generator_trait_ref_and_outputs(self,
@@ -522,7 +527,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             def_id: fn_trait_def_id,
             substs: self.mk_substs_trait(self_ty, &[]),
         };
-        ty::Binder((trait_ref, sig.skip_binder().yield_ty, sig.skip_binder().return_ty))
+        ty::Binder::bind((trait_ref, sig.skip_binder().yield_ty, sig.skip_binder().return_ty))
     }
 
     pub fn impl_is_default(self, node_item_def_id: DefId) -> bool {

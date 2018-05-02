@@ -21,7 +21,7 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc::hir;
 use rustc::hir::def_id::DefId;
 use rustc::middle::const_val::ConstVal;
-use rustc::traits;
+use rustc::traits::{self, TraitEngine};
 use rustc::ty::{self, TyCtxt, Ty, TypeFoldable};
 use rustc::ty::cast::CastTy;
 use rustc::ty::maps::Providers;
@@ -29,7 +29,7 @@ use rustc::mir::*;
 use rustc::mir::traversal::ReversePostorder;
 use rustc::mir::visit::{PlaceContext, Visitor};
 use rustc::middle::lang_items;
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::attr;
 use syntax::ast::LitKind;
 use syntax::feature_gate::UnstableFeatures;
@@ -868,7 +868,7 @@ This does not pose a problem by itself because they can't be accessed directly."
                     Abi::RustIntrinsic |
                     Abi::PlatformIntrinsic => {
                         assert!(!self.tcx.is_const_fn(def_id));
-                        match &self.tcx.item_name(def_id)[..] {
+                        match &self.tcx.item_name(def_id).as_str()[..] {
                             "size_of" | "min_align_of" | "type_id" => is_const_fn = Some(def_id),
 
                             name if name.starts_with("simd_shuffle") => {
@@ -964,7 +964,7 @@ This does not pose a problem by itself because they can't be accessed directly."
                     let (msg, note) = if let UnstableFeatures::Disallow =
                             self.tcx.sess.opts.unstable_features {
                         (format!("calls in {}s are limited to \
-                                  struct and enum constructors",
+                                  tuple structs and tuple variants",
                                  self.mode),
                          Some("a limited form of compile-time function \
                                evaluation is available on a nightly \
@@ -972,7 +972,7 @@ This does not pose a problem by itself because they can't be accessed directly."
                     } else {
                         (format!("calls in {}s are limited \
                                   to constant functions, \
-                                  struct and enum constructors",
+                                  tuple structs and tuple variants",
                                  self.mode),
                          None)
                     };
@@ -1099,6 +1099,7 @@ This does not pose a problem by itself because they can't be accessed directly."
                 StatementKind::InlineAsm {..} |
                 StatementKind::EndRegion(_) |
                 StatementKind::Validate(..) |
+                StatementKind::UserAssertTy(..) |
                 StatementKind::Nop => {}
             }
         });

@@ -43,12 +43,11 @@
 
 use core::marker::PhantomData;
 use core::mem;
-use core::nonzero::NonZero;
-use core::ptr::{self, Unique};
+use core::ptr::{self, Unique, NonNull};
 use core::slice;
 
+use alloc::{Global, Alloc, Layout};
 use boxed::Box;
-use heap::{Heap, Alloc, Layout};
 
 const B: usize = 6;
 pub const MIN_LEN: usize = B - 1;
@@ -149,14 +148,12 @@ impl<K, V> BoxedNode<K, V> {
         }
     }
 
-    unsafe fn from_ptr(ptr: NonZero<*const LeafNode<K, V>>) -> Self {
-        BoxedNode { ptr: Unique::new_unchecked(ptr.get() as *mut LeafNode<K, V>) }
+    unsafe fn from_ptr(ptr: NonNull<LeafNode<K, V>>) -> Self {
+        BoxedNode { ptr: Unique::from(ptr) }
     }
 
-    fn as_ptr(&self) -> NonZero<*const LeafNode<K, V>> {
-        unsafe {
-            NonZero::from(self.ptr.as_ref())
-        }
+    fn as_ptr(&self) -> NonNull<LeafNode<K, V>> {
+        NonNull::from(self.ptr)
     }
 }
 
@@ -239,7 +236,7 @@ impl<K, V> Root<K, V> {
     pub fn pop_level(&mut self) {
         debug_assert!(self.height > 0);
 
-        let top = self.node.ptr.as_ptr() as *mut u8;
+        let top = self.node.ptr;
 
         self.node = unsafe {
             BoxedNode::from_ptr(self.as_mut()
@@ -252,7 +249,7 @@ impl<K, V> Root<K, V> {
         self.as_mut().as_leaf_mut().parent = ptr::null();
 
         unsafe {
-            Heap.dealloc(top, Layout::new::<InternalNode<K, V>>());
+            Global.dealloc(NonNull::from(top).as_opaque(), Layout::new::<InternalNode<K, V>>());
         }
     }
 }
@@ -276,7 +273,7 @@ impl<K, V> Root<K, V> {
 ///   `NodeRef` could be pointing to either type of node.
 pub struct NodeRef<BorrowType, K, V, Type> {
     height: usize,
-    node: NonZero<*const LeafNode<K, V>>,
+    node: NonNull<LeafNode<K, V>>,
     // This is null unless the borrow type is `Mut`
     root: *const Root<K, V>,
     _marker: PhantomData<(BorrowType, Type)>
@@ -302,7 +299,7 @@ unsafe impl<K: Send, V: Send, Type> Send
 impl<BorrowType, K, V> NodeRef<BorrowType, K, V, marker::Internal> {
     fn as_internal(&self) -> &InternalNode<K, V> {
         unsafe {
-            &*(self.node.get() as *const InternalNode<K, V>)
+            &*(self.node.as_ptr() as *mut InternalNode<K, V>)
         }
     }
 }
@@ -310,7 +307,7 @@ impl<BorrowType, K, V> NodeRef<BorrowType, K, V, marker::Internal> {
 impl<'a, K, V> NodeRef<marker::Mut<'a>, K, V, marker::Internal> {
     fn as_internal_mut(&mut self) -> &mut InternalNode<K, V> {
         unsafe {
-            &mut *(self.node.get() as *mut InternalNode<K, V>)
+            &mut *(self.node.as_ptr() as *mut InternalNode<K, V>)
         }
     }
 }
@@ -352,7 +349,7 @@ impl<BorrowType, K, V, Type> NodeRef<BorrowType, K, V, Type> {
 
     fn as_leaf(&self) -> &LeafNode<K, V> {
         unsafe {
-            &*self.node.get()
+            self.node.as_ref()
         }
     }
 
@@ -382,7 +379,8 @@ impl<BorrowType, K, V, Type> NodeRef<BorrowType, K, V, Type> {
         >,
         Self
     > {
-        if let Some(non_zero) = NonZero::new(self.as_leaf().parent as *const LeafNode<K, V>) {
+        let parent_as_leaf = self.as_leaf().parent as *const LeafNode<K, V>;
+        if let Some(non_zero) = NonNull::new(parent_as_leaf as *mut _) {
             Ok(Handle {
                 node: NodeRef {
                     height: self.height + 1,
@@ -435,9 +433,9 @@ impl<K, V> NodeRef<marker::Owned, K, V, marker::Leaf> {
             marker::Edge
         >
     > {
-        let ptr = self.as_leaf() as *const LeafNode<K, V> as *const u8 as *mut u8;
+        let node = self.node;
         let ret = self.ascend().ok();
-        Heap.dealloc(ptr, Layout::new::<LeafNode<K, V>>());
+        Global.dealloc(node.as_opaque(), Layout::new::<LeafNode<K, V>>());
         ret
     }
 }
@@ -456,9 +454,9 @@ impl<K, V> NodeRef<marker::Owned, K, V, marker::Internal> {
             marker::Edge
         >
     > {
-        let ptr = self.as_internal() as *const InternalNode<K, V> as *const u8 as *mut u8;
+        let node = self.node;
         let ret = self.ascend().ok();
-        Heap.dealloc(ptr, Layout::new::<InternalNode<K, V>>());
+        Global.dealloc(node.as_opaque(), Layout::new::<InternalNode<K, V>>());
         ret
     }
 }
@@ -498,7 +496,7 @@ impl<'a, K, V, Type> NodeRef<marker::Mut<'a>, K, V, Type> {
 
     fn as_leaf_mut(&mut self) -> &mut LeafNode<K, V> {
         unsafe {
-            &mut *(self.node.get() as *mut LeafNode<K, V>)
+            self.node.as_mut()
         }
     }
 
@@ -1240,13 +1238,13 @@ impl<'a, K, V> Handle<NodeRef<marker::Mut<'a>, K, V, marker::Internal>, marker::
                     ).correct_parent_link();
                 }
 
-                Heap.dealloc(
-                    right_node.node.get() as *mut u8,
+                Global.dealloc(
+                    right_node.node.as_opaque(),
                     Layout::new::<InternalNode<K, V>>(),
                 );
             } else {
-                Heap.dealloc(
-                    right_node.node.get() as *mut u8,
+                Global.dealloc(
+                    right_node.node.as_opaque(),
                     Layout::new::<LeafNode<K, V>>(),
                 );
             }

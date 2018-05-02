@@ -46,6 +46,7 @@ use syntax::attr;
 use syntax::feature_gate::{AttributeGate, AttributeType, Stability, deprecated_attributes};
 use syntax_pos::{BytePos, Span, SyntaxContext};
 use syntax::symbol::keywords;
+use syntax::errors::DiagnosticBuilder;
 
 use rustc::hir::{self, PatKind};
 use rustc::hir::intravisit::FnKind;
@@ -165,21 +166,32 @@ impl LintPass for NonShorthandFieldPatterns {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NonShorthandFieldPatterns {
     fn check_pat(&mut self, cx: &LateContext, pat: &hir::Pat) {
-        if let PatKind::Struct(_, ref field_pats, _) = pat.node {
+        if let PatKind::Struct(ref qpath, ref field_pats, _) = pat.node {
+            let variant = cx.tables.pat_ty(pat).ty_adt_def()
+                                   .expect("struct pattern type is not an ADT")
+                                   .variant_of_def(cx.tables.qpath_def(qpath, pat.hir_id));
             for fieldpat in field_pats {
                 if fieldpat.node.is_shorthand {
                     continue;
                 }
-                if let PatKind::Binding(_, _, ident, None) = fieldpat.node.pat.node {
-                    if ident.node == fieldpat.node.name {
+                if fieldpat.span.ctxt().outer().expn_info().is_some() {
+                    // Don't lint if this is a macro expansion: macro authors
+                    // shouldn't have to worry about this kind of style issue
+                    // (Issue #49588)
+                    continue;
+                }
+                if let PatKind::Binding(_, _, name, None) = fieldpat.node.pat.node {
+                    let binding_ident = ast::Ident::new(name.node, name.span);
+                    if cx.tcx.find_field_index(binding_ident, &variant) ==
+                       Some(cx.tcx.field_index(fieldpat.node.id, cx.tables)) {
                         let mut err = cx.struct_span_lint(NON_SHORTHAND_FIELD_PATTERNS,
                                      fieldpat.span,
                                      &format!("the `{}:` in this pattern is redundant",
-                                              ident.node));
+                                              name.node));
                         let subspan = cx.tcx.sess.codemap().span_through_char(fieldpat.span, ':');
                         err.span_suggestion_short(subspan,
                                                   "remove this",
-                                                  format!("{}", ident.node));
+                                                  format!("{}", name.node));
                         err.emit();
                     }
                 }
@@ -624,7 +636,7 @@ impl EarlyLintPass for AnonymousParameters {
                 for arg in sig.decl.inputs.iter() {
                     match arg.pat.node {
                         ast::PatKind::Ident(_, ident, None) => {
-                            if ident.node.name == keywords::Invalid.name() {
+                            if ident.name == keywords::Invalid.name() {
                                 cx.span_lint(ANONYMOUS_PARAMETERS,
                                              arg.pat.span,
                                              "use of deprecated anonymous parameter");
@@ -948,7 +960,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnconditionalRecursion {
                 // Attempt to select a concrete impl before checking.
                 ty::TraitContainer(trait_def_id) => {
                     let trait_ref = ty::TraitRef::from_method(tcx, trait_def_id, callee_substs);
-                    let trait_ref = ty::Binder(trait_ref);
+                    let trait_ref = ty::Binder::bind(trait_ref);
                     let span = tcx.hir.span(expr_id);
                     let obligation =
                         traits::Obligation::new(traits::ObligationCause::misc(span, expr_id),
@@ -1082,7 +1094,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for InvalidNoMangleItems {
                     if !cx.access_levels.is_reachable(it.id) {
                         let msg = "function is marked #[no_mangle], but not exported";
                         let mut err = cx.struct_span_lint(PRIVATE_NO_MANGLE_FNS, it.span, msg);
-                        let insertion_span = it.span.with_hi(it.span.lo());
+                        let insertion_span = it.span.shrink_to_lo();
                         if it.vis == hir::Visibility::Inherited {
                             err.span_suggestion(insertion_span,
                                                 "try making it public",
@@ -1107,7 +1119,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for InvalidNoMangleItems {
                    !cx.access_levels.is_reachable(it.id) {
                        let msg = "static is marked #[no_mangle], but not exported";
                        let mut err = cx.struct_span_lint(PRIVATE_NO_MANGLE_STATICS, it.span, msg);
-                       let insertion_span = it.span.with_hi(it.span.lo());
+                       let insertion_span = it.span.shrink_to_lo();
                        if it.vis == hir::Visibility::Inherited {
                            err.span_suggestion(insertion_span,
                                                "try making it public",
@@ -1157,7 +1169,7 @@ impl LintPass for MutableTransmutes {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MutableTransmutes {
     fn check_expr(&mut self, cx: &LateContext, expr: &hir::Expr) {
-        use syntax::abi::Abi::RustIntrinsic;
+        use rustc_target::spec::abi::Abi::RustIntrinsic;
 
         let msg = "mutating transmuted &mut T from &T may cause undefined behavior, \
                    consider instead using an UnsafeCell";
@@ -1316,49 +1328,184 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnreachablePub {
     }
 }
 
-/// Lint for trait and lifetime bounds that are (accidentally) accepted by the parser, but
-/// ignored later.
+/// Lint for trait and lifetime bounds in type aliases being mostly ignored:
+/// They are relevant when using associated types, but otherwise neither checked
+/// at definition site nor enforced at use site.
 
-pub struct IgnoredGenericBounds;
+pub struct TypeAliasBounds;
 
 declare_lint! {
-    IGNORED_GENERIC_BOUNDS,
+    TYPE_ALIAS_BOUNDS,
     Warn,
-    "these generic bounds are ignored"
+    "bounds in type aliases are not enforced"
 }
 
-impl LintPass for IgnoredGenericBounds {
+impl LintPass for TypeAliasBounds {
     fn get_lints(&self) -> LintArray {
-        lint_array!(IGNORED_GENERIC_BOUNDS)
+        lint_array!(TYPE_ALIAS_BOUNDS)
     }
 }
 
-impl EarlyLintPass for IgnoredGenericBounds {
-    fn check_item(&mut self, cx: &EarlyContext, item: &ast::Item) {
-        let type_alias_generics = match item.node {
-            ast::ItemKind::Ty(_, ref generics) => generics,
+impl TypeAliasBounds {
+    fn is_type_variable_assoc(qpath: &hir::QPath) -> bool {
+        match *qpath {
+            hir::QPath::TypeRelative(ref ty, _) => {
+                // If this is a type variable, we found a `T::Assoc`.
+                match ty.node {
+                    hir::TyPath(hir::QPath::Resolved(None, ref path)) => {
+                        match path.def {
+                            Def::TyParam(_) => true,
+                            _ => false
+                        }
+                    }
+                    _ => false
+                }
+            }
+            hir::QPath::Resolved(..) => false,
+        }
+    }
+
+    fn suggest_changing_assoc_types(ty: &hir::Ty, err: &mut DiagnosticBuilder) {
+        // Access to associates types should use `<T as Bound>::Assoc`, which does not need a
+        // bound.  Let's see if this type does that.
+
+        // We use a HIR visitor to walk the type.
+        use rustc::hir::intravisit::{self, Visitor};
+        use syntax::ast::NodeId;
+        struct WalkAssocTypes<'a, 'db> where 'db: 'a {
+            err: &'a mut DiagnosticBuilder<'db>
+        }
+        impl<'a, 'db, 'v> Visitor<'v> for WalkAssocTypes<'a, 'db> {
+            fn nested_visit_map<'this>(&'this mut self) -> intravisit::NestedVisitorMap<'this, 'v>
+            {
+                intravisit::NestedVisitorMap::None
+            }
+
+            fn visit_qpath(&mut self, qpath: &'v hir::QPath, id: NodeId, span: Span) {
+                if TypeAliasBounds::is_type_variable_assoc(qpath) {
+                    self.err.span_help(span,
+                        "use fully disambiguated paths (i.e., `<T as Trait>::Assoc`) to refer to \
+                         associated types in type aliases");
+                }
+                intravisit::walk_qpath(self, qpath, id, span)
+            }
+        }
+
+        // Let's go for a walk!
+        let mut visitor = WalkAssocTypes { err };
+        visitor.visit_ty(ty);
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeAliasBounds {
+    fn check_item(&mut self, cx: &LateContext, item: &hir::Item) {
+        let (ty, type_alias_generics) = match item.node {
+            hir::ItemTy(ref ty, ref generics) => (&*ty, generics),
             _ => return,
         };
+        let mut suggested_changing_assoc_types = false;
         // There must not be a where clause
         if !type_alias_generics.where_clause.predicates.is_empty() {
             let spans : Vec<_> = type_alias_generics.where_clause.predicates.iter()
                 .map(|pred| pred.span()).collect();
-            cx.span_lint(IGNORED_GENERIC_BOUNDS, spans,
-                "where clauses are ignored in type aliases");
+            let mut err = cx.struct_span_lint(TYPE_ALIAS_BOUNDS, spans,
+                "where clauses are not enforced in type aliases");
+            err.help("the clause will not be checked when the type alias is used, \
+                      and should be removed");
+            if !suggested_changing_assoc_types {
+                TypeAliasBounds::suggest_changing_assoc_types(ty, &mut err);
+                suggested_changing_assoc_types = true;
+            }
+            err.emit();
         }
         // The parameters must not have bounds
         for param in type_alias_generics.params.iter() {
             let spans : Vec<_> = match param {
-                &ast::GenericParam::Lifetime(ref l) => l.bounds.iter().map(|b| b.span).collect(),
-                &ast::GenericParam::Type(ref ty) => ty.bounds.iter().map(|b| b.span()).collect(),
+                &hir::GenericParam::Lifetime(ref l) => l.bounds.iter().map(|b| b.span).collect(),
+                &hir::GenericParam::Type(ref ty) => ty.bounds.iter().map(|b| b.span()).collect(),
             };
             if !spans.is_empty() {
-                cx.span_lint(
-                    IGNORED_GENERIC_BOUNDS,
+                let mut err = cx.struct_span_lint(
+                    TYPE_ALIAS_BOUNDS,
                     spans,
-                    "bounds on generic parameters are ignored in type aliases",
+                    "bounds on generic parameters are not enforced in type aliases",
                 );
+                err.help("the bound will not be checked when the type alias is used, \
+                          and should be removed");
+                if !suggested_changing_assoc_types {
+                    TypeAliasBounds::suggest_changing_assoc_types(ty, &mut err);
+                    suggested_changing_assoc_types = true;
+                }
+                err.emit();
             }
+        }
+    }
+}
+
+/// Lint constants that are erroneous.
+/// Without this lint, we might not get any diagnostic if the constant is
+/// unused within this crate, even though downstream crates can't use it
+/// without producing an error.
+pub struct UnusedBrokenConst;
+
+impl LintPass for UnusedBrokenConst {
+    fn get_lints(&self) -> LintArray {
+        lint_array!()
+    }
+}
+
+fn check_const(cx: &LateContext, body_id: hir::BodyId, what: &str) {
+    let def_id = cx.tcx.hir.body_owner_def_id(body_id);
+    let param_env = cx.tcx.param_env(def_id);
+    let cid = ::rustc::mir::interpret::GlobalId {
+        instance: ty::Instance::mono(cx.tcx, def_id),
+        promoted: None
+    };
+    if let Err(err) = cx.tcx.const_eval(param_env.and(cid)) {
+        let span = cx.tcx.def_span(def_id);
+        let mut diag = cx.struct_span_lint(
+            CONST_ERR,
+            span,
+            &format!("this {} cannot be used", what),
+        );
+        use rustc::middle::const_val::ConstEvalErrDescription;
+        match err.description() {
+            ConstEvalErrDescription::Simple(message) => {
+                diag.span_label(span, message);
+            }
+            ConstEvalErrDescription::Backtrace(miri, frames) => {
+                diag.span_label(span, format!("{}", miri));
+                for frame in frames {
+                    diag.span_label(frame.span, format!("inside call to `{}`", frame.location));
+                }
+            }
+        }
+        diag.emit()
+    }
+}
+
+struct UnusedBrokenConstVisitor<'a, 'tcx: 'a>(&'a LateContext<'a, 'tcx>);
+
+impl<'a, 'tcx, 'v> hir::intravisit::Visitor<'v> for UnusedBrokenConstVisitor<'a, 'tcx> {
+    fn visit_nested_body(&mut self, id: hir::BodyId) {
+        check_const(self.0, id, "array length");
+    }
+    fn nested_visit_map<'this>(&'this mut self) -> hir::intravisit::NestedVisitorMap<'this, 'v> {
+        hir::intravisit::NestedVisitorMap::None
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedBrokenConst {
+    fn check_item(&mut self, cx: &LateContext, it: &hir::Item) {
+        match it.node {
+            hir::ItemConst(_, body_id) => {
+                check_const(cx, body_id, "constant");
+            },
+            hir::ItemTy(ref ty, _) => hir::intravisit::walk_ty(
+                &mut UnusedBrokenConstVisitor(cx),
+                ty
+            ),
+            _ => {},
         }
     }
 }

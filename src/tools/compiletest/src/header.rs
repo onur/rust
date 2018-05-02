@@ -223,11 +223,13 @@ pub struct TestProps {
     // arguments. (In particular, it propagates to the aux-builds.)
     pub incremental_dir: Option<PathBuf>,
     // Specifies that a test must actually compile without errors.
-    pub must_compile_successfully: bool,
+    pub compile_pass: bool,
     // rustdoc will test the output of the `--test` option
     pub check_test_line_numbers_match: bool,
     // The test must be compiled and run successfully. Only used in UI tests for now.
     pub run_pass: bool,
+    // Skip any codegen step and running the executable. Only for run-pass.
+    pub skip_trans: bool,
     // Do not pass `-Z ui-testing` to UI tests
     pub disable_ui_testing_normalization: bool,
     // customized normalization rules
@@ -257,9 +259,10 @@ impl TestProps {
             pretty_compare_only: false,
             forbid_output: vec![],
             incremental_dir: None,
-            must_compile_successfully: false,
+            compile_pass: false,
             check_test_line_numbers_match: false,
             run_pass: false,
+            skip_trans: false,
             disable_ui_testing_normalization: false,
             normalize_stdout: vec![],
             normalize_stderr: vec![],
@@ -375,11 +378,15 @@ impl TestProps {
                 self.run_pass = config.parse_run_pass(ln);
             }
 
-            if !self.must_compile_successfully {
+            if !self.compile_pass {
                 // run-pass implies must_compile_sucessfully
-                self.must_compile_successfully =
-                    config.parse_must_compile_successfully(ln) || self.run_pass;
+                self.compile_pass =
+                    config.parse_compile_pass(ln) || self.run_pass;
             }
+
+                        if !self.skip_trans {
+                            self.skip_trans = config.parse_skip_trans(ln);
+                        }
 
             if !self.disable_ui_testing_normalization {
                 self.disable_ui_testing_normalization =
@@ -508,8 +515,8 @@ impl Config {
         }
     }
 
-    fn parse_must_compile_successfully(&self, line: &str) -> bool {
-        self.parse_name_directive(line, "must-compile-successfully")
+    fn parse_compile_pass(&self, line: &str) -> bool {
+        self.parse_name_directive(line, "compile-pass")
     }
 
     fn parse_disable_ui_testing_normalization(&self, line: &str) -> bool {
@@ -522,6 +529,10 @@ impl Config {
 
     fn parse_run_pass(&self, line: &str) -> bool {
         self.parse_name_directive(line, "run-pass")
+    }
+
+    fn parse_skip_trans(&self, line: &str) -> bool {
+        self.parse_name_directive(line, "skip-trans")
     }
 
     fn parse_env(&self, line: &str, name: &str) -> Option<(String, String)> {
@@ -595,7 +606,7 @@ impl Config {
     fn has_cfg_prefix(&self, line: &str, prefix: &str) -> bool {
         // returns whether this line contains this prefix or not. For prefix
         // "ignore", returns true if line says "ignore-x86_64", "ignore-arch",
-        // "ignore-andorid" etc.
+        // "ignore-android" etc.
         line.starts_with(prefix) && line.as_bytes().get(prefix.len()) == Some(&b'-')
     }
 

@@ -145,6 +145,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for hir::ImplItemId {
 impl_stable_hash_for!(enum hir::LifetimeName {
     Implicit,
     Underscore,
+    Fresh(index),
     Static,
     Name(name)
 });
@@ -203,7 +204,8 @@ impl_stable_hash_for!(struct hir::TyParam {
     default,
     span,
     pure_wrt_drop,
-    synthetic
+    synthetic,
+    attrs
 });
 
 impl_stable_hash_for!(enum hir::GenericParam {
@@ -418,11 +420,23 @@ impl<'a> HashStable<StableHashingContext<'a>> for hir::Pat {
 }
 
 impl_stable_hash_for_spanned!(hir::FieldPat);
-impl_stable_hash_for!(struct hir::FieldPat {
-    name,
-    pat,
-    is_shorthand
-});
+
+impl<'a> HashStable<StableHashingContext<'a>> for hir::FieldPat {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        let hir::FieldPat {
+            id: _,
+            name,
+            ref pat,
+            is_shorthand,
+        } = *self;
+
+        name.hash_stable(hcx, hasher);
+        pat.hash_stable(hcx, hasher);
+        is_shorthand.hash_stable(hcx, hasher);
+    }
+}
 
 impl_stable_hash_for!(enum hir::BindingAnnotation {
     Unannotated,
@@ -505,12 +519,24 @@ impl_stable_hash_for!(struct hir::Arm {
     body
 });
 
-impl_stable_hash_for!(struct hir::Field {
-    name,
-    expr,
-    span,
-    is_shorthand
-});
+impl<'a> HashStable<StableHashingContext<'a>> for hir::Field {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        let hir::Field {
+            id: _,
+            name,
+            ref expr,
+            span,
+            is_shorthand,
+        } = *self;
+
+        name.hash_stable(hcx, hasher);
+        expr.hash_stable(hcx, hasher);
+        span.hash_stable(hcx, hasher);
+        is_shorthand.hash_stable(hcx, hasher);
+    }
+}
 
 impl_stable_hash_for_spanned!(ast::Name);
 
@@ -567,7 +593,6 @@ impl_stable_hash_for!(enum hir::Expr_ {
     ExprAssign(lhs, rhs),
     ExprAssignOp(op, lhs, rhs),
     ExprField(owner, field_name),
-    ExprTupField(owner, idx),
     ExprIndex(lhs, rhs),
     ExprPath(path),
     ExprAddrOf(mutability, sub),
@@ -652,11 +677,12 @@ impl<'a> HashStable<StableHashingContext<'a>> for ast::Ident {
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
         let ast::Ident {
-            ref name,
-            ctxt: _ // Ignore this
+            name,
+            span,
         } = *self;
 
         name.hash_stable(hcx, hasher);
+        span.hash_stable(hcx, hasher);
     }
 }
 
@@ -851,7 +877,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for hir::Item {
 }
 
 impl_stable_hash_for!(enum hir::Item_ {
-    ItemExternCrate(name),
+    ItemExternCrate(orig_name),
     ItemUse(path, use_kind),
     ItemStatic(ty, mutability, body_id),
     ItemConst(ty, body_id),

@@ -14,20 +14,21 @@
 use borrow_check::nll::region_infer::Cause;
 use borrow_check::nll::region_infer::ClosureRegionRequirementsExt;
 use borrow_check::nll::universal_regions::UniversalRegions;
+use dataflow::move_paths::MoveData;
 use dataflow::FlowAtLocation;
 use dataflow::MaybeInitializedPlaces;
-use dataflow::move_paths::MoveData;
 use rustc::hir::def_id::DefId;
-use rustc::infer::{InferCtxt, InferOk, InferResult, LateBoundRegionConversionTime, UnitResult};
 use rustc::infer::region_constraints::{GenericKind, RegionConstraintData};
-use rustc::traits::{self, Normalized, FulfillmentContext};
+use rustc::infer::{InferCtxt, InferOk, InferResult, LateBoundRegionConversionTime, UnitResult};
+use rustc::mir::tcx::PlaceTy;
+use rustc::mir::visit::{PlaceContext, Visitor};
+use rustc::mir::interpret::EvalErrorKind::BoundsCheck;
+use rustc::mir::*;
 use rustc::traits::query::NoSolution;
+use rustc::traits::{self, Normalized, TraitEngine};
 use rustc::ty::error::TypeError;
 use rustc::ty::fold::TypeFoldable;
 use rustc::ty::{self, ToPolyTraitRef, Ty, TyCtxt, TypeVariants};
-use rustc::mir::*;
-use rustc::mir::tcx::PlaceTy;
-use rustc::mir::visit::{PlaceContext, Visitor};
 use std::fmt;
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
@@ -61,8 +62,8 @@ macro_rules! span_mirbug_and_err {
     })
 }
 
-mod liveness;
 mod input_output;
+mod liveness;
 
 /// Type checks the given `mir` in the context of the inference
 /// context `infcx`. Returns any region constraints that have yet to
@@ -275,7 +276,7 @@ impl<'a, 'b, 'gcx, 'tcx> TypeVerifier<'a, 'b, 'gcx, 'tcx> {
                         tcx.predicates_of(def_id).instantiate(tcx, substs);
                     let predicates =
                         type_checker.normalize(&instantiated_predicates.predicates, location);
-                    type_checker.prove_predicates(&predicates, location);
+                    type_checker.prove_predicates(predicates, location);
                 }
 
                 value.ty
@@ -662,7 +663,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
     where
         OP: FnOnce(&mut Self) -> InferResult<'tcx, R>,
     {
-        let mut fulfill_cx = FulfillmentContext::new();
+        let mut fulfill_cx = TraitEngine::new(self.infcx.tcx);
         let InferOk { value, obligations } = self.infcx.commit_if_ok(|_| op(self))?;
         fulfill_cx.register_predicate_obligations(self.infcx, obligations);
         if let Err(e) = fulfill_cx.select_all_or_error(self.infcx) {
@@ -760,6 +761,25 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
                         variant_index
                     );
                 };
+            }
+            StatementKind::UserAssertTy(ref c_ty, ref local) => {
+                let local_ty = mir.local_decls()[*local].ty;
+                let (ty, _) = self.infcx
+                    .instantiate_canonical_with_fresh_inference_vars(stmt.source_info.span, c_ty);
+                debug!(
+                    "check_stmt: user_assert_ty ty={:?} local_ty={:?}",
+                    ty, local_ty
+                );
+                if let Err(terr) = self.eq_types(ty, local_ty, location.at_self()) {
+                    span_mirbug!(
+                        self,
+                        stmt,
+                        "bad type assert ({:?} = {:?}): {:?}",
+                        ty,
+                        local_ty,
+                        terr
+                    );
+                }
             }
             StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
@@ -879,6 +899,11 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
                 let sig = self.normalize(&sig, term_location);
                 self.check_call_dest(mir, term, &sig, destination, term_location);
 
+                self.prove_predicates(
+                    sig.inputs().iter().map(|ty| ty::Predicate::WellFormed(ty)),
+                    term_location,
+                );
+
                 // The ordinary liveness rules will ensure that all
                 // regions in the type of the callee are live here. We
                 // then further constrain the late-bound regions that
@@ -894,11 +919,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
                     ));
                 }
 
-                if self.is_box_free(func) {
-                    self.check_box_free_inputs(mir, term, &sig, args, term_location);
-                } else {
-                    self.check_call_inputs(mir, term, &sig, args, term_location);
-                }
+                self.check_call_inputs(mir, term, &sig, args, term_location);
             }
             TerminatorKind::Assert {
                 ref cond, ref msg, ..
@@ -908,7 +929,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
                     span_mirbug!(self, term, "bad Assert ({:?}, not bool", cond_ty);
                 }
 
-                if let AssertMessage::BoundsCheck { ref len, ref index } = *msg {
+                if let BoundsCheck { ref len, ref index } = *msg {
                     if len.ty(mir, tcx) != tcx.types.usize {
                         span_mirbug!(self, len, "bounds-check length non-usize {:?}", len)
                     }
@@ -999,70 +1020,6 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
                     terr
                 );
             }
-        }
-    }
-
-    fn is_box_free(&self, operand: &Operand<'tcx>) -> bool {
-        match *operand {
-            Operand::Constant(ref c) => match c.ty.sty {
-                ty::TyFnDef(ty_def_id, _) => {
-                    Some(ty_def_id) == self.tcx().lang_items().box_free_fn()
-                }
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    fn check_box_free_inputs(
-        &mut self,
-        mir: &Mir<'tcx>,
-        term: &Terminator<'tcx>,
-        sig: &ty::FnSig<'tcx>,
-        args: &[Operand<'tcx>],
-        term_location: Location,
-    ) {
-        debug!("check_box_free_inputs");
-
-        // box_free takes a Box as a pointer. Allow for that.
-
-        if sig.inputs().len() != 1 {
-            span_mirbug!(self, term, "box_free should take 1 argument");
-            return;
-        }
-
-        let pointee_ty = match sig.inputs()[0].sty {
-            ty::TyRawPtr(mt) => mt.ty,
-            _ => {
-                span_mirbug!(self, term, "box_free should take a raw ptr");
-                return;
-            }
-        };
-
-        if args.len() != 1 {
-            span_mirbug!(self, term, "box_free called with wrong # of args");
-            return;
-        }
-
-        let ty = args[0].ty(mir, self.tcx());
-        let arg_ty = match ty.sty {
-            ty::TyRawPtr(mt) => mt.ty,
-            ty::TyAdt(def, _) if def.is_box() => ty.boxed_ty(),
-            _ => {
-                span_mirbug!(self, term, "box_free called with bad arg ty");
-                return;
-            }
-        };
-
-        if let Err(terr) = self.sub_types(arg_ty, pointee_ty, term_location.at_self()) {
-            span_mirbug!(
-                self,
-                term,
-                "bad box_free arg ({:?} <- {:?}): {:?}",
-                pointee_ty,
-                arg_ty,
-                terr
-            );
         }
     }
 
@@ -1470,7 +1427,9 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
             // these extra requirements are basically like where
             // clauses on the struct.
             AggregateKind::Closure(def_id, substs) => {
-                if let Some(closure_region_requirements) = tcx.mir_borrowck(*def_id) {
+                if let Some(closure_region_requirements) =
+                    tcx.mir_borrowck(*def_id).closure_requirements
+                {
                     closure_region_requirements.apply_requirements(
                         self.infcx,
                         self.body_id,
@@ -1492,28 +1451,35 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
 
         let predicates = self.normalize(&instantiated_predicates.predicates, location);
         debug!("prove_aggregate_predicates: predicates={:?}", predicates);
-        self.prove_predicates(&predicates, location);
+        self.prove_predicates(predicates, location);
     }
 
     fn prove_trait_ref(&mut self, trait_ref: ty::TraitRef<'tcx>, location: Location) {
         self.prove_predicates(
-            &[
-                ty::Predicate::Trait(trait_ref.to_poly_trait_ref().to_poly_trait_predicate()),
-            ],
+            Some(ty::Predicate::Trait(
+                trait_ref.to_poly_trait_ref().to_poly_trait_predicate(),
+            )),
             location,
         );
     }
 
-    fn prove_predicates(&mut self, predicates: &[ty::Predicate<'tcx>], location: Location) {
+    fn prove_predicates<T>(&mut self, predicates: T, location: Location)
+    where
+        T: IntoIterator<Item = ty::Predicate<'tcx>>,
+        T::IntoIter: Clone,
+    {
+        let predicates = predicates.into_iter();
+
         debug!(
             "prove_predicates(predicates={:?}, location={:?})",
-            predicates, location
+            predicates.clone().collect::<Vec<_>>(),
+            location,
         );
         self.fully_perform_op(location.at_self(), |this| {
             let cause = this.misc(this.last_span);
             let obligations = predicates
-                .iter()
-                .map(|&p| traits::Obligation::new(cause.clone(), this.param_env, p))
+                .into_iter()
+                .map(|p| traits::Obligation::new(cause.clone(), this.param_env, p))
                 .collect();
             Ok(InferOk {
                 value: (),
@@ -1580,7 +1546,7 @@ impl MirPass for TypeckMir {
 
         // When NLL is enabled, the borrow checker runs the typeck
         // itself, so we don't need this MIR pass anymore.
-        if tcx.nll() {
+        if tcx.use_mir_borrowck() {
             return;
         }
 

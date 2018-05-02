@@ -16,7 +16,7 @@ use hair::cx::to_ref::ToRef;
 use rustc::hir::def::{Def, CtorKind};
 use rustc::middle::const_val::ConstVal;
 use rustc::mir::interpret::{GlobalId, Value, PrimVal};
-use rustc::ty::{self, AdtKind, VariantDef, Ty};
+use rustc::ty::{self, AdtKind, Ty};
 use rustc::ty::adjustment::{Adjustment, Adjust, AutoBorrow, AutoBorrowMutability};
 use rustc::ty::cast::CastKind as TyCastKind;
 use rustc::hir;
@@ -420,12 +420,11 @@ fn make_mirror_unadjusted<'a, 'gcx, 'tcx>(cx: &mut Cx<'a, 'gcx, 'tcx>,
                 ty::TyAdt(adt, substs) => {
                     match adt.adt_kind() {
                         AdtKind::Struct | AdtKind::Union => {
-                            let field_refs = field_refs(&adt.variants[0], fields);
                             ExprKind::Adt {
                                 adt_def: adt,
                                 variant_index: 0,
                                 substs,
-                                fields: field_refs,
+                                fields: field_refs(cx, fields),
                                 base: base.as_ref().map(|base| {
                                     FruInfo {
                                         base: base.to_ref(),
@@ -446,12 +445,11 @@ fn make_mirror_unadjusted<'a, 'gcx, 'tcx>(cx: &mut Cx<'a, 'gcx, 'tcx>,
                                     assert!(base.is_none());
 
                                     let index = adt.variant_index_with_id(variant_id);
-                                    let field_refs = field_refs(&adt.variants[index], fields);
                                     ExprKind::Adt {
                                         adt_def: adt,
                                         variant_index: index,
                                         substs,
-                                        fields: field_refs,
+                                        fields: field_refs(cx, fields),
                                         base: None,
                                     }
                                 }
@@ -581,36 +579,94 @@ fn make_mirror_unadjusted<'a, 'gcx, 'tcx>(cx: &mut Cx<'a, 'gcx, 'tcx>,
                 body: block::to_expr_ref(cx, body),
             }
         }
-        hir::ExprField(ref source, name) => {
-            let index = match cx.tables().expr_ty_adjusted(source).sty {
-                ty::TyAdt(adt_def, _) => adt_def.variants[0].index_of_field_named(name.node),
-                ref ty => span_bug!(expr.span, "field of non-ADT: {:?}", ty),
-            };
-            let index =
-                index.unwrap_or_else(|| {
-                    span_bug!(expr.span, "no index found for field `{}`", name.node)
-                });
+        hir::ExprField(ref source, ..) => {
             ExprKind::Field {
                 lhs: source.to_ref(),
-                name: Field::new(index),
-            }
-        }
-        hir::ExprTupField(ref source, index) => {
-            ExprKind::Field {
-                lhs: source.to_ref(),
-                name: Field::new(index.node as usize),
+                name: Field::new(cx.tcx.field_index(expr.id, cx.tables)),
             }
         }
         hir::ExprCast(ref source, _) => {
             // Check to see if this cast is a "coercion cast", where the cast is actually done
             // using a coercion (or is a no-op).
             if let Some(&TyCastKind::CoercionCast) = cx.tables()
-                                                       .cast_kinds()
-                                                       .get(source.hir_id) {
+                                                    .cast_kinds()
+                                                    .get(source.hir_id) {
                 // Convert the lexpr to a vexpr.
                 ExprKind::Use { source: source.to_ref() }
             } else {
-                ExprKind::Cast { source: source.to_ref() }
+                // check whether this is casting an enum variant discriminant
+                // to prevent cycles, we refer to the discriminant initializer
+                // which is always an integer and thus doesn't need to know the
+                // enum's layout (or its tag type) to compute it during const eval
+                // Example:
+                // enum Foo {
+                //     A,
+                //     B = A as isize + 4,
+                // }
+                // The correct solution would be to add symbolic computations to miri,
+                // so we wouldn't have to compute and store the actual value
+                let var = if let hir::ExprPath(ref qpath) = source.node {
+                    let def = cx.tables().qpath_def(qpath, source.hir_id);
+                    cx
+                        .tables()
+                        .node_id_to_type(source.hir_id)
+                        .ty_adt_def()
+                        .and_then(|adt_def| {
+                        match def {
+                            Def::VariantCtor(variant_id, CtorKind::Const) => {
+                                let idx = adt_def.variant_index_with_id(variant_id);
+                                let (d, o) = adt_def.discriminant_def_for_variant(idx);
+                                use rustc::ty::util::IntTypeExt;
+                                let ty = adt_def.repr.discr_type().to_ty(cx.tcx());
+                                Some((d, o, ty))
+                            }
+                            _ => None,
+                        }
+                    })
+                } else {
+                    None
+                };
+                let source = if let Some((did, offset, ty)) = var {
+                    let mk_const = |val| Expr {
+                        temp_lifetime,
+                        ty,
+                        span: expr.span,
+                        kind: ExprKind::Literal {
+                            literal: Literal::Value {
+                                value: cx.tcx().mk_const(ty::Const {
+                                    val,
+                                    ty,
+                                }),
+                            },
+                        },
+                    }.to_ref();
+                    let offset = mk_const(
+                        ConstVal::Value(Value::ByVal(PrimVal::Bytes(offset as u128))),
+                    );
+                    match did {
+                        Some(did) => {
+                            // in case we are offsetting from a computed discriminant
+                            // and not the beginning of discriminants (which is always `0`)
+                            let substs = Substs::identity_for_item(cx.tcx(), did);
+                            let lhs = mk_const(ConstVal::Unevaluated(did, substs));
+                            let bin = ExprKind::Binary {
+                                op: BinOp::Add,
+                                lhs,
+                                rhs: offset,
+                            };
+                            Expr {
+                                temp_lifetime,
+                                ty,
+                                span: expr.span,
+                                kind: bin,
+                            }.to_ref()
+                        },
+                        None => offset,
+                    }
+                } else {
+                    source.to_ref()
+                };
+                ExprKind::Cast { source }
             }
         }
         hir::ExprType(ref source, _) => return source.make_mirror(cx),
@@ -662,9 +718,13 @@ trait ToBorrowKind { fn to_borrow_kind(&self) -> BorrowKind; }
 
 impl ToBorrowKind for AutoBorrowMutability {
     fn to_borrow_kind(&self) -> BorrowKind {
+        use rustc::ty::adjustment::AllowTwoPhase;
         match *self {
             AutoBorrowMutability::Mutable { allow_two_phase_borrow } =>
-                BorrowKind::Mut { allow_two_phase_borrow },
+                BorrowKind::Mut { allow_two_phase_borrow: match allow_two_phase_borrow {
+                    AllowTwoPhase::Yes => true,
+                    AllowTwoPhase::No => false
+                }},
             AutoBorrowMutability::Immutable =>
                 BorrowKind::Shared,
         }
@@ -995,13 +1055,13 @@ fn capture_freevar<'a, 'gcx, 'tcx>(cx: &mut Cx<'a, 'gcx, 'tcx>,
 }
 
 /// Converts a list of named fields (i.e. for struct-like struct/enum ADTs) into FieldExprRef.
-fn field_refs<'tcx>(variant: &'tcx VariantDef,
-                    fields: &'tcx [hir::Field])
-                    -> Vec<FieldExprRef<'tcx>> {
+fn field_refs<'a, 'gcx, 'tcx>(cx: &mut Cx<'a, 'gcx, 'tcx>,
+                              fields: &'tcx [hir::Field])
+                              -> Vec<FieldExprRef<'tcx>> {
     fields.iter()
         .map(|field| {
             FieldExprRef {
-                name: Field::new(variant.index_of_field_named(field.name.node).unwrap()),
+                name: Field::new(cx.tcx.field_index(field.id, cx.tables)),
                 expr: field.expr.to_ref(),
             }
         })

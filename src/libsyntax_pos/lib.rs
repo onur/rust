@@ -17,17 +17,15 @@
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 
 #![feature(const_fn)]
 #![feature(custom_attribute)]
-#![feature(i128_type)]
 #![feature(optin_builtin_traits)]
 #![allow(unused_attributes)]
 #![feature(specialization)]
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::cmp::{self, Ordering};
 use std::fmt;
 use std::hash::{Hasher, Hash};
@@ -50,7 +48,7 @@ extern crate serialize as rustc_serialize; // used by deriving
 extern crate unicode_width;
 
 pub mod hygiene;
-pub use hygiene::{SyntaxContext, ExpnInfo, ExpnFormat, NameAndSpan, CompilerDesugaringKind};
+pub use hygiene::{Mark, SyntaxContext, ExpnInfo, ExpnFormat, NameAndSpan, CompilerDesugaringKind};
 
 mod span_encoding;
 pub use span_encoding::{Span, DUMMY_SP};
@@ -184,8 +182,12 @@ impl SpanData {
     }
 }
 
-// The interner in thread-local, so `Span` shouldn't move between threads.
+// The interner is pointed to by a thread local value which is only set on the main thread
+// with parallelization is disabled. So we don't allow Span to transfer between threads
+// to avoid panics and other errors, even though it would be memory safe to do so.
+#[cfg(not(parallel_queries))]
 impl !Send for Span {}
+#[cfg(not(parallel_queries))]
 impl !Sync for Span {}
 
 impl PartialOrd for Span {
@@ -239,8 +241,15 @@ impl Span {
 
     /// Returns a new span representing an empty span at the beginning of this span
     #[inline]
-    pub fn empty(self) -> Span {
-        self.with_hi(self.lo())
+    pub fn shrink_to_lo(self) -> Span {
+        let span = self.data();
+        span.with_hi(span.lo)
+    }
+    /// Returns a new span representing an empty span at the end of this span
+    #[inline]
+    pub fn shrink_to_hi(self) -> Span {
+        let span = self.data();
+        span.with_lo(span.hi)
     }
 
     /// Returns `self` if `self` is not the dummy span, and `other` otherwise.
@@ -280,6 +289,12 @@ impl Span {
     /// the macro callsite that expanded to it.
     pub fn source_callsite(self) -> Span {
         self.ctxt().outer().expn_info().map(|info| info.call_site.source_callsite()).unwrap_or(self)
+    }
+
+    /// The `Span` for the tokens in the previous macro expansion from which `self` was generated,
+    /// if any
+    pub fn parent(self) -> Option<Span> {
+        self.ctxt().outer().expn_info().map(|i| i.call_site)
     }
 
     /// Return the source callee.
@@ -410,6 +425,52 @@ impl Span {
             end.lo,
             if end.ctxt == SyntaxContext::empty() { end.ctxt } else { span.ctxt },
         )
+    }
+
+    #[inline]
+    pub fn apply_mark(self, mark: Mark) -> Span {
+        let span = self.data();
+        span.with_ctxt(span.ctxt.apply_mark(mark))
+    }
+
+    #[inline]
+    pub fn remove_mark(&mut self) -> Mark {
+        let mut span = self.data();
+        let mark = span.ctxt.remove_mark();
+        *self = Span::new(span.lo, span.hi, span.ctxt);
+        mark
+    }
+
+    #[inline]
+    pub fn adjust(&mut self, expansion: Mark) -> Option<Mark> {
+        let mut span = self.data();
+        let mark = span.ctxt.adjust(expansion);
+        *self = Span::new(span.lo, span.hi, span.ctxt);
+        mark
+    }
+
+    #[inline]
+    pub fn glob_adjust(&mut self, expansion: Mark, glob_ctxt: SyntaxContext)
+                       -> Option<Option<Mark>> {
+        let mut span = self.data();
+        let mark = span.ctxt.glob_adjust(expansion, glob_ctxt);
+        *self = Span::new(span.lo, span.hi, span.ctxt);
+        mark
+    }
+
+    #[inline]
+    pub fn reverse_glob_adjust(&mut self, expansion: Mark, glob_ctxt: SyntaxContext)
+                               -> Option<Option<Mark>> {
+        let mut span = self.data();
+        let mark = span.ctxt.reverse_glob_adjust(expansion, glob_ctxt);
+        *self = Span::new(span.lo, span.hi, span.ctxt);
+        mark
+    }
+
+    #[inline]
+    pub fn modern(self) -> Span {
+        let span = self.data();
+        span.with_ctxt(span.ctxt.modern())
     }
 }
 
@@ -699,17 +760,17 @@ pub struct FileMap {
     pub src_hash: u128,
     /// The external source code (used for external crates, which will have a `None`
     /// value as `self.src`.
-    pub external_src: RefCell<ExternalSource>,
+    pub external_src: Lock<ExternalSource>,
     /// The start position of this source in the CodeMap
     pub start_pos: BytePos,
     /// The end position of this source in the CodeMap
     pub end_pos: BytePos,
     /// Locations of lines beginnings in the source code
-    pub lines: RefCell<Vec<BytePos>>,
+    pub lines: Lock<Vec<BytePos>>,
     /// Locations of multi-byte characters in the source code
-    pub multibyte_chars: RefCell<Vec<MultiByteChar>>,
+    pub multibyte_chars: Lock<Vec<MultiByteChar>>,
     /// Width of characters that are not narrow in the source code
-    pub non_narrow_chars: RefCell<Vec<NonNarrowChar>>,
+    pub non_narrow_chars: Lock<Vec<NonNarrowChar>>,
     /// A hash of the filename, used for speeding up the incr. comp. hashing.
     pub name_hash: u128,
 }
@@ -839,10 +900,10 @@ impl Decodable for FileMap {
                 end_pos,
                 src: None,
                 src_hash,
-                external_src: RefCell::new(ExternalSource::AbsentOk),
-                lines: RefCell::new(lines),
-                multibyte_chars: RefCell::new(multibyte_chars),
-                non_narrow_chars: RefCell::new(non_narrow_chars),
+                external_src: Lock::new(ExternalSource::AbsentOk),
+                lines: Lock::new(lines),
+                multibyte_chars: Lock::new(multibyte_chars),
+                non_narrow_chars: Lock::new(non_narrow_chars),
                 name_hash,
             })
         })
@@ -882,12 +943,12 @@ impl FileMap {
             crate_of_origin: 0,
             src: Some(Lrc::new(src)),
             src_hash,
-            external_src: RefCell::new(ExternalSource::Unneeded),
+            external_src: Lock::new(ExternalSource::Unneeded),
             start_pos,
             end_pos: Pos::from_usize(end_pos),
-            lines: RefCell::new(Vec::new()),
-            multibyte_chars: RefCell::new(Vec::new()),
-            non_narrow_chars: RefCell::new(Vec::new()),
+            lines: Lock::new(Vec::new()),
+            multibyte_chars: Lock::new(Vec::new()),
+            non_narrow_chars: Lock::new(Vec::new()),
             name_hash,
         }
     }
@@ -919,19 +980,24 @@ impl FileMap {
         if *self.external_src.borrow() == ExternalSource::AbsentOk {
             let src = get_src();
             let mut external_src = self.external_src.borrow_mut();
-            if let Some(src) = src {
-                let mut hasher: StableHasher<u128> = StableHasher::new();
-                hasher.write(src.as_bytes());
+            // Check that no-one else have provided the source while we were getting it
+            if *external_src == ExternalSource::AbsentOk {
+                if let Some(src) = src {
+                    let mut hasher: StableHasher<u128> = StableHasher::new();
+                    hasher.write(src.as_bytes());
 
-                if hasher.finish() == self.src_hash {
-                    *external_src = ExternalSource::Present(src);
-                    return true;
+                    if hasher.finish() == self.src_hash {
+                        *external_src = ExternalSource::Present(src);
+                        return true;
+                    }
+                } else {
+                    *external_src = ExternalSource::AbsentErr;
                 }
-            } else {
-                *external_src = ExternalSource::AbsentErr;
-            }
 
-            false
+                false
+            } else {
+                self.src.is_some() || external_src.get_source().is_some()
+            }
         } else {
             self.src.is_some() || self.external_src.borrow().get_source().is_some()
         }
@@ -951,14 +1017,16 @@ impl FileMap {
             }
         }
 
-        let lines = self.lines.borrow();
-        let line = if let Some(line) = lines.get(line_number) {
-            line
-        } else {
-            return None;
+        let begin = {
+            let lines = self.lines.borrow();
+            let line = if let Some(line) = lines.get(line_number) {
+                line
+            } else {
+                return None;
+            };
+            let begin: BytePos = *line - self.start_pos;
+            begin.to_usize()
         };
-        let begin: BytePos = *line - self.start_pos;
-        let begin = begin.to_usize();
 
         if let Some(ref src) = self.src {
             Some(Cow::from(get_until_newline(src, begin)))

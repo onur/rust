@@ -227,27 +227,6 @@ for mir::TerminatorKind<'gcx> {
     }
 }
 
-impl<'a, 'gcx> HashStable<StableHashingContext<'a>>
-for mir::AssertMessage<'gcx> {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        mem::discriminant(self).hash_stable(hcx, hasher);
-
-        match *self {
-            mir::AssertMessage::BoundsCheck { ref len, ref index } => {
-                len.hash_stable(hcx, hasher);
-                index.hash_stable(hcx, hasher);
-            }
-            mir::AssertMessage::Math(ref const_math_err) => {
-                const_math_err.hash_stable(hcx, hasher);
-            }
-            mir::AssertMessage::GeneratorResumedAfterReturn => (),
-            mir::AssertMessage::GeneratorResumedAfterPanic => (),
-        }
-    }
-}
-
 impl_stable_hash_for!(struct mir::Statement<'tcx> { source_info, kind });
 
 impl<'a, 'gcx> HashStable<StableHashingContext<'a>>
@@ -276,6 +255,10 @@ for mir::StatementKind<'gcx> {
             mir::StatementKind::Validate(ref op, ref places) => {
                 op.hash_stable(hcx, hasher);
                 places.hash_stable(hcx, hasher);
+            }
+            mir::StatementKind::UserAssertTy(ref c_ty, ref local) => {
+                c_ty.hash_stable(hcx, hasher);
+                local.hash_stable(hcx, hasher);
             }
             mir::StatementKind::Nop => {}
             mir::StatementKind::InlineAsm { ref asm, ref outputs, ref inputs } => {
@@ -558,6 +541,11 @@ impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for mir::Literal<'gcx> {
 }
 
 impl_stable_hash_for!(struct mir::Location { block, statement_index });
+
+impl_stable_hash_for!(struct mir::BorrowCheckResult<'tcx> {
+    closure_requirements,
+    used_mut_upvars
+});
 
 impl_stable_hash_for!(struct mir::ClosureRegionRequirements<'tcx> {
     num_external_vids,

@@ -105,6 +105,7 @@ impl<'a, 'tcx> Visitor<'tcx> for UnsafetyChecker<'a, 'tcx> {
             StatementKind::StorageDead(..) |
             StatementKind::EndRegion(..) |
             StatementKind::Validate(..) |
+            StatementKind::UserAssertTy(..) |
             StatementKind::Nop => {
                 // safe (at least as emitted during MIR construction)
             }
@@ -125,20 +126,12 @@ impl<'a, 'tcx> Visitor<'tcx> for UnsafetyChecker<'a, 'tcx> {
                 &AggregateKind::Array(..) |
                 &AggregateKind::Tuple |
                 &AggregateKind::Adt(..) => {}
-                &AggregateKind::Closure(def_id, _) => {
+                &AggregateKind::Closure(def_id, _) |
+                &AggregateKind::Generator(def_id, _, _) => {
                     let UnsafetyCheckResult {
                         violations, unsafe_blocks
                     } = self.tcx.unsafety_check_result(def_id);
                     self.register_violations(&violations, &unsafe_blocks);
-                }
-                &AggregateKind::Generator(def_id, _, interior) => {
-                    let UnsafetyCheckResult {
-                        violations, unsafe_blocks
-                    } = self.tcx.unsafety_check_result(def_id);
-                    self.register_violations(&violations, &unsafe_blocks);
-                    if !interior.movable {
-                        self.require_unsafe("construction of immovable generator")
-                    }
                 }
             }
         }
@@ -156,7 +149,7 @@ impl<'a, 'tcx> Visitor<'tcx> for UnsafetyChecker<'a, 'tcx> {
                     self.visibility_scope_info[source_info.scope].lint_root;
                 self.register_violations(&[UnsafetyViolation {
                     source_info,
-                    description: Symbol::intern("borrow of packed field").as_str(),
+                    description: Symbol::intern("borrow of packed field").as_interned_str(),
                     kind: UnsafetyViolationKind::BorrowPacked(lint_root)
                 }], &[]);
             }
@@ -221,7 +214,7 @@ impl<'a, 'tcx> Visitor<'tcx> for UnsafetyChecker<'a, 'tcx> {
                         self.visibility_scope_info[source_info.scope].lint_root;
                     self.register_violations(&[UnsafetyViolation {
                         source_info,
-                        description: Symbol::intern("use of extern static").as_str(),
+                        description: Symbol::intern("use of extern static").as_interned_str(),
                         kind: UnsafetyViolationKind::ExternStatic(lint_root)
                     }], &[]);
                 }
@@ -238,7 +231,7 @@ impl<'a, 'tcx> UnsafetyChecker<'a, 'tcx> {
         let source_info = self.source_info;
         self.register_violations(&[UnsafetyViolation {
             source_info,
-            description: Symbol::intern(description).as_str(),
+            description: Symbol::intern(description).as_interned_str(),
             kind: UnsafetyViolationKind::General,
         }], &[]);
     }
@@ -451,7 +444,7 @@ pub fn check_unsafety<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) {
                 struct_span_err!(
                     tcx.sess, source_info.span, E0133,
                     "{} requires unsafe function or block", description)
-                    .span_label(source_info.span, &description[..])
+                    .span_label(source_info.span, &description.as_str()[..])
                     .emit();
             }
             UnsafetyViolationKind::ExternStatic(lint_node_id) => {
@@ -459,7 +452,7 @@ pub fn check_unsafety<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) {
                               lint_node_id,
                               source_info.span,
                               &format!("{} requires unsafe function or \
-                                        block (error E0133)", &description[..]));
+                                        block (error E0133)", &description.as_str()[..]));
             }
             UnsafetyViolationKind::BorrowPacked(lint_node_id) => {
                 if let Some(impl_def_id) = builtin_derive_def_id(tcx, def_id) {
@@ -469,7 +462,7 @@ pub fn check_unsafety<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) {
                                   lint_node_id,
                                   source_info.span,
                                   &format!("{} requires unsafe function or \
-                                            block (error E0133)", &description[..]));
+                                            block (error E0133)", &description.as_str()[..]));
                 }
             }
         }

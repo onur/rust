@@ -14,7 +14,7 @@ use super::{Place, EvalContext, StackPopCleanup, ValTy, PlaceExtra, Memory};
 
 use std::fmt;
 use std::error::Error;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 
 pub fn mk_borrowck_eval_cx<'a, 'mir, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
@@ -56,7 +56,7 @@ pub fn mk_eval_cx<'a, 'tcx>(
     Ok(ecx)
 }
 
-pub fn eval_body_with_mir<'a, 'mir, 'tcx>(
+pub fn eval_promoted<'a, 'mir, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     cid: GlobalId<'tcx>,
     mir: &'mir mir::Mir<'tcx>,
@@ -66,7 +66,7 @@ pub fn eval_body_with_mir<'a, 'mir, 'tcx>(
     match res {
         Ok(val) => Some(val),
         Err(mut err) => {
-            ecx.report(&mut err, true, None);
+            ecx.report(&mut err, false, None);
             None
         }
     }
@@ -109,53 +109,38 @@ fn eval_body_and_ecx<'a, 'mir, 'tcx>(
         }
         span = mir.span;
         let layout = ecx.layout_of(mir.return_ty().subst(tcx, cid.instance.substs))?;
-        let alloc = tcx.interpret_interner.get_cached(cid.instance.def_id());
-        let is_static = tcx.is_static(cid.instance.def_id()).is_some();
-        let alloc = match alloc {
-            Some(alloc) => {
-                assert!(cid.promoted.is_none());
-                assert!(param_env.caller_bounds.is_empty());
-                alloc
-            },
-            None => {
-                assert!(!layout.is_unsized());
-                let ptr = ecx.memory.allocate(
-                    layout.size.bytes(),
-                    layout.align,
-                    None,
-                )?;
-                if is_static {
-                    tcx.interpret_interner.cache(cid.instance.def_id(), ptr.alloc_id);
-                }
-                let internally_mutable = !layout.ty.is_freeze(tcx, param_env, mir.span);
-                let mutability = tcx.is_static(cid.instance.def_id());
-                let mutability = if mutability == Some(hir::Mutability::MutMutable) || internally_mutable {
-                    Mutability::Mutable
-                } else {
-                    Mutability::Immutable
-                };
-                let cleanup = StackPopCleanup::MarkStatic(mutability);
-                let name = ty::tls::with(|tcx| tcx.item_path_str(cid.instance.def_id()));
-                let prom = cid.promoted.map_or(String::new(), |p| format!("::promoted[{:?}]", p));
-                trace!("const_eval: pushing stack frame for global: {}{}", name, prom);
-                assert!(mir.arg_count == 0);
-                ecx.push_stack_frame(
-                    cid.instance,
-                    mir.span,
-                    mir,
-                    Place::from_ptr(ptr, layout.align),
-                    cleanup,
-                )?;
-
-                while ecx.step()? {}
-                ptr.alloc_id
-            }
+        assert!(!layout.is_unsized());
+        let ptr = ecx.memory.allocate(
+            layout.size.bytes(),
+            layout.align,
+            None,
+        )?;
+        let internally_mutable = !layout.ty.is_freeze(tcx, param_env, mir.span);
+        let mutability = tcx.is_static(cid.instance.def_id());
+        let mutability = if mutability == Some(hir::Mutability::MutMutable) || internally_mutable {
+            Mutability::Mutable
+        } else {
+            Mutability::Immutable
         };
-        let ptr = MemoryPointer::new(alloc, 0).into();
+        let cleanup = StackPopCleanup::MarkStatic(mutability);
+        let name = ty::tls::with(|tcx| tcx.item_path_str(cid.instance.def_id()));
+        let prom = cid.promoted.map_or(String::new(), |p| format!("::promoted[{:?}]", p));
+        trace!("const_eval: pushing stack frame for global: {}{}", name, prom);
+        assert!(mir.arg_count == 0);
+        ecx.push_stack_frame(
+            cid.instance,
+            mir.span,
+            mir,
+            Place::from_ptr(ptr, layout.align),
+            cleanup,
+        )?;
+
+        while ecx.step()? {}
+        let ptr = ptr.into();
         // always try to read the value and report errors
         let value = match ecx.try_read_value(ptr, layout.align, layout.ty)? {
             // if it's a constant (so it needs no address, directly compute its value)
-            Some(val) if !is_static => val,
+            Some(val) if tcx.is_static(cid.instance.def_id()).is_none() => val,
             // point at the allocation
             _ => Value::ByRef(ptr, layout.align),
         };
@@ -278,7 +263,7 @@ impl<'mir, 'tcx> super::Machine<'mir, 'tcx> for CompileTimeEvaluator {
     ) -> EvalResult<'tcx> {
         let substs = instance.substs;
 
-        let intrinsic_name = &ecx.tcx.item_name(instance.def_id())[..];
+        let intrinsic_name = &ecx.tcx.item_name(instance.def_id()).as_str()[..];
         match intrinsic_name {
             "min_align_of" => {
                 let elem_ty = substs.type_at(0);
@@ -339,13 +324,10 @@ impl<'mir, 'tcx> super::Machine<'mir, 'tcx> for CompileTimeEvaluator {
         ecx: &mut EvalContext<'a, 'mir, 'tcx, Self>,
         cid: GlobalId<'tcx>,
     ) -> EvalResult<'tcx, AllocId> {
-        // ensure the static is computed
-        ecx.const_eval(cid)?;
         Ok(ecx
             .tcx
             .interpret_interner
-            .get_cached(cid.instance.def_id())
-            .expect("uncached static"))
+            .cache_static(cid.instance.def_id()))
     }
 
     fn box_alloc<'a>(
@@ -418,14 +400,14 @@ pub fn const_val_field<'a, 'tcx>(
     }
 }
 
-pub fn const_discr<'a, 'tcx>(
+pub fn const_variant_index<'a, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     instance: ty::Instance<'tcx>,
     value: Value,
     ty: Ty<'tcx>,
-) -> EvalResult<'tcx, u128> {
-    trace!("const_discr: {:?}, {:?}, {:?}", instance, value, ty);
+) -> EvalResult<'tcx, usize> {
+    trace!("const_variant_index: {:?}, {:?}, {:?}", instance, value, ty);
     let mut ecx = mk_eval_cx(tcx, instance, param_env).unwrap();
     let (ptr, align) = match value {
         Value::ByValPair(..) | Value::ByVal(_) => {
@@ -439,7 +421,7 @@ pub fn const_discr<'a, 'tcx>(
         Value::ByRef(ptr, align) => (ptr, align),
     };
     let place = Place::from_primval_ptr(ptr, align);
-    ecx.read_discriminant_value(place, ty)
+    ecx.read_discriminant_as_variant_index(place, ty)
 }
 
 pub fn const_eval_provider<'a, 'tcx>(
@@ -451,16 +433,7 @@ pub fn const_eval_provider<'a, 'tcx>(
     let def_id = cid.instance.def.def_id();
 
     if tcx.is_foreign_item(def_id) {
-        let id = tcx.interpret_interner.get_cached(def_id);
-        let id = match id {
-            // FIXME: due to caches this shouldn't happen, add some assertions
-            Some(id) => id,
-            None => {
-                let id = tcx.interpret_interner.reserve();
-                tcx.interpret_interner.cache(def_id, id);
-                id
-            },
-        };
+        let id = tcx.interpret_interner.cache_static(def_id);
         let ty = tcx.type_of(def_id);
         let layout = tcx.layout_of(key.param_env.and(ty)).unwrap();
         let ptr = MemoryPointer::new(id, 0);
@@ -477,7 +450,7 @@ pub fn const_eval_provider<'a, 'tcx>(
         // Do match-check before building MIR
         if tcx.check_match(def_id).is_err() {
             return Err(ConstEvalErr {
-                kind: Rc::new(CheckMatchError),
+                kind: Lrc::new(CheckMatchError),
                 span,
             });
         }
@@ -489,7 +462,7 @@ pub fn const_eval_provider<'a, 'tcx>(
         // Do not continue into miri if typeck errors occurred; it will fail horribly
         if tables.tainted_by_errors {
             return Err(ConstEvalErr {
-                kind: Rc::new(TypeckError),
+                kind: Lrc::new(TypeckError),
                 span,
             });
         }

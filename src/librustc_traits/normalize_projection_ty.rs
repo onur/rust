@@ -13,19 +13,19 @@ use rustc::traits::{self, FulfillmentContext, Normalized, ObligationCause,
                     SelectionContext};
 use rustc::traits::query::{CanonicalProjectionGoal, NoSolution, normalize::NormalizationResult};
 use rustc::ty::{ParamEnvAnd, TyCtxt};
-use rustc::util::common::CellUsizeExt;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 use syntax::ast::DUMMY_NODE_ID;
 use syntax_pos::DUMMY_SP;
 use util;
+use std::sync::atomic::Ordering;
 
 crate fn normalize_projection_ty<'tcx>(
     tcx: TyCtxt<'_, 'tcx, 'tcx>,
     goal: CanonicalProjectionGoal<'tcx>,
-) -> Result<Rc<Canonical<'tcx, QueryResult<'tcx, NormalizationResult<'tcx>>>>, NoSolution> {
+) -> Result<Lrc<Canonical<'tcx, QueryResult<'tcx, NormalizationResult<'tcx>>>>, NoSolution> {
     debug!("normalize_provider(goal={:#?})", goal);
 
-    tcx.sess.perf_stats.normalize_projection_ty.increment();
+    tcx.sess.perf_stats.normalize_projection_ty.fetch_add(1, Ordering::Relaxed);
     tcx.infer_ctxt().enter(|ref infcx| {
         let (
             ParamEnvAnd {

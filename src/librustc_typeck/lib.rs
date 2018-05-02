@@ -68,26 +68,22 @@ This API is completely unstable and subject to change.
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 
 #![allow(non_camel_case_types)]
 
-#![feature(advanced_slice_patterns)]
+#![cfg_attr(stage0, feature(dyn_trait))]
+
 #![feature(box_patterns)]
 #![feature(box_syntax)]
-#![feature(conservative_impl_trait)]
-#![feature(copy_closures, clone_closures)]
 #![feature(crate_visibility_modifier)]
 #![feature(from_ref)]
-#![feature(match_default_bindings)]
 #![feature(exhaustive_patterns)]
-#![feature(option_filter)]
 #![feature(quote)]
 #![feature(refcell_replace_swap)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_patterns)]
-#![feature(i128_type)]
-#![cfg_attr(stage0, feature(never_type))]
+#![feature(slice_sort_by_cached_key)]
+#![feature(never_type)]
 
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
@@ -96,9 +92,9 @@ extern crate syntax_pos;
 extern crate arena;
 #[macro_use] extern crate rustc;
 extern crate rustc_platform_intrinsics as intrinsics;
-extern crate rustc_const_math;
 extern crate rustc_data_structures;
 extern crate rustc_errors as errors;
+extern crate rustc_target;
 
 use rustc::hir;
 use rustc::lint;
@@ -111,12 +107,12 @@ use rustc::infer::InferOk;
 use rustc::ty::subst::Substs;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::maps::Providers;
-use rustc::traits::{FulfillmentContext, ObligationCause, ObligationCauseCode};
+use rustc::traits::{ObligationCause, ObligationCauseCode, TraitEngine};
 use session::{CompileIncomplete, config};
 use util::common::time;
 
 use syntax::ast;
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax_pos::Span;
 
 use std::iter;
@@ -160,7 +156,7 @@ fn require_same_types<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                                 -> bool {
     tcx.infer_ctxt().enter(|ref infcx| {
         let param_env = ty::ParamEnv::empty();
-        let mut fulfill_cx = FulfillmentContext::new();
+        let mut fulfill_cx = TraitEngine::new(infcx.tcx);
         match infcx.at(&cause, param_env).eq(expected, actual) {
             Ok(InferOk { obligations, .. }) => {
                 fulfill_cx.register_predicate_obligations(infcx, obligations);
@@ -208,8 +204,7 @@ fn check_main_fn_ty<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             }
 
             let actual = tcx.fn_sig(main_def_id);
-            let expected_return_type = if tcx.lang_items().termination().is_some()
-                && tcx.features().termination_trait {
+            let expected_return_type = if tcx.lang_items().termination().is_some() {
                 // we take the return type of the given main function, the real check is done
                 // in `check_fn`
                 actual.output().skip_binder()
@@ -218,7 +213,7 @@ fn check_main_fn_ty<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                 tcx.mk_nil()
             };
 
-            let se_ty = tcx.mk_fn_ptr(ty::Binder(
+            let se_ty = tcx.mk_fn_ptr(ty::Binder::bind(
                 tcx.mk_fn_sig(
                     iter::empty(),
                     expected_return_type,
@@ -267,7 +262,7 @@ fn check_start_fn_ty<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                 _ => ()
             }
 
-            let se_ty = tcx.mk_fn_ptr(ty::Binder(
+            let se_ty = tcx.mk_fn_ptr(ty::Binder::bind(
                 tcx.mk_fn_sig(
                     [
                         tcx.types.isize,
@@ -295,12 +290,10 @@ fn check_start_fn_ty<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 }
 
 fn check_for_entry_fn<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    if let Some((id, sp)) = *tcx.sess.entry_fn.borrow() {
-        match tcx.sess.entry_type.get() {
-            Some(config::EntryMain) => check_main_fn_ty(tcx, id, sp),
-            Some(config::EntryStart) => check_start_fn_ty(tcx, id, sp),
-            Some(config::EntryNone) => {}
-            None => bug!("entry function without a type")
+    if let Some((id, sp, entry_type)) = *tcx.sess.entry_fn.borrow() {
+        match entry_type {
+            config::EntryMain => check_main_fn_ty(tcx, id, sp),
+            config::EntryStart => check_start_fn_ty(tcx, id, sp),
         }
     }
 }

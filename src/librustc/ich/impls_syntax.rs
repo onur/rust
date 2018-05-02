@@ -19,7 +19,7 @@ use std::mem;
 use syntax::ast;
 use syntax::feature_gate;
 use syntax::parse::token;
-use syntax::symbol::InternedString;
+use syntax::symbol::{InternedString, LocalInternedString};
 use syntax::tokenstream;
 use syntax_pos::FileMap;
 
@@ -34,8 +34,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for InternedString {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
-        let s: &str = &**self;
-        s.hash_stable(hcx, hasher);
+        self.with(|s| s.hash_stable(hcx, hasher))
     }
 }
 
@@ -46,6 +45,27 @@ impl<'a> ToStableHashKey<StableHashingContext<'a>> for InternedString {
     fn to_stable_hash_key(&self,
                           _: &StableHashingContext<'a>)
                           -> InternedString {
+        self.clone()
+    }
+}
+
+impl<'a> HashStable<StableHashingContext<'a>> for LocalInternedString {
+    #[inline]
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        let s: &str = &**self;
+        s.hash_stable(hcx, hasher);
+    }
+}
+
+impl<'a> ToStableHashKey<StableHashingContext<'a>> for LocalInternedString {
+    type KeyType = LocalInternedString;
+
+    #[inline]
+    fn to_stable_hash_key(&self,
+                          _: &StableHashingContext<'a>)
+                          -> LocalInternedString {
         self.clone()
     }
 }
@@ -66,7 +86,7 @@ impl<'a> ToStableHashKey<StableHashingContext<'a>> for ast::Name {
     fn to_stable_hash_key(&self,
                           _: &StableHashingContext<'a>)
                           -> InternedString {
-        self.as_str()
+        self.as_interned_str()
     }
 }
 
@@ -82,7 +102,7 @@ impl_stable_hash_for!(enum ::syntax::ext::base::MacroKind {
 });
 
 
-impl_stable_hash_for!(enum ::syntax::abi::Abi {
+impl_stable_hash_for!(enum ::rustc_target::spec::abi::Abi {
     Cdecl,
     Stdcall,
     Fastcall,
@@ -162,7 +182,7 @@ impl_stable_hash_for!(enum ::syntax::ast::FloatTy { F32, F64 });
 impl_stable_hash_for!(enum ::syntax::ast::Unsafety { Unsafe, Normal });
 impl_stable_hash_for!(enum ::syntax::ast::Constness { Const, NotConst });
 impl_stable_hash_for!(enum ::syntax::ast::Defaultness { Default, Final });
-impl_stable_hash_for!(struct ::syntax::ast::Lifetime { id, span, ident });
+impl_stable_hash_for!(struct ::syntax::ast::Lifetime { id, ident });
 impl_stable_hash_for!(enum ::syntax::ast::StrStyle { Cooked, Raw(pounds) });
 impl_stable_hash_for!(enum ::syntax::ast::AttrStyle { Outer, Inner });
 
@@ -211,7 +231,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for ast::Attribute {
         style.hash_stable(hcx, hasher);
         path.segments.len().hash_stable(hcx, hasher);
         for segment in &path.segments {
-            segment.identifier.name.hash_stable(hcx, hasher);
+            segment.ident.name.hash_stable(hcx, hasher);
         }
         for tt in tokens.trees() {
             tt.hash_stable(hcx, hasher);
@@ -287,7 +307,6 @@ fn hash_token<'a, 'gcx, W: StableHasherResult>(
         token::Token::Pound |
         token::Token::Dollar |
         token::Token::Question |
-        token::Token::Underscore |
         token::Token::Whitespace |
         token::Token::Comment |
         token::Token::Eof => {}
@@ -319,7 +338,10 @@ fn hash_token<'a, 'gcx, W: StableHasherResult>(
             opt_name.hash_stable(hcx, hasher);
         }
 
-        token::Token::Ident(ident) |
+        token::Token::Ident(ident, is_raw) => {
+            ident.name.hash_stable(hcx, hasher);
+            is_raw.hash_stable(hcx, hasher);
+        }
         token::Token::Lifetime(ident) => ident.name.hash_stable(hcx, hasher),
 
         token::Token::Interpolated(_) => {
@@ -339,7 +361,7 @@ impl_stable_hash_for!(enum ::syntax::ast::NestedMetaItemKind {
 });
 
 impl_stable_hash_for!(struct ::syntax::ast::MetaItem {
-    name,
+    ident,
     node,
     span
 });
@@ -369,9 +391,9 @@ impl_stable_hash_for!(enum ::syntax_pos::hygiene::ExpnFormat {
 });
 
 impl_stable_hash_for!(enum ::syntax_pos::hygiene::CompilerDesugaringKind {
-    BackArrow,
     DotFill,
-    QuestionMark
+    QuestionMark,
+    Catch
 });
 
 impl_stable_hash_for!(enum ::syntax_pos::FileName {
@@ -417,24 +439,27 @@ impl<'a> HashStable<StableHashingContext<'a>> for FileMap {
         src_hash.hash_stable(hcx, hasher);
 
         // We only hash the relative position within this filemap
-        let lines = lines.borrow();
-        lines.len().hash_stable(hcx, hasher);
-        for &line in lines.iter() {
-            stable_byte_pos(line, start_pos).hash_stable(hcx, hasher);
-        }
+        lines.with_lock(|lines| {
+            lines.len().hash_stable(hcx, hasher);
+            for &line in lines.iter() {
+                stable_byte_pos(line, start_pos).hash_stable(hcx, hasher);
+            }
+        });
 
         // We only hash the relative position within this filemap
-        let multibyte_chars = multibyte_chars.borrow();
-        multibyte_chars.len().hash_stable(hcx, hasher);
-        for &char_pos in multibyte_chars.iter() {
-            stable_multibyte_char(char_pos, start_pos).hash_stable(hcx, hasher);
-        }
+        multibyte_chars.with_lock(|multibyte_chars| {
+            multibyte_chars.len().hash_stable(hcx, hasher);
+            for &char_pos in multibyte_chars.iter() {
+                stable_multibyte_char(char_pos, start_pos).hash_stable(hcx, hasher);
+            }
+        });
 
-        let non_narrow_chars = non_narrow_chars.borrow();
-        non_narrow_chars.len().hash_stable(hcx, hasher);
-        for &char_pos in non_narrow_chars.iter() {
-            stable_non_narrow_char(char_pos, start_pos).hash_stable(hcx, hasher);
-        }
+        non_narrow_chars.with_lock(|non_narrow_chars| {
+            non_narrow_chars.len().hash_stable(hcx, hasher);
+            for &char_pos in non_narrow_chars.iter() {
+                stable_non_narrow_char(char_pos, start_pos).hash_stable(hcx, hasher);
+            }
+        });
     }
 }
 

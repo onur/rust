@@ -19,7 +19,7 @@ pub use util::parser::ExprPrecedence;
 
 use syntax_pos::{Span, DUMMY_SP};
 use codemap::{respan, Spanned};
-use abi::Abi;
+use rustc_target::spec::abi::Abi;
 use ext::hygiene::{Mark, SyntaxContext};
 use print::pprust;
 use ptr::P;
@@ -36,7 +36,6 @@ use std::u32;
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
 pub struct Label {
     pub ident: Ident,
-    pub span: Span,
 }
 
 impl fmt::Debug for Label {
@@ -48,7 +47,6 @@ impl fmt::Debug for Label {
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
 pub struct Lifetime {
     pub id: NodeId,
-    pub span: Span,
     pub ident: Ident,
 }
 
@@ -82,7 +80,7 @@ pub struct Path {
 
 impl<'a> PartialEq<&'a str> for Path {
     fn eq(&self, string: &&'a str) -> bool {
-        self.segments.len() == 1 && self.segments[0].identifier.name == *string
+        self.segments.len() == 1 && self.segments[0].ident.name == *string
     }
 }
 
@@ -101,28 +99,24 @@ impl fmt::Display for Path {
 impl Path {
     // convert a span and an identifier to the corresponding
     // 1-segment path
-    pub fn from_ident(s: Span, identifier: Ident) -> Path {
-        Path {
-            span: s,
-            segments: vec![PathSegment::from_ident(identifier, s)],
-        }
+    pub fn from_ident(ident: Ident) -> Path {
+        Path { segments: vec![PathSegment::from_ident(ident)], span: ident.span }
     }
 
-    // Add starting "crate root" segment to all paths except those that
-    // already have it or start with `self`, `super`, `Self` or `$crate`.
-    pub fn default_to_global(mut self) -> Path {
-        if !self.is_global() {
-            let ident = self.segments[0].identifier;
-            if !::parse::token::Ident(ident).is_path_segment_keyword() ||
-               ident.name == keywords::Crate.name() {
-                self.segments.insert(0, PathSegment::crate_root(self.span));
+    // Make a "crate root" segment for this path unless it already has it
+    // or starts with something like `self`/`super`/`$crate`/etc.
+    pub fn make_root(&self) -> Option<PathSegment> {
+        if let Some(ident) = self.segments.get(0).map(|seg| seg.ident) {
+            if ::parse::token::is_path_segment_keyword(ident) &&
+               ident.name != keywords::Crate.name() {
+                return None;
             }
         }
-        self
+        Some(PathSegment::crate_root(self.span.shrink_to_lo()))
     }
 
     pub fn is_global(&self) -> bool {
-        !self.segments.is_empty() && self.segments[0].identifier.name == keywords::CrateRoot.name()
+        !self.segments.is_empty() && self.segments[0].ident.name == keywords::CrateRoot.name()
     }
 }
 
@@ -132,9 +126,7 @@ impl Path {
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct PathSegment {
     /// The identifier portion of this path segment.
-    pub identifier: Ident,
-    /// Span of the segment identifier.
-    pub span: Span,
+    pub ident: Ident,
 
     /// Type/lifetime parameters attached to this path. They come in
     /// two flavors: `Path<A,B,C>` and `Path(A,B) -> C`.
@@ -146,15 +138,11 @@ pub struct PathSegment {
 }
 
 impl PathSegment {
-    pub fn from_ident(ident: Ident, span: Span) -> Self {
-        PathSegment { identifier: ident, span: span, parameters: None }
+    pub fn from_ident(ident: Ident) -> Self {
+        PathSegment { ident, parameters: None }
     }
     pub fn crate_root(span: Span) -> Self {
-        PathSegment {
-            identifier: Ident { ctxt: span.ctxt(), ..keywords::CrateRoot.ident() },
-            span,
-            parameters: None,
-        }
+        PathSegment::from_ident(Ident::new(keywords::CrateRoot.name(), span))
     }
 }
 
@@ -298,7 +286,7 @@ impl TyParamBound {
     pub fn span(&self) -> Span {
         match self {
             &TraitTyParamBound(ref t, ..) => t.span,
-            &RegionTyParamBound(ref l) => l.span,
+            &RegionTyParamBound(ref l) => l.ident.span,
         }
     }
 }
@@ -320,7 +308,6 @@ pub struct TyParam {
     pub id: NodeId,
     pub bounds: TyParamBounds,
     pub default: Option<P<Ty>>,
-    pub span: Span,
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
@@ -371,7 +358,7 @@ impl Generics {
         for param in &self.params {
             if let GenericParam::Type(ref t) = *param {
                 if t.ident.name == name {
-                    return Some(t.span);
+                    return Some(t.ident.span);
                 }
             }
         }
@@ -490,7 +477,7 @@ pub enum NestedMetaItemKind {
 /// E.g. `#[test]`, `#[derive(..)]` or `#[feature = "foo"]`
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct MetaItem {
-    pub name: Name,
+    pub ident: Ident,
     pub node: MetaItemKind,
     pub span: Span,
 }
@@ -546,7 +533,7 @@ impl Pat {
         let node = match &self.node {
             PatKind::Wild => TyKind::Infer,
             PatKind::Ident(BindingMode::ByValue(Mutability::Immutable), ident, None) =>
-                TyKind::Path(None, Path::from_ident(ident.span, ident.node)),
+                TyKind::Path(None, Path::from_ident(*ident)),
             PatKind::Path(qself, path) => TyKind::Path(qself.clone(), path.clone()),
             PatKind::Mac(mac) => TyKind::Mac(mac.clone()),
             PatKind::Ref(pat, mutbl) =>
@@ -643,7 +630,7 @@ pub enum PatKind {
     /// or a unit struct/variant pattern, or a const pattern (in the last two cases the third
     /// field must be `None`). Disambiguation cannot be done with parser alone, so it happens
     /// during name resolution.
-    Ident(BindingMode, SpannedIdent, Option<P<Pat>>),
+    Ident(BindingMode, Ident, Option<P<Pat>>),
 
     /// A struct or struct variant pattern, e.g. `Variant {x, y, ..}`.
     /// The `bool` is `true` in the presence of a `..`.
@@ -834,7 +821,14 @@ impl Stmt {
 
     pub fn is_item(&self) -> bool {
         match self.node {
-            StmtKind::Local(_) => true,
+            StmtKind::Item(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_expr(&self) -> bool {
+        match self.node {
+            StmtKind::Expr(_) => true,
             _ => false,
         }
     }
@@ -908,14 +902,12 @@ pub struct Arm {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct Field {
-    pub ident: SpannedIdent,
+    pub ident: Ident,
     pub expr: P<Expr>,
     pub span: Span,
     pub is_shorthand: bool,
     pub attrs: ThinVec<Attribute>,
 }
-
-pub type SpannedIdent = Spanned<Ident>;
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
 pub enum BlockCheckMode {
@@ -1005,7 +997,6 @@ impl Expr {
     pub fn precedence(&self) -> ExprPrecedence {
         match self.node {
             ExprKind::Box(_) => ExprPrecedence::Box,
-            ExprKind::InPlace(..) => ExprPrecedence::InPlace,
             ExprKind::Array(_) => ExprPrecedence::Array,
             ExprKind::Call(..) => ExprPrecedence::Call,
             ExprKind::MethodCall(..) => ExprPrecedence::MethodCall,
@@ -1027,7 +1018,6 @@ impl Expr {
             ExprKind::Assign(..) => ExprPrecedence::Assign,
             ExprKind::AssignOp(..) => ExprPrecedence::AssignOp,
             ExprKind::Field(..) => ExprPrecedence::Field,
-            ExprKind::TupField(..) => ExprPrecedence::TupField,
             ExprKind::Index(..) => ExprPrecedence::Index,
             ExprKind::Range(..) => ExprPrecedence::Range,
             ExprKind::Path(..) => ExprPrecedence::Path,
@@ -1065,8 +1055,6 @@ pub enum RangeLimits {
 pub enum ExprKind {
     /// A `box x` expression.
     Box(P<Expr>),
-    /// First expr is the place; second expr is the value.
-    InPlace(P<Expr>, P<Expr>),
     /// An array (`[a, b, c, d]`)
     Array(Vec<P<Expr>>),
     /// A function call
@@ -1144,12 +1132,8 @@ pub enum ExprKind {
     ///
     /// For example, `a += 1`.
     AssignOp(BinOp, P<Expr>, P<Expr>),
-    /// Access of a named struct field (`obj.foo`)
-    Field(P<Expr>, SpannedIdent),
-    /// Access of an unnamed field of a struct or tuple-struct
-    ///
-    /// For example, `foo.0`.
-    TupField(P<Expr>, Spanned<usize>),
+    /// Access of a named (`obj.foo`) or unnamed (`obj.0`) struct field
+    Field(P<Expr>, Ident),
     /// An indexing operation (`foo[2]`)
     Index(P<Expr>, P<Expr>),
     /// A range (`1..2`, `1..`, `..2`, `1...2`, `1...`, `...2`)
@@ -1271,8 +1255,8 @@ pub enum StrStyle {
     Cooked,
     /// A raw string, like `r##"foo"##`
     ///
-    /// The uint is the number of `#` symbols used
-    Raw(usize)
+    /// The value is the number of `#` symbols used.
+    Raw(u16)
 }
 
 /// A literal
@@ -1690,7 +1674,7 @@ pub type ExplicitSelf = Spanned<SelfKind>;
 impl Arg {
     pub fn to_self(&self) -> Option<ExplicitSelf> {
         if let PatKind::Ident(BindingMode::ByValue(mutbl), ident, _) = self.pat.node {
-            if ident.node.name == keywords::SelfValue.name() {
+            if ident.name == keywords::SelfValue.name() {
                 return match self.ty.node {
                     TyKind::ImplicitSelf => Some(respan(self.pat.span, SelfKind::Value(mutbl))),
                     TyKind::Rptr(lt, MutTy{ref ty, mutbl}) if ty.node == TyKind::ImplicitSelf => {
@@ -1706,13 +1690,13 @@ impl Arg {
 
     pub fn is_self(&self) -> bool {
         if let PatKind::Ident(_, ident, _) = self.pat.node {
-            ident.node.name == keywords::SelfValue.name()
+            ident.name == keywords::SelfValue.name()
         } else {
             false
         }
     }
 
-    pub fn from_self(eself: ExplicitSelf, eself_ident: SpannedIdent) -> Arg {
+    pub fn from_self(eself: ExplicitSelf, eself_ident: Ident) -> Arg {
         let span = eself.span.to(eself_ident.span);
         let infer_ty = P(Ty {
             id: DUMMY_NODE_ID,
@@ -1869,7 +1853,7 @@ pub struct EnumDef {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct Variant_ {
-    pub name: Ident,
+    pub ident: Ident,
     pub attrs: Vec<Attribute>,
     pub data: VariantData,
     /// Explicit discriminant, e.g. `Foo = 1`
@@ -1878,18 +1862,35 @@ pub struct Variant_ {
 
 pub type Variant = Spanned<Variant_>;
 
+/// Part of `use` item to the right of its prefix.
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum UseTreeKind {
-    Simple(Ident),
-    Glob,
+    /// `use prefix` or `use prefix as rename`
+    Simple(Option<Ident>),
+    /// `use prefix::{...}`
     Nested(Vec<(UseTree, NodeId)>),
+    /// `use prefix::*`
+    Glob,
 }
 
+/// A tree of paths sharing common prefixes.
+/// Used in `use` items both at top-level and inside of braces in import groups.
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct UseTree {
-    pub kind: UseTreeKind,
     pub prefix: Path,
+    pub kind: UseTreeKind,
     pub span: Span,
+}
+
+impl UseTree {
+    pub fn ident(&self) -> Ident {
+        match self.kind {
+            UseTreeKind::Simple(Some(rename)) => rename,
+            UseTreeKind::Simple(None) =>
+                self.prefix.segments.last().expect("empty prefix in a simple import").ident,
+            _ => panic!("`UseTree::ident` can only be used on a simple import"),
+        }
+    }
 }
 
 /// Distinguishes between Attributes that decorate items and Attributes that
@@ -2055,7 +2056,7 @@ pub struct Item {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum ItemKind {
-    /// An `extern crate` item, with optional original crate name.
+    /// An `extern crate` item, with optional *original* crate name if the crate was renamed.
     ///
     /// E.g. `extern crate foo` or `extern crate foo_bar as foo`
     ExternCrate(Option<Name>),
@@ -2172,6 +2173,8 @@ pub enum ForeignItemKind {
     Static(P<Ty>, bool),
     /// A foreign type
     Ty,
+    /// A macro invocation
+    Macro(Mac),
 }
 
 impl ForeignItemKind {
@@ -2180,6 +2183,7 @@ impl ForeignItemKind {
             ForeignItemKind::Fn(..) => "foreign function",
             ForeignItemKind::Static(..) => "foreign static item",
             ForeignItemKind::Ty => "foreign type",
+            ForeignItemKind::Macro(..) => "macro in foreign module",
         }
     }
 }

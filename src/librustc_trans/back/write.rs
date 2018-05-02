@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use attributes;
 use back::bytecode::{self, RLIB_BYTECODE_EXTENSION};
 use back::lto::{self, ModuleBuffer, ThinBuffer};
 use back::link::{self, get_linker, remove};
@@ -42,6 +43,7 @@ use syntax_pos::MultiSpan;
 use syntax_pos::symbol::Symbol;
 use type_::Type;
 use context::{is_pie_binary, get_reloc_model};
+use common::{C_bytes_in_context, val_ty};
 use jobserver::{Client, Acquired};
 use rustc_demangle;
 
@@ -110,31 +112,6 @@ pub fn write_output_file(
     }
 }
 
-// On android, we by default compile for armv7 processors. This enables
-// things like double word CAS instructions (rather than emulating them)
-// which are *far* more efficient. This is obviously undesirable in some
-// cases, so if any sort of target feature is specified we don't append v7
-// to the feature list.
-//
-// On iOS only armv7 and newer are supported. So it is useful to
-// get all hardware potential via VFP3 (hardware floating point)
-// and NEON (SIMD) instructions supported by LLVM.
-// Note that without those flags various linking errors might
-// arise as some of intrinsics are converted into function calls
-// and nobody provides implementations those functions
-fn target_feature(sess: &Session) -> String {
-    let rustc_features = [
-        "crt-static",
-    ];
-    let requested_features = sess.opts.cg.target_feature.split(',');
-    let llvm_features = requested_features.filter(|f| {
-        !rustc_features.iter().any(|s| f.contains(s))
-    });
-    format!("{},{}",
-            sess.target.target.options.features,
-            llvm_features.collect::<Vec<_>>().join(","))
-}
-
 fn get_llvm_opt_level(optimize: config::OptLevel) -> llvm::CodeGenOptLevel {
     match optimize {
       config::OptLevel::No => llvm::CodeGenOptLevel::None,
@@ -153,13 +130,16 @@ fn get_llvm_opt_size(optimize: config::OptLevel) -> llvm::CodeGenOptSize {
     }
 }
 
-pub fn create_target_machine(sess: &Session) -> TargetMachineRef {
-    target_machine_factory(sess)().unwrap_or_else(|err| {
+pub fn create_target_machine(sess: &Session, find_features: bool) -> TargetMachineRef {
+    target_machine_factory(sess, find_features)().unwrap_or_else(|err| {
         llvm_err(sess.diagnostic(), err).raise()
     })
 }
 
-pub fn target_machine_factory(sess: &Session)
+// If find_features is true this won't access `sess.crate_types` by assuming
+// that `is_pie_binary` is false. When we discover LLVM target features
+// `sess.crate_types` is uninitialized so we cannot access it.
+pub fn target_machine_factory(sess: &Session, find_features: bool)
     -> Arc<Fn() -> Result<TargetMachineRef, String> + Send + Sync>
 {
     let reloc_model = get_reloc_model(sess);
@@ -199,8 +179,11 @@ pub fn target_machine_factory(sess: &Session)
         None => &*sess.target.target.options.cpu
     };
     let cpu = CString::new(cpu.as_bytes()).unwrap();
-    let features = CString::new(target_feature(sess).as_bytes()).unwrap();
-    let is_pie_binary = is_pie_binary(sess);
+    let features = attributes::llvm_target_features(sess)
+        .collect::<Vec<_>>()
+        .join(",");
+    let features = CString::new(features).unwrap();
+    let is_pie_binary = !find_features && is_pie_binary(sess);
     let trap_unreachable = sess.target.target.options.trap_unreachable;
 
     Arc::new(move || {
@@ -239,6 +222,9 @@ pub struct ModuleConfig {
     /// Some(level) to optimize binary size, or None to not affect program size.
     opt_size: Option<llvm::CodeGenOptSize>,
 
+    pgo_gen: Option<String>,
+    pgo_use: String,
+
     // Flags indicating which outputs to produce.
     emit_no_opt_bc: bool,
     emit_bc: bool,
@@ -262,6 +248,8 @@ pub struct ModuleConfig {
     // emscripten's ecc compiler, when used as the linker.
     obj_is_bitcode: bool,
     no_integrated_as: bool,
+    embed_bitcode: bool,
+    embed_bitcode_marker: bool,
 }
 
 impl ModuleConfig {
@@ -271,6 +259,9 @@ impl ModuleConfig {
             opt_level: None,
             opt_size: None,
 
+            pgo_gen: None,
+            pgo_use: String::new(),
+
             emit_no_opt_bc: false,
             emit_bc: false,
             emit_bc_compressed: false,
@@ -279,6 +270,8 @@ impl ModuleConfig {
             emit_asm: false,
             emit_obj: false,
             obj_is_bitcode: false,
+            embed_bitcode: false,
+            embed_bitcode_marker: false,
             no_integrated_as: false,
 
             no_verify: false,
@@ -299,6 +292,17 @@ impl ModuleConfig {
         self.time_passes = sess.time_passes();
         self.inline_threshold = sess.opts.cg.inline_threshold;
         self.obj_is_bitcode = sess.target.target.options.obj_is_bitcode;
+        let embed_bitcode = sess.target.target.options.embed_bitcode ||
+            sess.opts.debugging_opts.embed_bitcode;
+        if embed_bitcode {
+            match sess.opts.optimize {
+                config::OptLevel::No |
+                config::OptLevel::Less => {
+                    self.embed_bitcode_marker = embed_bitcode;
+                }
+                _ => self.embed_bitcode = embed_bitcode,
+            }
+        }
 
         // Copy what clang does by turning on loop vectorization at O2 and
         // slp vectorization at O3. Otherwise configure other optimization aspects
@@ -476,8 +480,13 @@ unsafe extern "C" fn diagnostic_handler(info: DiagnosticInfoRef, user: *mut c_vo
                                                 opt.message));
             }
         }
-
-        _ => (),
+        llvm::diagnostic::PGO(diagnostic_ref) => {
+            let msg = llvm::build_string(|s| {
+                llvm::LLVMRustWriteDiagnosticInfoToString(diagnostic_ref, s)
+            }).expect("non-UTF8 PGO diagnostic");
+            diag_handler.warn(&msg);
+        }
+        llvm::diagnostic::UnknownDiagnostic(..) => {},
     }
 }
 
@@ -662,7 +671,7 @@ unsafe fn codegen(cgcx: &CodegenContext,
     let obj_out = cgcx.output_filenames.temp_path(OutputType::Object, module_name);
 
 
-    if write_bc || config.emit_bc_compressed {
+    if write_bc || config.emit_bc_compressed || config.embed_bitcode {
         let thin;
         let old;
         let data = if llvm::LLVMRustThinLTOAvailable() {
@@ -681,6 +690,11 @@ unsafe fn codegen(cgcx: &CodegenContext,
             timeline.record("write-bc");
         }
 
+        if config.embed_bitcode {
+            embed_bitcode(cgcx, llcx, llmod, Some(data));
+            timeline.record("embed-bc");
+        }
+
         if config.emit_bc_compressed {
             let dst = bc_out.with_extension(RLIB_BYTECODE_EXTENSION);
             let data = bytecode::encode(&mtrans.llmod_id, data);
@@ -689,6 +703,8 @@ unsafe fn codegen(cgcx: &CodegenContext,
             }
             timeline.record("compress-bc");
         }
+    } else if config.embed_bitcode_marker {
+        embed_bitcode(cgcx, llcx, llmod, None);
     }
 
     time_ext(config.time_passes, None, &format!("codegen passes [{}]", module_name.unwrap()),
@@ -796,6 +812,59 @@ unsafe fn codegen(cgcx: &CodegenContext,
                                    &cgcx.output_filenames))
 }
 
+/// Embed the bitcode of an LLVM module in the LLVM module itself.
+///
+/// This is done primarily for iOS where it appears to be standard to compile C
+/// code at least with `-fembed-bitcode` which creates two sections in the
+/// executable:
+///
+/// * __LLVM,__bitcode
+/// * __LLVM,__cmdline
+///
+/// It appears *both* of these sections are necessary to get the linker to
+/// recognize what's going on. For us though we just always throw in an empty
+/// cmdline section.
+///
+/// Furthermore debug/O1 builds don't actually embed bitcode but rather just
+/// embed an empty section.
+///
+/// Basically all of this is us attempting to follow in the footsteps of clang
+/// on iOS. See #35968 for lots more info.
+unsafe fn embed_bitcode(cgcx: &CodegenContext,
+                        llcx: ContextRef,
+                        llmod: ModuleRef,
+                        bitcode: Option<&[u8]>) {
+    let llconst = C_bytes_in_context(llcx, bitcode.unwrap_or(&[]));
+    let llglobal = llvm::LLVMAddGlobal(
+        llmod,
+        val_ty(llconst).to_ref(),
+        "rustc.embedded.module\0".as_ptr() as *const _,
+    );
+    llvm::LLVMSetInitializer(llglobal, llconst);
+    let section = if cgcx.opts.target_triple.triple().contains("-ios") {
+        "__LLVM,__bitcode\0"
+    } else {
+        ".llvmbc\0"
+    };
+    llvm::LLVMSetSection(llglobal, section.as_ptr() as *const _);
+    llvm::LLVMRustSetLinkage(llglobal, llvm::Linkage::PrivateLinkage);
+
+    let llconst = C_bytes_in_context(llcx, &[]);
+    let llglobal = llvm::LLVMAddGlobal(
+        llmod,
+        val_ty(llconst).to_ref(),
+        "rustc.embedded.cmdline\0".as_ptr() as *const _,
+    );
+    llvm::LLVMSetInitializer(llglobal, llconst);
+    let section = if cgcx.opts.target_triple.triple().contains("-ios") {
+        "__LLVM,__cmdline\0"
+    } else {
+        ".llvmcmd\0"
+    };
+    llvm::LLVMSetSection(llglobal, section.as_ptr() as *const _);
+    llvm::LLVMRustSetLinkage(llglobal, llvm::Linkage::PrivateLinkage);
+}
+
 pub(crate) struct CompiledModules {
     pub modules: Vec<CompiledModule>,
     pub metadata_module: CompiledModule,
@@ -856,6 +925,9 @@ pub fn start_async_translation(tcx: TyCtxt,
         modules_config.passes.push("insert-gcov-profiling".to_owned())
     }
 
+    modules_config.pgo_gen = sess.opts.debugging_opts.pgo_gen.clone();
+    modules_config.pgo_use = sess.opts.debugging_opts.pgo_use.clone();
+
     modules_config.opt_level = Some(get_llvm_opt_level(sess.opts.optimize));
     modules_config.opt_size = Some(get_llvm_opt_size(sess.opts.optimize));
 
@@ -914,13 +986,6 @@ pub fn start_async_translation(tcx: TyCtxt,
     metadata_config.time_passes = false;
     allocator_config.time_passes = false;
 
-    let client = sess.jobserver_from_env.clone().unwrap_or_else(|| {
-        // Pick a "reasonable maximum" if we don't otherwise have a jobserver in
-        // our environment, capping out at 32 so we don't take everything down
-        // by hogging the process run queue.
-        Client::new(32).expect("failed to create jobserver")
-    });
-
     let (shared_emitter, shared_emitter_main) = SharedEmitter::new();
     let (trans_worker_send, trans_worker_receive) = channel();
 
@@ -930,7 +995,7 @@ pub fn start_async_translation(tcx: TyCtxt,
                                                   trans_worker_send,
                                                   coordinator_receive,
                                                   total_cgus,
-                                                  client,
+                                                  sess.jobserver.clone(),
                                                   time_graph.clone(),
                                                   Arc::new(modules_config),
                                                   Arc::new(metadata_config),
@@ -945,7 +1010,7 @@ pub fn start_async_translation(tcx: TyCtxt,
         crate_info,
 
         time_graph,
-        coordinator_send: tcx.tx_to_llvm_workers.clone(),
+        coordinator_send: tcx.tx_to_llvm_workers.lock().clone(),
         trans_worker_receive,
         shared_emitter_main,
         future: coordinator_thread,
@@ -1338,7 +1403,7 @@ fn start_executing_work(tcx: TyCtxt,
                         metadata_config: Arc<ModuleConfig>,
                         allocator_config: Arc<ModuleConfig>)
                         -> thread::JoinHandle<Result<CompiledModules, ()>> {
-    let coordinator_send = tcx.tx_to_llvm_workers.clone();
+    let coordinator_send = tcx.tx_to_llvm_workers.lock().clone();
     let sess = tcx.sess;
 
     // Compute the set of symbols we need to retain when doing LTO (if we need to)
@@ -1420,7 +1485,7 @@ fn start_executing_work(tcx: TyCtxt,
         regular_module_config: modules_config,
         metadata_module_config: metadata_config,
         allocator_module_config: allocator_config,
-        tm_factory: target_machine_factory(tcx.sess),
+        tm_factory: target_machine_factory(tcx.sess, false),
         total_cgus,
         msvc_imps_needed: msvc_imps_needed(tcx),
         target_pointer_width: tcx.sess.target.target.target_pointer_width.clone(),
@@ -1970,6 +2035,8 @@ pub unsafe fn with_llvm_pmb(llmod: ModuleRef,
                             config: &ModuleConfig,
                             opt_level: llvm::CodeGenOptLevel,
                             f: &mut FnMut(llvm::PassManagerBuilderRef)) {
+    use std::ptr;
+
     // Create the PassManagerBuilder for LLVM. We configure it with
     // reasonable defaults and prepare it to actually populate the pass
     // manager.
@@ -1977,11 +2044,27 @@ pub unsafe fn with_llvm_pmb(llmod: ModuleRef,
     let opt_size = config.opt_size.unwrap_or(llvm::CodeGenOptSizeNone);
     let inline_threshold = config.inline_threshold;
 
-    llvm::LLVMRustConfigurePassManagerBuilder(builder,
-                                              opt_level,
-                                              config.merge_functions,
-                                              config.vectorize_slp,
-                                              config.vectorize_loop);
+    let pgo_gen_path = config.pgo_gen.as_ref().map(|s| {
+        let s = if s.is_empty() { "default_%m.profraw" } else { s };
+        CString::new(s.as_bytes()).unwrap()
+    });
+
+    let pgo_use_path = if config.pgo_use.is_empty() {
+        None
+    } else {
+        Some(CString::new(config.pgo_use.as_bytes()).unwrap())
+    };
+
+    llvm::LLVMRustConfigurePassManagerBuilder(
+        builder,
+        opt_level,
+        config.merge_functions,
+        config.vectorize_slp,
+        config.vectorize_loop,
+        pgo_gen_path.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+        pgo_use_path.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+    );
+
     llvm::LLVMPassManagerBuilderSetSizeLevel(builder, opt_size as u32);
 
     if opt_size != llvm::CodeGenOptSizeNone {
@@ -2232,7 +2315,7 @@ pub(crate) fn submit_translated_module_to_llvm(tcx: TyCtxt,
                                                mtrans: ModuleTranslation,
                                                cost: u64) {
     let llvm_work_item = WorkItem::Optimize(mtrans);
-    drop(tcx.tx_to_llvm_workers.send(Box::new(Message::TranslationDone {
+    drop(tcx.tx_to_llvm_workers.lock().send(Box::new(Message::TranslationDone {
         llvm_work_item,
         cost,
     })));

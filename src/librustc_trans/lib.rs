@@ -17,29 +17,23 @@
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 #![feature(custom_attribute)]
 #![feature(fs_read_write)]
 #![allow(unused_attributes)]
-#![feature(i128_type)]
-#![feature(i128)]
-#![cfg_attr(stage0, feature(inclusive_range_syntax))]
 #![feature(libc)]
 #![feature(quote)]
+#![feature(range_contains)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(slice_patterns)]
-#![feature(conservative_impl_trait)]
+#![feature(slice_sort_by_cached_key)]
 #![feature(optin_builtin_traits)]
-#![feature(inclusive_range_fields)]
+#![feature(inclusive_range_methods)]
 
 use rustc::dep_graph::WorkProduct;
 use syntax_pos::symbol::Symbol;
 
-#[macro_use]
-extern crate bitflags;
 extern crate flate2;
 extern crate libc;
 #[macro_use] extern crate rustc;
@@ -48,8 +42,7 @@ extern crate num_cpus;
 extern crate rustc_mir;
 extern crate rustc_allocator;
 extern crate rustc_apfloat;
-extern crate rustc_back;
-extern crate rustc_const_math;
+extern crate rustc_target;
 #[macro_use] extern crate rustc_data_structures;
 extern crate rustc_demangle;
 extern crate rustc_incremental;
@@ -72,12 +65,14 @@ pub use llvm_util::target_features;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::collections::BTreeMap;
 use rustc_data_structures::sync::Lrc;
 
 use rustc::dep_graph::DepGraph;
 use rustc::hir::def_id::CrateNum;
 use rustc::middle::cstore::MetadataLoader;
 use rustc::middle::cstore::{NativeLibrary, CrateSource, LibSource};
+use rustc::middle::lang_items::LangItem;
 use rustc::session::{Session, CompileIncomplete};
 use rustc::session::config::{OutputFilenames, OutputType, PrintRequest};
 use rustc::ty::{self, TyCtxt};
@@ -98,6 +93,7 @@ mod back {
     pub mod symbol_export;
     pub mod write;
     mod rpath;
+    mod wasm;
 }
 
 mod abi;
@@ -106,24 +102,6 @@ mod asm;
 mod attributes;
 mod base;
 mod builder;
-mod cabi_aarch64;
-mod cabi_arm;
-mod cabi_asmjs;
-mod cabi_hexagon;
-mod cabi_mips;
-mod cabi_mips64;
-mod cabi_msp430;
-mod cabi_nvptx;
-mod cabi_nvptx64;
-mod cabi_powerpc;
-mod cabi_powerpc64;
-mod cabi_s390x;
-mod cabi_sparc;
-mod cabi_sparc64;
-mod cabi_x86;
-mod cabi_x86_64;
-mod cabi_x86_win64;
-mod cabi_wasm32;
 mod callee;
 mod common;
 mod consts;
@@ -201,7 +179,7 @@ impl TransCrate for LlvmTransCrate {
         target_features(sess)
     }
 
-    fn metadata_loader(&self) -> Box<MetadataLoader> {
+    fn metadata_loader(&self) -> Box<MetadataLoader + Sync> {
         box metadata::LlvmMetadataLoader
     }
 
@@ -214,6 +192,8 @@ impl TransCrate for LlvmTransCrate {
 
     fn provide_extern(&self, providers: &mut ty::maps::Providers) {
         back::symbol_export::provide_extern(providers);
+        base::provide_extern(providers);
+        attributes::provide_extern(providers);
     }
 
     fn trans_crate<'a, 'tcx>(
@@ -400,6 +380,10 @@ struct CrateInfo {
     used_crate_source: FxHashMap<CrateNum, Lrc<CrateSource>>,
     used_crates_static: Vec<(CrateNum, LibSource)>,
     used_crates_dynamic: Vec<(CrateNum, LibSource)>,
+    wasm_custom_sections: BTreeMap<String, Vec<u8>>,
+    wasm_imports: FxHashMap<String, String>,
+    lang_item_to_crate: FxHashMap<LangItem, CrateNum>,
+    missing_lang_items: FxHashMap<CrateNum, Vec<LangItem>>,
 }
 
 __build_diagnostic_array! { librustc_trans, DIAGNOSTICS }

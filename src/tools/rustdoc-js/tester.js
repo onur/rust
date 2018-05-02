@@ -144,6 +144,7 @@ function main(argv) {
     var toolchain = argv[2];
 
     var mainJs = readFile("build/" + toolchain + "/doc/main.js");
+    var ALIASES = readFile("build/" + toolchain + "/doc/aliases.js");
     var searchIndex = readFile("build/" + toolchain + "/doc/search-index.js").split("\n");
     if (searchIndex[searchIndex.length - 1].length === 0) {
         searchIndex.pop();
@@ -157,9 +158,11 @@ function main(argv) {
     // execQuery first parameter is built in getQuery (which takes in the search input).
     // execQuery last parameter is built in buildIndex.
     // buildIndex requires the hashmap from search-index.
-    var functionsToLoad = ["levenshtein", "validateResult", "getQuery", "buildIndex", "execQuery"];
+    var functionsToLoad = ["levenshtein", "validateResult", "getQuery", "buildIndex", "execQuery",
+                           "execSearch"];
 
     finalJS += 'window = { "currentCrate": "std" };\n';
+    finalJS += ALIASES;
     finalJS += loadThings(arraysToLoad, 'array', extractArrayVariable, mainJs);
     finalJS += loadThings(variablesToLoad, 'variable', extractVariable, mainJs);
     finalJS += loadThings(functionsToLoad, 'function', extractFunction, mainJs);
@@ -174,7 +177,7 @@ function main(argv) {
                                'exports.QUERY = QUERY;exports.EXPECTED = EXPECTED;');
         const expected = loadedFile.EXPECTED;
         const query = loadedFile.QUERY;
-        var results = loaded.execQuery(loaded.getQuery(query), index);
+        var results = loaded.execSearch(loaded.getQuery(query), index);
         process.stdout.write('Checking "' + file + '" ... ');
         var error_text = [];
         for (var key in expected) {

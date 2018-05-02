@@ -9,6 +9,8 @@
 // except according to those terms.
 
 #[doc(primitive = "bool")]
+#[doc(alias = "true")]
+#[doc(alias = "false")]
 //
 /// The boolean type.
 ///
@@ -68,6 +70,7 @@
 mod prim_bool { }
 
 #[doc(primitive = "never")]
+#[doc(alias = "!")]
 //
 /// The `!` type, also called "never".
 ///
@@ -79,6 +82,7 @@ mod prim_bool { }
 /// write:
 ///
 /// ```
+/// #![feature(never_type)]
 /// # fn foo() -> u32 {
 /// let x: ! = {
 ///     return 123
@@ -155,6 +159,7 @@ mod prim_bool { }
 /// for example:
 ///
 /// ```
+/// #![feature(never_type)]
 /// # use std::fmt;
 /// # trait Debug {
 /// # fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result;
@@ -499,6 +504,9 @@ mod prim_pointer { }
 mod prim_array { }
 
 #[doc(primitive = "slice")]
+#[doc(alias = "[")]
+#[doc(alias = "]")]
+#[doc(alias = "[]")]
 //
 /// A dynamically-sized view into a contiguous sequence, `[T]`.
 ///
@@ -597,6 +605,9 @@ mod prim_slice { }
 mod prim_str { }
 
 #[doc(primitive = "tuple")]
+#[doc(alias = "(")]
+#[doc(alias = ")")]
+#[doc(alias = "()")]
 //
 /// A finite heterogeneous sequence, `(T, U, ..)`.
 ///
@@ -751,7 +762,7 @@ mod prim_i64 { }
 /// The 128-bit signed integer type.
 ///
 /// *[See also the `std::i128` module](i128/index.html).*
-#[unstable(feature = "i128", issue="35118")]
+#[stable(feature = "i128", since="1.26.0")]
 mod prim_i128 { }
 
 #[doc(primitive = "u8")]
@@ -791,7 +802,7 @@ mod prim_u64 { }
 /// The 128-bit unsigned integer type.
 ///
 /// *[See also the `std::u128` module](u128/index.html).*
-#[unstable(feature = "i128", issue="35118")]
+#[stable(feature = "i128", since="1.26.0")]
 mod prim_u128 { }
 
 #[doc(primitive = "isize")]
@@ -819,6 +830,7 @@ mod prim_isize { }
 mod prim_usize { }
 
 #[doc(primitive = "reference")]
+#[doc(alias = "&")]
 //
 /// References, both shared and mutable.
 ///

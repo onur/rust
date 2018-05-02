@@ -128,7 +128,7 @@ fn borrowck<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, owner_def_id: DefId)
     // Note that `mir_validated` is a "stealable" result; the
     // thief, `optimized_mir()`, forces borrowck, so we know that
     // is not yet stolen.
-    tcx.mir_validated(owner_def_id).borrow();
+    ty::maps::queries::mir_validated::ensure(tcx, owner_def_id);
 
     // option dance because you can't capture an uninitialized variable
     // by mut-ref.
@@ -144,7 +144,10 @@ fn borrowck<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, owner_def_id: DefId)
     {
         check_loans::check_loans(&mut bccx, &loan_dfcx, &flowed_moves, &all_loans, body);
     }
-    unused::check(&mut bccx, body);
+
+    if !tcx.use_mir_borrowck() {
+        unused::check(&mut bccx, body);
+    }
 
     Lrc::new(BorrowCheckResult {
         used_mut_nodes: bccx.used_mut_nodes.into_inner(),
@@ -253,28 +256,28 @@ pub struct BorrowckCtxt<'a, 'tcx: 'a> {
     used_mut_nodes: RefCell<FxHashSet<HirId>>,
 }
 
-impl<'b, 'tcx: 'b> BorrowckErrors for BorrowckCtxt<'b, 'tcx> {
-    fn struct_span_err_with_code<'a, S: Into<MultiSpan>>(&'a self,
-                                                         sp: S,
-                                                         msg: &str,
-                                                         code: DiagnosticId)
-                                                         -> DiagnosticBuilder<'a>
+impl<'a, 'b, 'tcx: 'b> BorrowckErrors<'a> for &'a BorrowckCtxt<'b, 'tcx> {
+    fn struct_span_err_with_code<S: Into<MultiSpan>>(self,
+                                                     sp: S,
+                                                     msg: &str,
+                                                     code: DiagnosticId)
+                                                     -> DiagnosticBuilder<'a>
     {
         self.tcx.sess.struct_span_err_with_code(sp, msg, code)
     }
 
-    fn struct_span_err<'a, S: Into<MultiSpan>>(&'a self,
-                                               sp: S,
-                                               msg: &str)
-                                               -> DiagnosticBuilder<'a>
+    fn struct_span_err<S: Into<MultiSpan>>(self,
+                                           sp: S,
+                                           msg: &str)
+                                           -> DiagnosticBuilder<'a>
     {
         self.tcx.sess.struct_span_err(sp, msg)
     }
 
-    fn cancel_if_wrong_origin<'a>(&'a self,
-                                mut diag: DiagnosticBuilder<'a>,
-                                o: Origin)
-                                -> DiagnosticBuilder<'a>
+    fn cancel_if_wrong_origin(self,
+                              mut diag: DiagnosticBuilder<'a>,
+                              o: Origin)
+                              -> DiagnosticBuilder<'a>
     {
         if !o.should_emit_errors(self.tcx.borrowck_mode()) {
             self.tcx.sess.diagnostic().cancel(&mut diag);
@@ -370,7 +373,7 @@ const DOWNCAST_PRINTED_OPERATOR: &'static str = " as ";
 // is tracked is irrelevant here.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteriorKind {
-    InteriorField(mc::FieldName),
+    InteriorField(mc::FieldIndex),
     InteriorElement,
 }
 
@@ -1336,18 +1339,10 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                 out.push(')');
             }
 
-            LpExtend(ref lp_base, _, LpInterior(_, InteriorField(fname))) => {
+            LpExtend(ref lp_base, _, LpInterior(_, InteriorField(mc::FieldIndex(_, info)))) => {
                 self.append_autoderefd_loan_path_to_string(&lp_base, out);
-                match fname {
-                    mc::NamedField(fname) => {
-                        out.push('.');
-                        out.push_str(&fname.as_str());
-                    }
-                    mc::PositionalField(idx) => {
-                        out.push('.');
-                        out.push_str(&idx.to_string());
-                    }
-                }
+                out.push('.');
+                out.push_str(&info.as_str());
             }
 
             LpExtend(ref lp_base, _, LpInterior(_, InteriorElement)) => {
@@ -1422,8 +1417,7 @@ impl DataFlowOperator for LoanDataFlowOperator {
 impl<'tcx> fmt::Debug for InteriorKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            InteriorField(mc::NamedField(fld)) => write!(f, "{}", fld),
-            InteriorField(mc::PositionalField(i)) => write!(f, "#{}", i),
+            InteriorField(mc::FieldIndex(_, info)) => write!(f, "{}", info),
             InteriorElement => write!(f, "[]"),
         }
     }

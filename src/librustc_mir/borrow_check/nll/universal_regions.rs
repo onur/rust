@@ -259,18 +259,18 @@ impl<'tcx> UniversalRegions<'tcx> {
 
     /// True if `r` is a member of this set of universal regions.
     pub fn is_universal_region(&self, r: RegionVid) -> bool {
-        (FIRST_GLOBAL_INDEX..self.num_universals).contains(r.index())
+        (FIRST_GLOBAL_INDEX..self.num_universals).contains(&r.index())
     }
 
     /// Classifies `r` as a universal region, returning `None` if this
     /// is not a member of this set of universal regions.
     pub fn region_classification(&self, r: RegionVid) -> Option<RegionClassification> {
         let index = r.index();
-        if (FIRST_GLOBAL_INDEX..self.first_extern_index).contains(index) {
+        if (FIRST_GLOBAL_INDEX..self.first_extern_index).contains(&index) {
             Some(RegionClassification::Global)
-        } else if (self.first_extern_index..self.first_local_index).contains(index) {
+        } else if (self.first_extern_index..self.first_local_index).contains(&index) {
             Some(RegionClassification::External)
-        } else if (self.first_local_index..self.num_universals).contains(index) {
+        } else if (self.first_local_index..self.num_universals).contains(&index) {
             Some(RegionClassification::Local)
         } else {
             None
@@ -777,6 +777,11 @@ impl<'cx, 'gcx, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'cx, 'gcx, 'tcx> {
     where
         T: TypeFoldable<'tcx>,
     {
+        debug!(
+            "replace_bound_regions_with_nll_infer_vars(value={:?}, all_outlive_scope={:?})",
+            value,
+            all_outlive_scope,
+        );
         let (value, _map) = self.tcx.replace_late_bound_regions(value, |br| {
             let liberated_region = self.tcx.mk_region(ty::ReFree(ty::FreeRegion {
                 scope: all_outlive_scope,
@@ -784,6 +789,7 @@ impl<'cx, 'gcx, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'cx, 'gcx, 'tcx> {
             }));
             let region_vid = self.next_nll_region_var(origin);
             indices.insert_late_bound_region(liberated_region, region_vid.to_region_vid());
+            debug!("liberated_region={:?} => {:?}", liberated_region, region_vid);
             region_vid
         });
         value

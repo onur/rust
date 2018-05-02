@@ -31,12 +31,17 @@ use rustc_data_structures::sync::Lrc;
 
 pub use self::MethodError::*;
 pub use self::CandidateSource::*;
+pub use self::suggest::TraitInfo;
 
 mod confirm;
 pub mod probe;
 mod suggest;
 
 use self::probe::{IsSuggestion, ProbeScope};
+
+pub fn provide(providers: &mut ty::maps::Providers) {
+    suggest::provide(providers);
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MethodCallee<'tcx> {
@@ -171,7 +176,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                         .unwrap().insert(import_def_id);
         }
 
-        self.tcx.check_stability(pick.item.def_id, call_expr.id, span);
+        self.tcx.check_stability(pick.item.def_id, Some(call_expr.id), span);
 
         let result = self.confirm_method(span,
                                          self_expr,
@@ -257,7 +262,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             } else if let Some(ref input_types) = opt_input_types {
                 input_types[def.index as usize - 1]
             } else {
-                self.type_var_for_def(ty::UniverseIndex::ROOT, span, def)
+                self.type_var_for_def(span, def)
             }
         });
 
@@ -272,8 +277,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                      poly_trait_ref.to_predicate());
 
         // Now we want to know if this can be matched
-        let mut selcx = traits::SelectionContext::new(self);
-        if !selcx.evaluate_obligation(&obligation) {
+        if !self.predicate_may_hold(&obligation) {
             debug!("--> Cannot match obligation");
             return None; // Cannot be matched, no such method resolution is possible.
         }
@@ -331,7 +335,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                                            &bounds));
 
         // Also add an obligation for the method type being well-formed.
-        let method_ty = tcx.mk_fn_ptr(ty::Binder(fn_sig));
+        let method_ty = tcx.mk_fn_ptr(ty::Binder::bind(fn_sig));
         debug!("lookup_in_trait_adjusted: matched method method_ty={:?} obligation={:?}",
                method_ty,
                obligation);
@@ -371,7 +375,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         }
 
         let def = pick.item.def();
-        self.tcx.check_stability(def.def_id(), expr_id, span);
+        self.tcx.check_stability(def.def_id(), Some(expr_id), span);
 
         Ok(def)
     }

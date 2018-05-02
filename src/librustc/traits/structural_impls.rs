@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use rustc_data_structures::accumulate_vec::AccumulateVec;
 use traits;
 use traits::project::Normalized;
 use ty::{self, Lift, TyCtxt};
@@ -176,6 +177,7 @@ impl<'a, 'tcx> Lift<'tcx> for traits::SelectionError<'a> {
             super::ConstEvalFailure(ref err) => {
                 tcx.lift(err).map(super::ConstEvalFailure)
             }
+            super::Overflow => bug!() // FIXME: ape ConstEvalFailure?
         }
     }
 }
@@ -424,4 +426,186 @@ BraceStructTypeFoldableImpl! {
         value,
         obligations
     } where T: TypeFoldable<'tcx>
+}
+
+impl<'tcx> fmt::Display for traits::WhereClauseAtom<'tcx> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use traits::WhereClauseAtom::*;
+
+        match self {
+            Implemented(trait_ref) => write!(fmt, "Implemented({})", trait_ref),
+            ProjectionEq(projection) => write!(fmt, "ProjectionEq({})", projection),
+        }
+    }
+}
+
+impl<'tcx> fmt::Display for traits::DomainGoal<'tcx> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use traits::DomainGoal::*;
+        use traits::WhereClauseAtom::*;
+
+        match self {
+            Holds(wc) => write!(fmt, "{}", wc),
+            WellFormed(Implemented(trait_ref)) => write!(fmt, "WellFormed({})", trait_ref),
+            WellFormed(ProjectionEq(projection)) => write!(fmt, "WellFormed({})", projection),
+            FromEnv(Implemented(trait_ref)) => write!(fmt, "FromEnv({})", trait_ref),
+            FromEnv(ProjectionEq(projection)) => write!(fmt, "FromEnv({})", projection),
+            WellFormedTy(ty) => write!(fmt, "WellFormed({})", ty),
+            Normalize(projection) => write!(fmt, "Normalize({})", projection),
+            FromEnvTy(ty) => write!(fmt, "FromEnv({})", ty),
+            RegionOutlives(predicate) => write!(fmt, "RegionOutlives({})", predicate),
+            TypeOutlives(predicate) => write!(fmt, "TypeOutlives({})", predicate),
+        }
+    }
+}
+
+impl fmt::Display for traits::QuantifierKind {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use traits::QuantifierKind::*;
+
+        match self {
+            Universal => write!(fmt, "forall"),
+            Existential => write!(fmt, "exists"),
+        }
+    }
+}
+
+impl<'tcx> fmt::Display for traits::Goal<'tcx> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use traits::Goal::*;
+
+        match self {
+            Implies(hypotheses, goal) => {
+                write!(fmt, "if (")?;
+                for (index, hyp) in hypotheses.iter().enumerate() {
+                    if index > 0 {
+                        write!(fmt, ", ")?;
+                    }
+                    write!(fmt, "{}", hyp)?;
+                }
+                write!(fmt, ") {{ {} }}", goal)
+            }
+            And(goal1, goal2) => write!(fmt, "({} && {})", goal1, goal2),
+            Not(goal) => write!(fmt, "not {{ {} }}", goal),
+            DomainGoal(goal) => write!(fmt, "{}", goal),
+            Quantified(qkind, goal) => {
+                // FIXME: appropriate binder names
+                write!(fmt, "{}<> {{ {} }}", qkind, goal.skip_binder())
+            }
+            CannotProve => write!(fmt, "CannotProve"),
+        }
+    }
+}
+
+impl<'tcx> fmt::Display for traits::ProgramClause<'tcx> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let traits::ProgramClause { goal, hypotheses } = self;
+        write!(fmt, "{}", goal)?;
+        if !hypotheses.is_empty() {
+            write!(fmt, " :- ")?;
+            for (index, condition) in hypotheses.iter().enumerate() {
+                if index > 0 {
+                    write!(fmt, ", ")?;
+                }
+                write!(fmt, "{}", condition)?;
+            }
+        }
+        write!(fmt, ".")
+    }
+}
+
+impl<'tcx> fmt::Display for traits::Clause<'tcx> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use traits::Clause::*;
+
+        match self {
+            Implies(clause) => write!(fmt, "{}", clause),
+            ForAll(clause) => {
+                // FIXME: appropriate binder names
+                write!(fmt, "forall<> {{ {} }}", clause.skip_binder())
+            }
+        }
+    }
+}
+
+EnumTypeFoldableImpl! {
+    impl<'tcx> TypeFoldable<'tcx> for traits::WhereClauseAtom<'tcx> {
+        (traits::WhereClauseAtom::Implemented)(trait_ref),
+        (traits::WhereClauseAtom::ProjectionEq)(projection),
+    }
+}
+
+EnumTypeFoldableImpl! {
+    impl<'tcx> TypeFoldable<'tcx> for traits::DomainGoal<'tcx> {
+        (traits::DomainGoal::Holds)(wc),
+        (traits::DomainGoal::WellFormed)(wc),
+        (traits::DomainGoal::FromEnv)(wc),
+        (traits::DomainGoal::WellFormedTy)(ty),
+        (traits::DomainGoal::Normalize)(projection),
+        (traits::DomainGoal::FromEnvTy)(ty),
+        (traits::DomainGoal::RegionOutlives)(predicate),
+        (traits::DomainGoal::TypeOutlives)(predicate),
+    }
+}
+
+CloneTypeFoldableImpls! {
+    traits::QuantifierKind,
+}
+
+EnumTypeFoldableImpl! {
+    impl<'tcx> TypeFoldable<'tcx> for traits::Goal<'tcx> {
+        (traits::Goal::Implies)(hypotheses, goal),
+        (traits::Goal::And)(goal1, goal2),
+        (traits::Goal::Not)(goal),
+        (traits::Goal::DomainGoal)(domain_goal),
+        (traits::Goal::Quantified)(qkind, goal),
+        (traits::Goal::CannotProve),
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::Slice<traits::Goal<'tcx>> {
+    fn super_fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, folder: &mut F) -> Self {
+        let v = self.iter().map(|t| t.fold_with(folder)).collect::<AccumulateVec<[_; 8]>>();
+        folder.tcx().intern_goals(&v)
+    }
+
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> bool {
+        self.iter().any(|t| t.visit_with(visitor))
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for &'tcx traits::Goal<'tcx> {
+    fn super_fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, folder: &mut F) -> Self {
+        let v = (**self).fold_with(folder);
+        folder.tcx().mk_goal(v)
+    }
+
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> bool {
+        (**self).visit_with(visitor)
+    }
+}
+
+BraceStructTypeFoldableImpl! {
+    impl<'tcx> TypeFoldable<'tcx> for traits::ProgramClause<'tcx> {
+        goal,
+        hypotheses
+    }
+}
+
+EnumTypeFoldableImpl! {
+    impl<'tcx> TypeFoldable<'tcx> for traits::Clause<'tcx> {
+        (traits::Clause::Implies)(clause),
+        (traits::Clause::ForAll)(clause),
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::Slice<traits::Clause<'tcx>> {
+    fn super_fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, folder: &mut F) -> Self {
+        let v = self.iter().map(|t| t.fold_with(folder)).collect::<AccumulateVec<[_; 8]>>();
+        folder.tcx().intern_clauses(&v)
+    }
+
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> bool {
+        self.iter().any(|t| t.visit_with(visitor))
+    }
 }

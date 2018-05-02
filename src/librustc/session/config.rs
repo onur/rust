@@ -16,19 +16,21 @@ pub use self::CrateType::*;
 pub use self::Passes::*;
 pub use self::DebugInfoLevel::*;
 
+use std::str::FromStr;
+
 use session::{early_error, early_warn, Session};
 use session::search_paths::SearchPaths;
 
 use ich::StableHashingContext;
-use rustc_back::{LinkerFlavor, PanicStrategy, RelroLevel};
-use rustc_back::target::Target;
+use rustc_target::spec::{LinkerFlavor, PanicStrategy, RelroLevel};
+use rustc_target::spec::{Target, TargetTriple};
 use rustc_data_structures::stable_hasher::ToStableHashKey;
 use lint;
 use middle::cstore;
 
 use syntax::ast::{self, IntTy, UintTy};
 use syntax::codemap::{FileName, FilePathMapping};
-use syntax::epoch::Epoch;
+use syntax::edition::{Edition, EDITION_NAME_LIST, DEFAULT_EDITION};
 use syntax::parse::token;
 use syntax::parse;
 use syntax::symbol::Symbol;
@@ -47,7 +49,7 @@ use std::hash::Hasher;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::iter::FromIterator;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct Config {
     pub target: Target,
@@ -246,6 +248,10 @@ impl OutputTypes {
         self.0.values()
     }
 
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     // True if any of the output types require codegen or linking.
     pub fn should_trans(&self) -> bool {
         self.0.keys().any(|k| match *k {
@@ -367,7 +373,7 @@ top_level_options!(
         libs: Vec<(String, Option<String>, Option<cstore::NativeLibraryKind>)> [TRACKED],
         maybe_sysroot: Option<PathBuf> [TRACKED],
 
-        target_triple: String [TRACKED],
+        target_triple: TargetTriple [TRACKED],
 
         test: bool [TRACKED],
         error_format: ErrorOutputType [UNTRACKED],
@@ -385,7 +391,7 @@ top_level_options!(
         externs: Externs [UNTRACKED],
         crate_name: Option<String> [TRACKED],
         // An optional name to use as the crate for std during std injection,
-        // written `extern crate std = "name"`. Default to "std". Used by
+        // written `extern crate name as std`. Defaults to `std`. Used by
         // out-of-tree drivers.
         alt_std_name: Option<String> [TRACKED],
         // Indicates how the compiler should treat unstable features
@@ -406,6 +412,7 @@ top_level_options!(
 
         // Remap source path prefixes in all output (messages, object files, debug, etc)
         remap_path_prefix: Vec<(PathBuf, PathBuf)> [UNTRACKED],
+        edition: Edition [TRACKED],
     }
 );
 
@@ -567,7 +574,7 @@ pub fn basic_options() -> Options {
         output_types: OutputTypes(BTreeMap::new()),
         search_paths: SearchPaths::new(),
         maybe_sysroot: None,
-        target_triple: host_triple().to_string(),
+        target_triple: TargetTriple::from_triple(host_triple()),
         test: false,
         incremental: None,
         debugging_opts: basic_debugging_options(),
@@ -585,6 +592,7 @@ pub fn basic_options() -> Options {
         cli_forced_codegen_units: None,
         cli_forced_thinlto_off: false,
         remap_path_prefix: Vec::new(),
+        edition: DEFAULT_EDITION,
     }
 }
 
@@ -614,13 +622,11 @@ impl Options {
 
 // The type of entry function, so
 // users can have their own entry
-// functions that don't start a
-// scheduler
+// functions
 #[derive(Copy, Clone, PartialEq)]
 pub enum EntryFnType {
     EntryMain,
     EntryStart,
-    EntryNone,
 }
 
 #[derive(Copy, PartialEq, PartialOrd, Clone, Ord, Eq, Hash, Debug)]
@@ -764,23 +770,20 @@ macro_rules! options {
         pub const parse_sanitizer: Option<&'static str> =
             Some("one of: `address`, `leak`, `memory` or `thread`");
         pub const parse_linker_flavor: Option<&'static str> =
-            Some(::rustc_back::LinkerFlavor::one_of());
+            Some(::rustc_target::spec::LinkerFlavor::one_of());
         pub const parse_optimization_fuel: Option<&'static str> =
             Some("crate=integer");
         pub const parse_unpretty: Option<&'static str> =
             Some("`string` or `string=string`");
         pub const parse_lto: Option<&'static str> =
             Some("one of `thin`, `fat`, or omitted");
-        pub const parse_epoch: Option<&'static str> =
-            Some("one of: `2015`, `2018`");
     }
 
     #[allow(dead_code)]
     mod $mod_set {
         use super::{$struct_name, Passes, SomePasses, AllPasses, Sanitizer, Lto};
-        use rustc_back::{LinkerFlavor, PanicStrategy, RelroLevel};
+        use rustc_target::spec::{LinkerFlavor, PanicStrategy, RelroLevel};
         use std::path::PathBuf;
-        use syntax::epoch::Epoch;
 
         $(
             pub fn $opt(cg: &mut $struct_name, v: Option<&str>) -> bool {
@@ -983,20 +986,6 @@ macro_rules! options {
             true
         }
 
-        fn parse_epoch(slot: &mut Epoch, v: Option<&str>) -> bool {
-            match v {
-                Some(s) => {
-                    let epoch = s.parse();
-                    if let Ok(parsed) = epoch {
-                        *slot = parsed;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        }
     }
 ) }
 
@@ -1064,6 +1053,8 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
          2 = full debug info with variable and type information"),
     opt_level: Option<String> = (None, parse_opt_string, [TRACKED],
         "optimize with possible levels 0-3, s, or z"),
+    force_frame_pointers: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "force use of the frame pointers"),
     debug_assertions: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "explicitly enable the cfg(debug_assertions) directive"),
     inline_threshold: Option<usize> = (None, parse_opt_uint, [TRACKED],
@@ -1208,6 +1199,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "set the MIR optimization level (0-3, default: 1)"),
     mutable_noalias: bool = (false, parse_bool, [UNTRACKED],
           "emit noalias metadata for mutable references"),
+    arg_align_attributes: bool = (false, parse_bool, [UNTRACKED],
+          "emit align metadata for reference arguments"),
     dump_mir: Option<String> = (None, parse_opt_string, [UNTRACKED],
           "dump MIR state at various points in translation"),
     dump_mir_dir: String = (String::from("mir_dump"), parse_string, [UNTRACKED],
@@ -1227,8 +1220,6 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "print some statistics about MIR"),
     always_encode_mir: bool = (false, parse_bool, [TRACKED],
           "encode MIR of all functions into the crate metadata"),
-    miri: bool = (false, parse_bool, [TRACKED],
-          "check the miri const evaluator against the old ctfe"),
     osx_rpath_install_name: bool = (false, parse_bool, [TRACKED],
           "pass `-install_name @rpath/...` to the macOS linker"),
     sanitizer: Option<Sanitizer> = (None, parse_sanitizer, [TRACKED],
@@ -1247,10 +1238,20 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "extra arguments to prepend to the linker invocation (space separated)"),
     profile: bool = (false, parse_bool, [TRACKED],
                      "insert profiling code"),
+    pgo_gen: Option<String> = (None, parse_opt_string, [TRACKED],
+        "Generate PGO profile data, to a given file, or to the default \
+         location if it's empty."),
+    pgo_use: String = (String::new(), parse_string, [TRACKED],
+        "Use PGO profile data from the given profile file."),
+    disable_instrumentation_preinliner: bool =
+        (false, parse_bool, [TRACKED], "Disable the instrumentation pre-inliner, \
+        useful for profiling / PGO."),
     relro_level: Option<RelroLevel> = (None, parse_relro_level, [TRACKED],
         "choose which RELRO level to use"),
-    nll: bool = (false, parse_bool, [UNTRACKED],
-                 "run the non-lexical lifetimes MIR pass"),
+    nll_subminimal_causes: bool = (false, parse_bool, [UNTRACKED],
+        "when tracking region error causes, accept subminimal results for faster execution."),
+    disable_nll_user_type_assert: bool = (false, parse_bool, [UNTRACKED],
+        "disable user provided type assertion in NLL"),
     trans_time_graph: bool = (false, parse_bool, [UNTRACKED],
         "generate a graphical HTML report of time spent in trans and LLVM"),
     thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -1271,7 +1272,7 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     dep_info_omit_d_target: bool = (false, parse_bool, [TRACKED],
         "in dep-info output, omit targets for tracking dependencies of the dep-info files \
          themselves"),
-    approximate_suggestions: bool = (false, parse_bool, [UNTRACKED],
+    suggestion_applicability: bool = (false, parse_bool, [UNTRACKED],
         "include machine-applicability of suggestions in JSON output"),
     unpretty: Option<String> = (None, parse_unpretty, [UNTRACKED],
         "Present the input source, unstable (and less-pretty) variants;
@@ -1280,14 +1281,18 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         `everybody_loops` (all function bodies replaced with `loop {}`),
         `hir` (the HIR), `hir,identified`, or
         `hir,typed` (HIR with types for each node)."),
-    epoch: Epoch = (Epoch::Epoch2015, parse_epoch, [TRACKED],
-        "The epoch to build Rust with. Newer epochs may include features
-         that require breaking changes. The default epoch is 2015 (the first
-         epoch). Crates compiled with different epochs can be linked together."),
     run_dsymutil: Option<bool> = (None, parse_opt_bool, [TRACKED],
           "run `dsymutil` and delete intermediate object files"),
     ui_testing: bool = (false, parse_bool, [UNTRACKED],
           "format compiler diagnostics in a way that's better suitable for UI testing"),
+    embed_bitcode: bool = (false, parse_bool, [TRACKED],
+          "embed LLVM bitcode in object files"),
+    strip_debuginfo_if_disabled: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "tell the linker to strip debuginfo when building without debuginfo enabled."),
+    share_generics: Option<bool> = (None, parse_opt_bool, [TRACKED],
+          "make the current crate share its generic instantiations"),
+    chalk: bool = (false, parse_bool, [TRACKED],
+          "enable the experimental Chalk-based trait solving engine"),
 }
 
 pub fn default_lib_output() -> CrateType {
@@ -1639,6 +1644,12 @@ pub fn rustc_optgroups() -> Vec<RustcOptGroup> {
                   `expanded,identified` (fully parenthesized, AST nodes with IDs).",
             "TYPE",
         ),
+        opt::opt_s(
+            "",
+            "edition",
+            "Specify which edition of the compiler to use when compiling code.",
+            EDITION_NAME_LIST,
+        ),
         opt::multi_s(
             "",
             "remap-path-prefix",
@@ -1668,12 +1679,12 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> ast::CrateConfig {
             } else if meta_item.is_meta_item_list() {
                 let msg = format!(
                     "invalid predicate in --cfg command line argument: `{}`",
-                    meta_item.name()
+                    meta_item.ident
                 );
                 early_error(ErrorOutputType::default(), &msg)
             }
 
-            (meta_item.name(), meta_item.value_str())
+            (meta_item.ident.name, meta_item.value_str())
         })
         .collect::<ast::CrateConfig>()
 }
@@ -1697,6 +1708,34 @@ pub fn build_session_options_and_crate_config(
             ),
         ),
     };
+
+    let edition = match matches.opt_str("edition") {
+        Some(arg) => match Edition::from_str(&arg){
+            Ok(edition) => edition,
+            Err(_) => early_error(
+                ErrorOutputType::default(),
+                &format!(
+                    "argument for --edition must be one of: \
+                    {}. (instead was `{}`)",
+                    EDITION_NAME_LIST,
+                    arg
+                ),
+            ),
+        }
+        None => DEFAULT_EDITION,
+    };
+
+    if !edition.is_stable() && !nightly_options::is_nightly_build() {
+        early_error(
+                ErrorOutputType::default(),
+                &format!(
+                    "Edition {} is unstable an only\
+                    available for nightly builds of rustc.",
+                    edition,
+                )
+        )
+    }
+
 
     // We need the opts_present check because the driver will send us Matches
     // with only stable options if no unstable options are used. Since error-format
@@ -1763,6 +1802,13 @@ pub fn build_session_options_and_crate_config(
         early_error(
             ErrorOutputType::Json(false),
             "--error-format=pretty-json is unstable",
+        );
+    }
+
+    if debugging_opts.pgo_gen.is_some() && !debugging_opts.pgo_use.is_empty() {
+        early_error(
+            error_format,
+            "options `-Z pgo-gen` and `-Z pgo-use` are exclusive",
         );
     }
 
@@ -1837,6 +1883,13 @@ pub fn build_session_options_and_crate_config(
         );
     }
 
+    if debugging_opts.query_threads.unwrap_or(1) > 1 && debugging_opts.fuel.is_some() {
+        early_error(
+            error_format,
+            "Optimization fuel is incompatible with multiple query threads",
+        );
+    }
+
     if codegen_units == Some(0) {
         early_error(
             error_format,
@@ -1900,9 +1953,21 @@ pub fn build_session_options_and_crate_config(
     let cg = cg;
 
     let sysroot_opt = matches.opt_str("sysroot").map(|m| PathBuf::from(&m));
-    let target = matches
-        .opt_str("target")
-        .unwrap_or(host_triple().to_string());
+    let target_triple = if let Some(target) = matches.opt_str("target") {
+        if target.ends_with(".json") {
+            let path = Path::new(&target);
+            match TargetTriple::from_path(&path) {
+                Ok(triple) => triple,
+                Err(_) => {
+                    early_error(error_format, &format!("target file {:?} does not exist", path))
+                }
+            }
+        } else {
+            TargetTriple::TargetTriple(target)
+        }
+    } else {
+        TargetTriple::from_triple(host_triple())
+    };
     let opt_level = {
         if matches.opt_present("O") {
             if cg.opt_level.is_some() {
@@ -2110,7 +2175,7 @@ pub fn build_session_options_and_crate_config(
             output_types: OutputTypes(output_types),
             search_paths,
             maybe_sysroot: sysroot_opt,
-            target_triple: target,
+            target_triple,
             test,
             incremental,
             debugging_opts,
@@ -2128,6 +2193,7 @@ pub fn build_session_options_and_crate_config(
             cli_forced_codegen_units: codegen_units,
             cli_forced_thinlto_off: disable_thinlto,
             remap_path_prefix,
+            edition,
         },
         cfg,
     )
@@ -2257,10 +2323,11 @@ mod dep_tracking {
     use std::hash::Hash;
     use std::path::PathBuf;
     use std::collections::hash_map::DefaultHasher;
-    use super::{CrateType, DebugInfoLevel, Epoch, ErrorOutputType, Lto, OptLevel, OutputTypes,
+    use super::{CrateType, DebugInfoLevel, ErrorOutputType, Lto, OptLevel, OutputTypes,
                 Passes, Sanitizer};
     use syntax::feature_gate::UnstableFeatures;
-    use rustc_back::{PanicStrategy, RelroLevel};
+    use rustc_target::spec::{PanicStrategy, RelroLevel, TargetTriple};
+    use syntax::edition::Edition;
 
     pub trait DepTrackingHash {
         fn hash(&self, hasher: &mut DefaultHasher, error_format: ErrorOutputType);
@@ -2319,7 +2386,8 @@ mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(cstore::NativeLibraryKind);
     impl_dep_tracking_hash_via_hash!(Sanitizer);
     impl_dep_tracking_hash_via_hash!(Option<Sanitizer>);
-    impl_dep_tracking_hash_via_hash!(Epoch);
+    impl_dep_tracking_hash_via_hash!(TargetTriple);
+    impl_dep_tracking_hash_via_hash!(Edition);
 
     impl_dep_tracking_hash_for_sortable_vec_of!(String);
     impl_dep_tracking_hash_for_sortable_vec_of!(PathBuf);
@@ -2390,8 +2458,9 @@ mod tests {
     use std::iter::FromIterator;
     use std::path::PathBuf;
     use super::{Externs, OutputType, OutputTypes};
-    use rustc_back::{PanicStrategy, RelroLevel};
+    use rustc_target::spec::{PanicStrategy, RelroLevel};
     use syntax::symbol::Symbol;
+    use syntax::edition::{Edition, DEFAULT_EDITION};
     use syntax;
 
     fn optgroups() -> getopts::Options {
@@ -2880,6 +2949,14 @@ mod tests {
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
+        opts.debugging_opts.pgo_gen = Some(String::from("abc"));
+        assert_ne!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
+
+        opts = reference.clone();
+        opts.debugging_opts.pgo_use = String::from("abc");
+        assert_ne!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
+
+        opts = reference.clone();
         opts.cg.metadata = vec![String::from("A"), String::from("B")];
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
@@ -2889,6 +2966,10 @@ mod tests {
 
         opts = reference.clone();
         opts.cg.debuginfo = Some(0xba5eba11);
+        assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
+
+        opts = reference.clone();
+        opts.cg.force_frame_pointers = Some(false);
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
@@ -3027,5 +3108,18 @@ mod tests {
         opts = reference.clone();
         opts.debugging_opts.relro_level = Some(RelroLevel::Full);
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
+    }
+
+    #[test]
+    fn test_edition_parsing() {
+        // test default edition
+        let options = super::basic_options();
+        assert!(options.edition == DEFAULT_EDITION);
+
+        let matches = optgroups()
+            .parse(&["--edition=2018".to_string()])
+            .unwrap();
+        let (sessopts, _) = build_session_options_and_crate_config(&matches);
+        assert!(sessopts.edition == Edition::Edition2018)
     }
 }

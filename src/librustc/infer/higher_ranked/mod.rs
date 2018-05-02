@@ -19,7 +19,7 @@ use super::{CombinedSnapshot,
 use super::combine::CombineFields;
 use super::region_constraints::{TaintDirections};
 
-use std::collections::BTreeMap;
+use rustc_data_structures::lazy_btree_map::LazyBTreeMap;
 use ty::{self, TyCtxt, Binder, TypeFoldable};
 use ty::error::TypeError;
 use ty::relate::{Relate, RelateResult, TypeRelation};
@@ -80,7 +80,7 @@ impl<'a, 'gcx, 'tcx> CombineFields<'a, 'gcx, 'tcx> {
 
             debug!("higher_ranked_sub: OK result={:?}", result);
 
-            Ok(ty::Binder(result))
+            Ok(ty::Binder::bind(result))
         });
     }
 
@@ -239,7 +239,7 @@ impl<'a, 'gcx, 'tcx> CombineFields<'a, 'gcx, 'tcx> {
                    b,
                    result1);
 
-            Ok(ty::Binder(result1))
+            Ok(ty::Binder::bind(result1))
         });
 
         fn generalize_region<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
@@ -247,7 +247,8 @@ impl<'a, 'gcx, 'tcx> CombineFields<'a, 'gcx, 'tcx> {
                                              snapshot: &CombinedSnapshot<'a, 'tcx>,
                                              debruijn: ty::DebruijnIndex,
                                              new_vars: &[ty::RegionVid],
-                                             a_map: &BTreeMap<ty::BoundRegion, ty::Region<'tcx>>,
+                                             a_map: &LazyBTreeMap<ty::BoundRegion,
+                                                                  ty::Region<'tcx>>,
                                              r0: ty::Region<'tcx>)
                                              -> ty::Region<'tcx> {
             // Regions that pre-dated the LUB computation stay as they are.
@@ -335,7 +336,7 @@ impl<'a, 'gcx, 'tcx> CombineFields<'a, 'gcx, 'tcx> {
                    b,
                    result1);
 
-            Ok(ty::Binder(result1))
+            Ok(ty::Binder::bind(result1))
         });
 
         fn generalize_region<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
@@ -343,7 +344,8 @@ impl<'a, 'gcx, 'tcx> CombineFields<'a, 'gcx, 'tcx> {
                                              snapshot: &CombinedSnapshot<'a, 'tcx>,
                                              debruijn: ty::DebruijnIndex,
                                              new_vars: &[ty::RegionVid],
-                                             a_map: &BTreeMap<ty::BoundRegion, ty::Region<'tcx>>,
+                                             a_map: &LazyBTreeMap<ty::BoundRegion,
+                                                                  ty::Region<'tcx>>,
                                              a_vars: &[ty::RegionVid],
                                              b_vars: &[ty::RegionVid],
                                              r0: ty::Region<'tcx>)
@@ -412,7 +414,7 @@ impl<'a, 'gcx, 'tcx> CombineFields<'a, 'gcx, 'tcx> {
 
         fn rev_lookup<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
                                       span: Span,
-                                      a_map: &BTreeMap<ty::BoundRegion, ty::Region<'tcx>>,
+                                      a_map: &LazyBTreeMap<ty::BoundRegion, ty::Region<'tcx>>,
                                       r: ty::Region<'tcx>) -> ty::Region<'tcx>
         {
             for (a_br, a_r) in a_map {
@@ -435,7 +437,7 @@ impl<'a, 'gcx, 'tcx> CombineFields<'a, 'gcx, 'tcx> {
 }
 
 fn var_ids<'a, 'gcx, 'tcx>(fields: &CombineFields<'a, 'gcx, 'tcx>,
-                           map: &BTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
+                           map: &LazyBTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
                            -> Vec<ty::RegionVid> {
     map.iter()
        .map(|(_, &r)| match *r {
@@ -580,7 +582,10 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     /// the pop occurs as part of the rollback, so an explicit call is not
     /// needed (but is also permitted).
     ///
-    /// See `README.md` for more details.
+    /// For more information about how skolemization for HRTBs works, see
+    /// the [rustc guide].
+    ///
+    /// [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/trait-hrtb.html
     pub fn skolemize_late_bound_regions<T>(&self,
                                            binder: &ty::Binder<T>,
                                            snapshot: &CombinedSnapshot<'a, 'tcx>)

@@ -44,6 +44,7 @@ o("debug", "rust.debug", "debug mode; disables optimization unless `--enable-opt
 o("docs", "build.docs", "build standard library documentation")
 o("compiler-docs", "build.compiler-docs", "build compiler documentation")
 o("optimize-tests", "rust.optimize-tests", "build tests with optimizations")
+o("experimental-parallel-queries", "rust.experimental-parallel-queries", "build rustc with experimental parallelization")
 o("test-miri", "rust.test-miri", "run miri's test suite")
 o("debuginfo-tests", "rust.debuginfo-tests", "build tests with debugger metadata")
 o("quiet-tests", "rust.quiet-tests", "enable quieter output when running tests")
@@ -78,6 +79,7 @@ o("llvm-release-debuginfo", "llvm.release-debuginfo", "build LLVM with debugger 
 o("debuginfo", "rust.debuginfo", "build with debugger metadata")
 o("debuginfo-lines", "rust.debuginfo-lines", "build with line number debugger metadata")
 o("debuginfo-only-std", "rust.debuginfo-only-std", "build only libstd with debugging information")
+o("debuginfo-tools", "rust.debuginfo-tools", "build extended tools with debugging information")
 o("debug-jemalloc", "rust.debug-jemalloc", "build jemalloc with --enable-debug --enable-fill")
 v("save-toolstates", "rust.save-toolstates", "save build and test status of external tools into this file")
 
@@ -144,7 +146,7 @@ o("jemalloc", "rust.use-jemalloc", "build liballoc with jemalloc")
 o("full-bootstrap", "build.full-bootstrap", "build three compilers instead of two")
 o("extended", "build.extended", "build an extended rust tool set")
 
-v("tools", "build.tools", "List of extended tools will be installed")
+v("tools", None, "List of extended tools will be installed")
 v("build", "build.build", "GNUs ./configure syntax LLVM build triple")
 v("host", None, "GNUs ./configure syntax LLVM host triples")
 v("target", None, "GNUs ./configure syntax LLVM target triples")
@@ -320,6 +322,8 @@ for key in known_args:
         set('target.{}.llvm-config'.format(build()), value + '/bin/llvm-config')
     elif option.name == 'jemalloc-root':
         set('target.{}.jemalloc'.format(build()), value + '/libjemalloc_pic.a')
+    elif option.name == 'tools':
+        set('build.tools', value.split(','))
     elif option.name == 'host':
         set('build.host', value.split(','))
     elif option.name == 'target':

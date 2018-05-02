@@ -628,8 +628,6 @@ impl<T> Option<T> {
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(option_filter)]
-    ///
     /// fn is_even(n: &i32) -> bool {
     ///     n % 2 == 0
     /// }
@@ -639,7 +637,7 @@ impl<T> Option<T> {
     /// assert_eq!(Some(4).filter(is_even), Some(4));
     /// ```
     #[inline]
-    #[unstable(feature = "option_filter", issue = "45860")]
+    #[stable(feature = "option_filter", since = "1.27.0")]
     pub fn filter<P: FnOnce(&T) -> bool>(self, predicate: P) -> Self {
         if let Some(x) = self {
             if predicate(&x) {
@@ -1186,6 +1184,16 @@ impl<A, V: FromIterator<A>> FromIterator<Option<A>> for Option<V> {
                         None
                     }
                     None => None,
+                }
+            }
+
+            #[inline]
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                if self.found_none {
+                    (0, Some(0))
+                } else {
+                    let (_, upper) = self.iter.size_hint();
+                    (0, upper)
                 }
             }
         }

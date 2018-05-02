@@ -200,7 +200,7 @@ pub fn parse(
                 let span = match trees.next() {
                     Some(tokenstream::TokenTree::Token(span, token::Colon)) => match trees.next() {
                         Some(tokenstream::TokenTree::Token(end_sp, ref tok)) => match tok.ident() {
-                            Some(kind) => {
+                            Some((kind, _)) => {
                                 let span = end_sp.with_lo(start_sp.lo());
                                 result.push(TokenTree::MetaVarDecl(span, ident, kind));
                                 continue;
@@ -289,14 +289,11 @@ where
             // `tree` is followed by an `ident`. This could be `$meta_var` or the `$crate` special
             // metavariable that names the crate of the invokation.
             Some(tokenstream::TokenTree::Token(ident_span, ref token)) if token.is_ident() => {
-                let ident = token.ident().unwrap();
+                let (ident, is_raw) = token.ident().unwrap();
                 let span = ident_span.with_lo(span.lo());
-                if ident.name == keywords::Crate.name() {
-                    let ident = ast::Ident {
-                        name: keywords::DollarCrate.name(),
-                        ..ident
-                    };
-                    TokenTree::Token(span, token::Ident(ident))
+                if ident.name == keywords::Crate.name() && !is_raw {
+                    let ident = ast::Ident::new(keywords::DollarCrate.name(), ident.span);
+                    TokenTree::Token(span, token::Ident(ident, is_raw))
                 } else {
                     TokenTree::MetaVar(span, ident)
                 }
@@ -389,71 +386,25 @@ where
 {
     // We basically look at two token trees here, denoted as #1 and #2 below
     let span = match parse_kleene_op(input, span) {
-        // #1 is a `+` or `*` KleeneOp
-        //
-        // `?` is ambiguous: it could be a separator or a Kleene::ZeroOrOne, so we need to look
-        // ahead one more token to be sure.
-        Ok(Ok(op)) if op != KleeneOp::ZeroOrOne => return (None, op),
-
-        // #1 is `?` token, but it could be a Kleene::ZeroOrOne without a separator or it could
-        // be a `?` separator followed by any Kleene operator. We need to look ahead 1 token to
-        // find out which.
-        Ok(Ok(op)) => {
-            assert_eq!(op, KleeneOp::ZeroOrOne);
-
-            // Lookahead at #2. If it is a KleenOp, then #1 is a separator.
-            let is_1_sep = if let Some(&tokenstream::TokenTree::Token(_, ref tok2)) = input.peek() {
-                kleene_op(tok2).is_some()
-            } else {
-                false
-            };
-
-            if is_1_sep {
-                // #1 is a separator and #2 should be a KleepeOp::*
-                // (N.B. We need to advance the input iterator.)
-                match parse_kleene_op(input, span) {
-                    // #2 is a KleeneOp (this is the only valid option) :)
-                    Ok(Ok(op)) if op == KleeneOp::ZeroOrOne => {
-                        if !features.macro_at_most_once_rep
-                            && !attr::contains_name(attrs, "allow_internal_unstable")
-                        {
-                            let explain = feature_gate::EXPLAIN_MACRO_AT_MOST_ONCE_REP;
-                            emit_feature_err(
-                                sess,
-                                "macro_at_most_once_rep",
-                                span,
-                                GateIssue::Language,
-                                explain,
-                            );
-                        }
-                        return (Some(token::Question), op);
-                    }
-                    Ok(Ok(op)) => return (Some(token::Question), op),
-
-                    // #2 is a random token (this is an error) :(
-                    Ok(Err((_, span))) => span,
-
-                    // #2 is not even a token at all :(
-                    Err(span) => span,
-                }
-            } else {
-                if !features.macro_at_most_once_rep
-                    && !attr::contains_name(attrs, "allow_internal_unstable")
-                {
-                    let explain = feature_gate::EXPLAIN_MACRO_AT_MOST_ONCE_REP;
-                    emit_feature_err(
-                        sess,
-                        "macro_at_most_once_rep",
-                        span,
-                        GateIssue::Language,
-                        explain,
-                    );
-                }
-
-                // #2 is a random tree and #1 is KleeneOp::ZeroOrOne
-                return (None, op);
+        // #1 is any KleeneOp (`?`)
+        Ok(Ok(op)) if op == KleeneOp::ZeroOrOne => {
+            if !features.macro_at_most_once_rep
+                && !attr::contains_name(attrs, "allow_internal_unstable")
+            {
+                let explain = feature_gate::EXPLAIN_MACRO_AT_MOST_ONCE_REP;
+                emit_feature_err(
+                    sess,
+                    "macro_at_most_once_rep",
+                    span,
+                    GateIssue::Language,
+                    explain,
+                );
             }
+            return (None, op);
         }
+
+        // #1 is any KleeneOp (`+`, `*`)
+        Ok(Ok(op)) => return (None, op),
 
         // #1 is a separator followed by #2, a KleeneOp
         Ok(Err((tok, span))) => match parse_kleene_op(input, span) {
@@ -470,8 +421,11 @@ where
                         GateIssue::Language,
                         explain,
                     );
+                } else {
+                    sess.span_diagnostic
+                        .span_err(span, "`?` macro repetition does not allow a separator");
                 }
-                return (Some(tok), op);
+                return (None, op);
             }
             Ok(Ok(op)) => return (Some(tok), op),
 
@@ -486,9 +440,7 @@ where
         Err(span) => span,
     };
 
-    if !features.macro_at_most_once_rep
-        && !attr::contains_name(attrs, "allow_internal_unstable")
-    {
+    if !features.macro_at_most_once_rep && !attr::contains_name(attrs, "allow_internal_unstable") {
         sess.span_diagnostic
             .span_err(span, "expected one of: `*`, `+`, or `?`");
     } else {

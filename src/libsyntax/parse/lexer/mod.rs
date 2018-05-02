@@ -14,8 +14,8 @@ use codemap::{CodeMap, FilePathMapping};
 use errors::{FatalError, DiagnosticBuilder};
 use parse::{token, ParseSess};
 use str::char_at;
-use symbol::Symbol;
-use std_unicode::property::Pattern_White_Space;
+use symbol::{Symbol, keywords};
+use core::unicode::property::Pattern_White_Space;
 
 use std::borrow::Cow;
 use std::char;
@@ -34,7 +34,7 @@ pub struct TokenAndSpan {
 
 impl Default for TokenAndSpan {
     fn default() -> Self {
-        TokenAndSpan { tok: token::Underscore, sp: syntax_pos::DUMMY_SP }
+        TokenAndSpan { tok: token::Whitespace, sp: syntax_pos::DUMMY_SP }
     }
 }
 
@@ -76,7 +76,7 @@ impl<'a> StringReader<'a> {
     fn mk_ident(&self, string: &str) -> Ident {
         let mut ident = Ident::from_str(string);
         if let Some(span) = self.override_span {
-            ident.ctxt = span.ctxt();
+            ident.span = span;
         }
         ident
     }
@@ -126,19 +126,19 @@ impl<'a> StringReader<'a> {
     pub fn try_next_token(&mut self) -> Result<TokenAndSpan, ()> {
         assert!(self.fatal_errs.is_empty());
         let ret_val = TokenAndSpan {
-            tok: replace(&mut self.peek_tok, token::Underscore),
+            tok: replace(&mut self.peek_tok, token::Whitespace),
             sp: self.peek_span,
         };
         self.advance_token()?;
         Ok(ret_val)
     }
 
-    fn fail_unterminated_raw_string(&self, pos: BytePos, hash_count: usize) {
+    fn fail_unterminated_raw_string(&self, pos: BytePos, hash_count: u16) {
         let mut err = self.struct_span_fatal(pos, pos, "unterminated raw string");
         err.span_label(self.mk_sp(pos, pos), "unterminated raw string");
         if hash_count > 0 {
             err.note(&format!("this raw string should be terminated with `\"{}`",
-                              "#".repeat(hash_count)));
+                              "#".repeat(hash_count as usize)));
         }
         err.emit();
         FatalError.raise();
@@ -214,7 +214,7 @@ impl<'a> StringReader<'a> {
 
         // Make the range zero-length if the span is invalid.
         if span.lo() > span.hi() || begin.fm.start_pos != end.fm.start_pos {
-            span = span.with_hi(span.lo());
+            span = span.shrink_to_lo();
         }
 
         let mut sr = StringReader::new_raw_internal(sess, begin.fm);
@@ -611,7 +611,7 @@ impl<'a> StringReader<'a> {
                 // I guess this is the only way to figure out if
                 // we're at the beginning of the file...
                 let cmap = CodeMap::new(FilePathMapping::empty());
-                cmap.files.borrow_mut().push(self.filemap.clone());
+                cmap.files.borrow_mut().file_maps.push(self.filemap.clone());
                 let loc = cmap.lookup_char_pos_adj(self.pos);
                 debug!("Skipping a shebang");
                 if loc.line == 1 && loc.col == CharPos(0) {
@@ -1115,32 +1115,53 @@ impl<'a> StringReader<'a> {
     /// token, and updates the interner
     fn next_token_inner(&mut self) -> Result<token::Token, ()> {
         let c = self.ch;
-        if ident_start(c) &&
-           match (c.unwrap(), self.nextch(), self.nextnextch()) {
-            // Note: r as in r" or r#" is part of a raw string literal,
-            // b as in b' is part of a byte literal.
-            // They are not identifiers, and are handled further down.
-            ('r', Some('"'), _) |
-            ('r', Some('#'), _) |
-            ('b', Some('"'), _) |
-            ('b', Some('\''), _) |
-            ('b', Some('r'), Some('"')) |
-            ('b', Some('r'), Some('#')) => false,
-            _ => true,
-        } {
-            let start = self.pos;
-            while ident_continue(self.ch) {
-                self.bump();
-            }
 
-            return Ok(self.with_str_from(start, |string| {
-                if string == "_" {
-                    token::Underscore
-                } else {
-                    // FIXME: perform NFKC normalization here. (Issue #2253)
-                    token::Ident(self.mk_ident(string))
+        if ident_start(c) {
+            let (is_ident_start, is_raw_ident) =
+                match (c.unwrap(), self.nextch(), self.nextnextch()) {
+                    // r# followed by an identifier starter is a raw identifier.
+                    // This is an exception to the r# case below.
+                    ('r', Some('#'), x) if ident_start(x) => (true, true),
+                    // r as in r" or r#" is part of a raw string literal.
+                    // b as in b' is part of a byte literal.
+                    // They are not identifiers, and are handled further down.
+                    ('r', Some('"'), _) |
+                    ('r', Some('#'), _) |
+                    ('b', Some('"'), _) |
+                    ('b', Some('\''), _) |
+                    ('b', Some('r'), Some('"')) |
+                    ('b', Some('r'), Some('#')) => (false, false),
+                    _ => (true, false),
+                };
+            if is_ident_start {
+                let raw_start = self.pos;
+                if is_raw_ident {
+                    // Consume the 'r#' characters.
+                    self.bump();
+                    self.bump();
                 }
-            }));
+
+                let start = self.pos;
+                while ident_continue(self.ch) {
+                    self.bump();
+                }
+
+                return Ok(self.with_str_from(start, |string| {
+                    // FIXME: perform NFKC normalization here. (Issue #2253)
+                    let ident = self.mk_ident(string);
+                    if is_raw_ident && (token::is_path_segment_keyword(ident) ||
+                                        ident.name == keywords::Underscore.name()) {
+                        self.fatal_span_(raw_start, self.pos,
+                            &format!("`r#{}` is not currently supported.", ident.name)
+                        ).raise();
+                    }
+                    if is_raw_ident {
+                        let span = self.mk_sp(raw_start, self.pos);
+                        self.sess.raw_identifier_spans.borrow_mut().push(span);
+                    }
+                    token::Ident(ident, is_raw_ident)
+                }));
+            }
         }
 
         if is_dec_digit(c) {
@@ -1418,7 +1439,7 @@ impl<'a> StringReader<'a> {
             'r' => {
                 let start_bpos = self.pos;
                 self.bump();
-                let mut hash_count = 0;
+                let mut hash_count: u16 = 0;
                 while self.ch_is('#') {
                     self.bump();
                     hash_count += 1;
@@ -1760,7 +1781,6 @@ mod tests {
     use errors;
     use feature_gate::UnstableFeatures;
     use parse::token;
-    use std::cell::RefCell;
     use std::collections::HashSet;
     use std::io;
     use std::path::PathBuf;
@@ -1776,11 +1796,12 @@ mod tests {
             span_diagnostic: errors::Handler::with_emitter(true, false, Box::new(emitter)),
             unstable_features: UnstableFeatures::from_environment(),
             config: CrateConfig::new(),
-            included_mod_stack: RefCell::new(Vec::new()),
+            included_mod_stack: Lock::new(Vec::new()),
             code_map: cm,
-            missing_fragment_specifiers: RefCell::new(HashSet::new()),
+            missing_fragment_specifiers: Lock::new(HashSet::new()),
+            raw_identifier_spans: Lock::new(Vec::new()),
             registered_diagnostics: Lock::new(ErrorMap::new()),
-            non_modrs_mods: RefCell::new(vec![]),
+            non_modrs_mods: Lock::new(vec![]),
         }
     }
 
@@ -1807,7 +1828,7 @@ mod tests {
             assert_eq!(string_reader.next_token().tok, token::Whitespace);
             let tok1 = string_reader.next_token();
             let tok2 = TokenAndSpan {
-                tok: token::Ident(id),
+                tok: token::Ident(id, false),
                 sp: Span::new(BytePos(21), BytePos(23), NO_EXPANSION),
             };
             assert_eq!(tok1, tok2);
@@ -1817,7 +1838,7 @@ mod tests {
             // read another token:
             let tok3 = string_reader.next_token();
             let tok4 = TokenAndSpan {
-                tok: token::Ident(Ident::from_str("main")),
+                tok: mk_ident("main"),
                 sp: Span::new(BytePos(24), BytePos(28), NO_EXPANSION),
             };
             assert_eq!(tok3, tok4);
@@ -1836,7 +1857,7 @@ mod tests {
 
     // make the identifier by looking up the string in the interner
     fn mk_ident(id: &str) -> token::Token {
-        token::Ident(Ident::from_str(id))
+        token::Token::from_ast_ident(Ident::from_str(id))
     }
 
     #[test]

@@ -24,7 +24,7 @@ use rustc::hir::def::*;
 use rustc::session::DiagnosticMessageId;
 use rustc::util::nodemap::{FxHashMap, FxHashSet};
 
-use syntax::ast::{Ident, Name, SpannedIdent, NodeId};
+use syntax::ast::{Ident, Name, NodeId};
 use syntax::ext::base::Determinacy::{self, Determined, Undetermined};
 use syntax::ext::hygiene::Mark;
 use syntax::parse::token;
@@ -58,7 +58,7 @@ pub enum ImportDirectiveSubclass<'a> {
 pub struct ImportDirective<'a> {
     pub id: NodeId,
     pub parent: Module<'a>,
-    pub module_path: Vec<SpannedIdent>,
+    pub module_path: Vec<Ident>,
     pub imported_module: Cell<Option<Module<'a>>>, // the resolution of `module_path`
     pub subclass: ImportDirectiveSubclass<'a>,
     pub span: Span,
@@ -238,7 +238,7 @@ impl<'a> Resolver<'a> {
             }
             let module = unwrap_or!(directive.imported_module.get(), return Err(Undetermined));
             let (orig_current_module, mut ident) = (self.current_module, ident.modern());
-            match ident.ctxt.glob_adjust(module.expansion, directive.span.ctxt().modern()) {
+            match ident.span.glob_adjust(module.expansion, directive.span.ctxt().modern()) {
                 Some(Some(def)) => self.current_module = self.macro_def_scope(def),
                 Some(None) => {}
                 None => continue,
@@ -257,7 +257,7 @@ impl<'a> Resolver<'a> {
 
     // Add an import directive to the current module.
     pub fn add_import_directive(&mut self,
-                                module_path: Vec<SpannedIdent>,
+                                module_path: Vec<Ident>,
                                 subclass: ImportDirectiveSubclass<'a>,
                                 span: Span,
                                 id: NodeId,
@@ -398,7 +398,7 @@ impl<'a> Resolver<'a> {
         // Define `binding` in `module`s glob importers.
         for directive in module.glob_importers.borrow_mut().iter() {
             let mut ident = ident.modern();
-            let scope = match ident.ctxt.reverse_glob_adjust(module.expansion,
+            let scope = match ident.span.reverse_glob_adjust(module.expansion,
                                                              directive.span.ctxt().modern()) {
                 Some(Some(def)) => self.macro_def_scope(def),
                 Some(None) => directive.parent,
@@ -535,7 +535,8 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
             // For better failure detection, pretend that the import will not define any names
             // while resolving its module path.
             directive.vis.set(ty::Visibility::Invisible);
-            let result = self.resolve_path(&directive.module_path[..], None, false, directive.span);
+            let result = self.resolve_path(&directive.module_path[..], None, false,
+                                           directive.span, Some(directive.id));
             directive.vis.set(vis);
 
             match result {
@@ -606,9 +607,9 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
 
         // FIXME: Last path segment is treated specially in import resolution, so extern crate
         // mode for absolute paths needs some special support for single-segment imports.
-        if module_path.len() == 1 && (module_path[0].node.name == keywords::CrateRoot.name() ||
-                                      module_path[0].node.name == keywords::Extern.name()) {
-            let is_extern = module_path[0].node.name == keywords::Extern.name() ||
+        if module_path.len() == 1 && (module_path[0].name == keywords::CrateRoot.name() ||
+                                      module_path[0].name == keywords::Extern.name()) {
+            let is_extern = module_path[0].name == keywords::Extern.name() ||
                             self.session.features_untracked().extern_absolute_paths;
             match directive.subclass {
                 GlobImport { .. } if is_extern => {
@@ -617,17 +618,22 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
                 }
                 SingleImport { source, target, .. } => {
                     let crate_root = if source.name == keywords::Crate.name() &&
-                                        module_path[0].node.name != keywords::Extern.name() {
+                                        module_path[0].name != keywords::Extern.name() {
                         if target.name == keywords::Crate.name() {
                             return Some((directive.span,
                                          "crate root imports need to be explicitly named: \
                                           `use crate as name;`".to_string()));
                         } else {
-                            Some(self.resolve_crate_root(source.ctxt.modern(), false))
+                            Some(self.resolve_crate_root(source.span.ctxt().modern(), false))
                         }
-                    } else if is_extern && !token::Ident(source).is_path_segment_keyword() {
+                    } else if is_extern && !token::is_path_segment_keyword(source) {
                         let crate_id =
-                            self.crate_loader.resolve_crate_from_path(source.name, directive.span);
+                            self.resolver.crate_loader.process_use_extern(
+                                source.name,
+                                directive.span,
+                                directive.id,
+                                &self.resolver.definitions,
+                            );
                         let crate_root =
                             self.get_module(DefId { krate: crate_id, index: CRATE_DEF_INDEX });
                         self.populate_module_if_necessary(crate_root);
@@ -658,7 +664,7 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
             }
         }
 
-        let module_result = self.resolve_path(&module_path, None, true, span);
+        let module_result = self.resolve_path(&module_path, None, true, span, Some(directive.id));
         let module = match module_result {
             PathResult::Module(module) => module,
             PathResult::Failed(span, msg, false) => {
@@ -667,13 +673,13 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
             }
             PathResult::Failed(span, msg, true) => {
                 let (mut self_path, mut self_result) = (module_path.clone(), None);
-                if !self_path.is_empty() &&
-                    !token::Ident(self_path[0].node).is_path_segment_keyword() &&
-                    !(self_path.len() > 1 &&
-                      token::Ident(self_path[1].node).is_path_segment_keyword())
-                {
-                    self_path[0].node.name = keywords::SelfValue.name();
-                    self_result = Some(self.resolve_path(&self_path, None, false, span));
+                let is_special = |ident| token::is_path_segment_keyword(ident) &&
+                                         ident.name != keywords::CrateRoot.name();
+                if !self_path.is_empty() && !is_special(self_path[0]) &&
+                   !(self_path.len() > 1 && is_special(self_path[1])) {
+                    self_path[0].name = keywords::SelfValue.name();
+                    self_result = Some(self.resolve_path(&self_path, None, false,
+                                                         span, None));
                 }
                 return if let Some(PathResult::Module(..)) = self_result {
                     Some((span, format!("Did you mean `{}`?", names_to_string(&self_path[..]))))
@@ -861,7 +867,7 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
             resolution.borrow().binding().map(|binding| (ident, binding))
         }).collect::<Vec<_>>();
         for ((mut ident, ns), binding) in bindings {
-            let scope = match ident.ctxt.reverse_glob_adjust(module.expansion,
+            let scope = match ident.span.reverse_glob_adjust(module.expansion,
                                                              directive.span.ctxt().modern()) {
                 Some(Some(def)) => self.macro_def_scope(def),
                 Some(None) => self.current_module,
@@ -958,7 +964,7 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
                             let resolutions = imported_module.parent.expect("parent should exist")
                                 .resolutions.borrow();
                             let enum_path_segment_index = directive.module_path.len() - 1;
-                            let enum_ident = directive.module_path[enum_path_segment_index].node;
+                            let enum_ident = directive.module_path[enum_path_segment_index];
 
                             let enum_resolution = resolutions.get(&(enum_ident, TypeNS))
                                 .expect("resolution should exist");
@@ -1012,12 +1018,12 @@ impl<'a, 'b:'a> ImportResolver<'a, 'b> {
     }
 }
 
-fn import_path_to_string(names: &[SpannedIdent],
+fn import_path_to_string(names: &[Ident],
                          subclass: &ImportDirectiveSubclass,
                          span: Span) -> String {
     let pos = names.iter()
-        .position(|p| span == p.span && p.node.name != keywords::CrateRoot.name());
-    let global = !names.is_empty() && names[0].node.name == keywords::CrateRoot.name();
+        .position(|p| span == p.span && p.name != keywords::CrateRoot.name());
+    let global = !names.is_empty() && names[0].name == keywords::CrateRoot.name();
     if let Some(pos) = pos {
         let names = if global { &names[1..pos + 1] } else { &names[..pos + 1] };
         names_to_string(names)
@@ -1026,28 +1032,9 @@ fn import_path_to_string(names: &[SpannedIdent],
         if names.is_empty() {
             import_directive_subclass_to_string(subclass)
         } else {
-            // FIXME: Remove this entire logic after #48116 is fixed.
-            //
-            // Note that this code looks a little wonky, it's currently here to
-            // hopefully help debug #48116, but otherwise isn't intended to
-            // cause any problems.
-            let x = format!(
-                "{}::{}",
-                names_to_string(names),
-                import_directive_subclass_to_string(subclass),
-            );
-            if names.is_empty() || x.starts_with("::") {
-                span_bug!(
-                    span,
-                    "invalid name `{}` at {:?}; global = {}, names = {:?}, subclass = {:?}",
-                    x,
-                    span,
-                    global,
-                    names,
-                    subclass
-                );
-            }
-            return x
+            format!("{}::{}",
+                    names_to_string(names),
+                    import_directive_subclass_to_string(subclass))
         }
     }
 }

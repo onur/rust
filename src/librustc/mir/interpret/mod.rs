@@ -8,20 +8,22 @@ macro_rules! err {
 mod error;
 mod value;
 
-pub use self::error::{EvalError, EvalResult, EvalErrorKind};
+pub use self::error::{EvalError, EvalResult, EvalErrorKind, AssertMessage};
 
 pub use self::value::{PrimVal, PrimValKind, Value, Pointer};
 
 use std::collections::BTreeMap;
 use std::fmt;
 use mir;
-use ty;
+use hir::def_id::DefId;
+use ty::{self, TyCtxt};
 use ty::layout::{self, Align, HasDataLayout};
 use middle::region;
 use std::iter;
 use syntax::ast::Mutability;
+use rustc_serialize::{Encoder, Decoder, Decodable, Encodable};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
 pub enum Lock {
     NoLock,
     WriteLock(DynamicLifetime),
@@ -29,13 +31,13 @@ pub enum Lock {
     ReadLock(Vec<DynamicLifetime>),
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
 pub struct DynamicLifetime {
     pub frame: usize,
     pub region: Option<region::Scope>, // "None" indicates "until the function ends"
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum AccessKind {
     Read,
     Write,
@@ -86,12 +88,12 @@ pub trait PointerArithmetic: layout::HasDataLayout {
 
     fn signed_offset<'tcx>(self, val: u64, i: i64) -> EvalResult<'tcx, u64> {
         let (res, over) = self.overflowing_signed_offset(val, i as i128);
-        if over { err!(OverflowingMath) } else { Ok(res) }
+        if over { err!(Overflow(mir::BinOp::Add)) } else { Ok(res) }
     }
 
     fn offset<'tcx>(self, val: u64, i: u64) -> EvalResult<'tcx, u64> {
         let (res, over) = self.overflowing_offset(val, i);
-        if over { err!(OverflowingMath) } else { Ok(res) }
+        if over { err!(Overflow(mir::BinOp::Add)) } else { Ok(res) }
     }
 
     fn wrapping_signed_offset(self, val: u64, i: i64) -> u64 {
@@ -151,6 +153,81 @@ pub struct AllocId(pub u64);
 
 impl ::rustc_serialize::UseSpecializedEncodable for AllocId {}
 impl ::rustc_serialize::UseSpecializedDecodable for AllocId {}
+
+#[derive(RustcDecodable, RustcEncodable)]
+enum AllocKind {
+    Alloc,
+    Fn,
+    Static,
+}
+
+pub fn specialized_encode_alloc_id<
+    'a, 'tcx,
+    E: Encoder,
+>(
+    encoder: &mut E,
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    alloc_id: AllocId,
+) -> Result<(), E::Error> {
+    if let Some(alloc) = tcx.interpret_interner.get_alloc(alloc_id) {
+        trace!("encoding {:?} with {:#?}", alloc_id, alloc);
+        AllocKind::Alloc.encode(encoder)?;
+        alloc.encode(encoder)?;
+    } else if let Some(fn_instance) = tcx.interpret_interner.get_fn(alloc_id) {
+        trace!("encoding {:?} with {:#?}", alloc_id, fn_instance);
+        AllocKind::Fn.encode(encoder)?;
+        fn_instance.encode(encoder)?;
+    } else if let Some(did) = tcx.interpret_interner.get_static(alloc_id) {
+        // referring to statics doesn't need to know about their allocations, just about its DefId
+        AllocKind::Static.encode(encoder)?;
+        did.encode(encoder)?;
+    } else {
+        bug!("alloc id without corresponding allocation: {}", alloc_id);
+    }
+    Ok(())
+}
+
+pub fn specialized_decode_alloc_id<
+    'a, 'tcx,
+    D: Decoder,
+    CACHE: FnOnce(&mut D, AllocId),
+>(
+    decoder: &mut D,
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    cache: CACHE,
+) -> Result<AllocId, D::Error> {
+    match AllocKind::decode(decoder)? {
+        AllocKind::Alloc => {
+            let alloc_id = tcx.interpret_interner.reserve();
+            trace!("creating alloc id {:?}", alloc_id);
+            // insert early to allow recursive allocs
+            cache(decoder, alloc_id);
+
+            let allocation = Allocation::decode(decoder)?;
+            trace!("decoded alloc {:?} {:#?}", alloc_id, allocation);
+            let allocation = tcx.intern_const_alloc(allocation);
+            tcx.interpret_interner.intern_at_reserved(alloc_id, allocation);
+
+            Ok(alloc_id)
+        },
+        AllocKind::Fn => {
+            trace!("creating fn alloc id");
+            let instance = ty::Instance::decode(decoder)?;
+            trace!("decoded fn alloc instance: {:?}", instance);
+            let id = tcx.interpret_interner.create_fn_alloc(instance);
+            trace!("created fn alloc id: {:?}", id);
+            cache(decoder, id);
+            Ok(id)
+        },
+        AllocKind::Static => {
+            trace!("creating extern static alloc id at");
+            let did = DefId::decode(decoder)?;
+            let alloc_id = tcx.interpret_interner.cache_static(did);
+            cache(decoder, alloc_id);
+            Ok(alloc_id)
+        },
+    }
+}
 
 impl fmt::Display for AllocId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

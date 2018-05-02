@@ -1121,8 +1121,13 @@ impl ExitCode {
 }
 
 impl Child {
-    /// Forces the child to exit. This is equivalent to sending a
-    /// SIGKILL on unix platforms.
+    /// Forces the child process to exit. If the child has already exited, an [`InvalidInput`]
+    /// error is returned.
+    ///
+    /// The mapping to [`ErrorKind`]s is not part of the compatibility contract of the function,
+    /// especially the [`Other`] kind might change to more specific kinds in the future.
+    ///
+    /// This is equivalent to sending a SIGKILL on Unix platforms.
     ///
     /// # Examples
     ///
@@ -1138,6 +1143,10 @@ impl Child {
     ///     println!("yes command didn't start");
     /// }
     /// ```
+    ///
+    /// [`ErrorKind`]: ../io/enum.ErrorKind.html
+    /// [`InvalidInput`]: ../io/enum.ErrorKind.html#variant.InvalidInput
+    /// [`Other`]: ../io/enum.ErrorKind.html#variant.Other
     #[stable(feature = "process", since = "1.0.0")]
     pub fn kill(&mut self) -> io::Result<()> {
         self.handle.kill()
@@ -1420,14 +1429,13 @@ pub fn abort() -> ! {
 /// Basic usage:
 ///
 /// ```no_run
-/// #![feature(getpid)]
 /// use std::process;
 ///
 /// println!("My pid is {}", process::id());
 /// ```
 ///
 ///
-#[unstable(feature = "getpid", issue = "44971", reason = "recently added")]
+#[stable(feature = "getpid", since = "1.26.0")]
 pub fn id() -> u32 {
     ::sys::os::getpid()
 }
@@ -1442,8 +1450,9 @@ pub fn id() -> u32 {
 /// a successful execution. In case of a failure, `libc::EXIT_FAILURE` is returned.
 #[cfg_attr(not(test), lang = "termination")]
 #[unstable(feature = "termination_trait_lib", issue = "43301")]
-#[rustc_on_unimplemented =
-  "`main` can only return types that implement {Termination}, not `{Self}`"]
+#[rustc_on_unimplemented(
+  message="`main` has invalid return type `{Self}`",
+  label="`main` can only return types that implement `{Termination}`")]
 pub trait Termination {
     /// Is called to get the representation of the value as status code.
     /// This status code is returned to the operating system.
@@ -1452,6 +1461,7 @@ pub trait Termination {
 
 #[unstable(feature = "termination_trait_lib", issue = "43301")]
 impl Termination for () {
+    #[inline]
     fn report(self) -> i32 { ExitCode::SUCCESS.report() }
 }
 
@@ -1481,6 +1491,7 @@ impl<E: fmt::Debug> Termination for Result<!, E> {
 
 #[unstable(feature = "termination_trait_lib", issue = "43301")]
 impl Termination for ExitCode {
+    #[inline]
     fn report(self) -> i32 {
         self.0.as_i32()
     }

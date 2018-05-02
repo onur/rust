@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use syntax::abi::{Abi};
+use rustc_target::spec::abi::{Abi};
 use syntax::ast;
 use syntax_pos::Span;
 
@@ -163,6 +163,7 @@ fn each_block<'a, 'tcx, O>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             mir::StatementKind::InlineAsm { .. } |
             mir::StatementKind::EndRegion(_) |
             mir::StatementKind::Validate(..) |
+            mir::StatementKind::UserAssertTy(..) |
             mir::StatementKind::Nop => continue,
             mir::StatementKind::SetDiscriminant{ .. } =>
                 span_bug!(stmt.source_info.span,

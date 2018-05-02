@@ -16,14 +16,14 @@ use rustc::traits::query::dropck_outlives::{DtorckConstraint, DropckOutlivesResu
 use rustc::ty::{self, ParamEnvAnd, Ty, TyCtxt};
 use rustc::ty::subst::Subst;
 use rustc::util::nodemap::FxHashSet;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 use syntax::codemap::{Span, DUMMY_SP};
 use util;
 
 crate fn dropck_outlives<'tcx>(
     tcx: TyCtxt<'_, 'tcx, 'tcx>,
     goal: CanonicalTyGoal<'tcx>,
-) -> Result<Rc<Canonical<'tcx, QueryResult<'tcx, DropckOutlivesResult<'tcx>>>>, NoSolution> {
+) -> Result<Lrc<Canonical<'tcx, QueryResult<'tcx, DropckOutlivesResult<'tcx>>>>, NoSolution> {
     debug!("dropck_outlives(goal={:#?})", goal);
 
     tcx.infer_ctxt().enter(|ref infcx| {
@@ -153,7 +153,7 @@ fn dtorck_constraint_for_ty<'a, 'gcx, 'tcx>(
         span, for_ty, depth, ty
     );
 
-    if depth >= tcx.sess.recursion_limit.get() {
+    if depth >= *tcx.sess.recursion_limit.get() {
         return Ok(DtorckConstraint {
             outlives: vec![],
             dtorck_types: vec![],
@@ -193,14 +193,38 @@ fn dtorck_constraint_for_ty<'a, 'gcx, 'tcx>(
             .map(|ty| dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ty))
             .collect(),
 
-        ty::TyGenerator(def_id, substs, _) => {
-            // Note that the interior types are ignored here.
-            // Any type reachable inside the interior must also be reachable
-            // through the upvars.
-            substs
-                .upvar_tys(def_id, tcx)
-                .map(|ty| dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ty))
-                .collect()
+        ty::TyGenerator(def_id, substs, _interior) => {
+            // rust-lang/rust#49918: types can be constructed, stored
+            // in the interior, and sit idle when generator yields
+            // (and is subsequently dropped).
+            //
+            // It would be nice to descend into interior of a
+            // generator to determine what effects dropping it might
+            // have (by looking at any drop effects associated with
+            // its interior).
+            //
+            // However, the interior's representation uses things like
+            // TyGeneratorWitness that explicitly assume they are not
+            // traversed in such a manner. So instead, we will
+            // simplify things for now by treating all generators as
+            // if they were like trait objects, where its upvars must
+            // all be alive for the generator's (potential)
+            // destructor.
+            //
+            // In particular, skipping over `_interior` is safe
+            // because any side-effects from dropping `_interior` can
+            // only take place through references with lifetimes
+            // derived from lifetimes attached to the upvars, and we
+            // *do* incorporate the upvars here.
+
+            let constraint = DtorckConstraint {
+                outlives: substs.upvar_tys(def_id, tcx).map(|t| t.into()).collect(),
+                dtorck_types: vec![],
+                overflows: vec![],
+            };
+            debug!("dtorck_constraint: generator {:?} => {:?}", def_id, constraint);
+
+            Ok(constraint)
         }
 
         ty::TyAdt(def, substs) => {

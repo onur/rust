@@ -78,7 +78,7 @@ pub fn modify_for_testing(sess: &ParseSess,
                           span_diagnostic: &errors::Handler,
                           features: &Features) -> ast::Crate {
     // Check for #[reexport_test_harness_main = "some_name"] which
-    // creates a `use some_name = __test::main;`. This needs to be
+    // creates a `use __test::main as some_name;`. This needs to be
     // unconditional, so that the attribute is still marked as used in
     // non-test builds.
     let reexport_test_harness_main =
@@ -195,10 +195,10 @@ impl fold::Folder for EntryPointCleaner {
             EntryPointType::MainAttr |
             EntryPointType::Start =>
                 folded.map(|ast::Item {id, ident, attrs, node, vis, span, tokens}| {
-                    let allow_str = Symbol::intern("allow");
-                    let dead_code_str = Symbol::intern("dead_code");
-                    let word_vec = vec![attr::mk_list_word_item(dead_code_str)];
-                    let allow_dead_code_item = attr::mk_list_item(allow_str, word_vec);
+                    let allow_ident = Ident::from_str("allow");
+                    let dc_nested = attr::mk_nested_word_item(Ident::from_str("dead_code"));
+                    let allow_dead_code_item = attr::mk_list_item(DUMMY_SP, allow_ident,
+                                                                  vec![dc_nested]);
                     let allow_dead_code = attr::mk_attr_outer(DUMMY_SP,
                                                               attr::mk_attr_id(),
                                                               allow_dead_code_item);
@@ -240,7 +240,8 @@ fn mk_reexport_mod(cx: &mut TestCtxt,
                                   cx.ext_cx.path(DUMMY_SP, vec![super_, r]))
     }).chain(tested_submods.into_iter().map(|(r, sym)| {
         let path = cx.ext_cx.path(DUMMY_SP, vec![super_, r, sym]);
-        cx.ext_cx.item_use_simple_(DUMMY_SP, dummy_spanned(ast::VisibilityKind::Public), r, path)
+        cx.ext_cx.item_use_simple_(DUMMY_SP, dummy_spanned(ast::VisibilityKind::Public),
+                                   Some(r), path)
     })).collect();
 
     let reexport_mod = ast::Mod {
@@ -319,37 +320,48 @@ fn ignored_span(cx: &TestCtxt, sp: Span) -> Span {
 #[derive(PartialEq)]
 enum HasTestSignature {
     Yes,
-    No,
+    No(BadTestSignature),
+}
+
+#[derive(PartialEq)]
+enum BadTestSignature {
     NotEvenAFunction,
+    WrongTypeSignature,
+    NoArgumentsAllowed,
+    ShouldPanicOnlyWithNoArgs,
 }
 
 fn is_test_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
     let has_test_attr = attr::contains_name(&i.attrs, "test");
 
     fn has_test_signature(cx: &TestCtxt, i: &ast::Item) -> HasTestSignature {
+        let has_should_panic_attr = attr::contains_name(&i.attrs, "should_panic");
         match i.node {
             ast::ItemKind::Fn(ref decl, _, _, _, ref generics, _) => {
                 // If the termination trait is active, the compiler will check that the output
                 // type implements the `Termination` trait as `libtest` enforces that.
-                let output_matches = if cx.features.termination_trait {
-                    true
-                } else {
-                    let no_output = match decl.output {
-                        ast::FunctionRetTy::Default(..) => true,
-                        ast::FunctionRetTy::Ty(ref t) if t.node == ast::TyKind::Tup(vec![]) => true,
-                        _ => false
-                    };
-
-                    no_output && !generics.is_parameterized()
+                let has_output = match decl.output {
+                    ast::FunctionRetTy::Default(..) => false,
+                    ast::FunctionRetTy::Ty(ref t) if t.node == ast::TyKind::Tup(vec![]) => false,
+                    _ => true
                 };
 
-                if decl.inputs.is_empty() && output_matches {
-                    Yes
-                } else {
-                    No
+                if !decl.inputs.is_empty() {
+                    return No(BadTestSignature::NoArgumentsAllowed);
+                }
+
+                match (has_output, cx.features.termination_trait_test, has_should_panic_attr) {
+                    (true, true, true) => No(BadTestSignature::ShouldPanicOnlyWithNoArgs),
+                    (true, true, false) => if generics.is_parameterized() {
+                        No(BadTestSignature::WrongTypeSignature)
+                    } else {
+                        Yes
+                    },
+                    (true, false, _) => No(BadTestSignature::WrongTypeSignature),
+                    (false, _, _) => Yes
                 }
             }
-            _ => NotEvenAFunction,
+            _ => No(BadTestSignature::NotEvenAFunction),
         }
     }
 
@@ -357,18 +369,20 @@ fn is_test_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
         let diag = cx.span_diagnostic;
         match has_test_signature(cx, i) {
             Yes => true,
-            No => {
-                if cx.features.termination_trait {
-                    diag.span_err(i.span, "functions used as tests can not have any arguments");
-                } else {
-                    diag.span_err(i.span, "functions used as tests must have signature fn() -> ()");
+            No(cause) => {
+                match cause {
+                    BadTestSignature::NotEvenAFunction =>
+                        diag.span_err(i.span, "only functions may be used as tests"),
+                    BadTestSignature::WrongTypeSignature =>
+                        diag.span_err(i.span,
+                                      "functions used as tests must have signature fn() -> ()"),
+                    BadTestSignature::NoArgumentsAllowed =>
+                        diag.span_err(i.span, "functions used as tests can not have any arguments"),
+                    BadTestSignature::ShouldPanicOnlyWithNoArgs =>
+                        diag.span_err(i.span, "functions using `#[should_panic]` must return `()`"),
                 }
                 false
-            },
-            NotEvenAFunction => {
-                diag.span_err(i.span, "only functions may be used as tests");
-                false
-            },
+            }
         }
     } else {
         false
@@ -387,7 +401,7 @@ fn is_bench_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
 
                 // If the termination trait is active, the compiler will check that the output
                 // type implements the `Termination` trait as `libtest` enforces that.
-                let output_matches = if cx.features.termination_trait {
+                let output_matches = if cx.features.termination_trait_test {
                     true
                 } else {
                     let no_output = match decl.output {
@@ -406,7 +420,7 @@ fn is_bench_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
                 // well before resolve, can't get too deep.
                 input_cnt == 1 && output_matches
             }
-          _ => false
+            _ => false
         }
     }
 
@@ -415,7 +429,7 @@ fn is_bench_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
     if has_bench_attr && !has_bench_signature {
         let diag = cx.span_diagnostic;
 
-        if cx.features.termination_trait {
+        if cx.features.termination_trait_test {
             diag.span_err(i.span, "functions used as benches must have signature \
                                    `fn(&mut Bencher) -> impl Termination`");
         } else {
@@ -502,7 +516,7 @@ fn mk_std(cx: &TestCtxt) -> P<ast::Item> {
         (ast::ItemKind::Use(P(ast::UseTree {
             span: DUMMY_SP,
             prefix: path_node(vec![id_test]),
-            kind: ast::UseTreeKind::Simple(id_test),
+            kind: ast::UseTreeKind::Simple(None),
         })),
          ast::VisibilityKind::Public, keywords::Invalid.ident())
     } else {
@@ -546,10 +560,12 @@ fn mk_main(cx: &mut TestCtxt) -> P<ast::Item> {
     // pub fn main() { ... }
     let main_ret_ty = ecx.ty(sp, ast::TyKind::Tup(vec![]));
     let main_body = ecx.block(sp, vec![call_test_main]);
-    let main = ast::ItemKind::Fn(ecx.fn_decl(vec![], main_ret_ty),
+    let main = ast::ItemKind::Fn(ecx.fn_decl(vec![], ast::FunctionRetTy::Ty(main_ret_ty)),
                            ast::Unsafety::Normal,
                            dummy_spanned(ast::Constness::NotConst),
-                           ::abi::Abi::Rust, ast::Generics::default(), main_body);
+                           ::rustc_target::spec::abi::Abi::Rust,
+                           ast::Generics::default(),
+                           main_body);
     P(ast::Item {
         ident: Ident::from_str("main"),
         attrs: vec![main_attr],
@@ -590,13 +606,13 @@ fn mk_test_module(cx: &mut TestCtxt) -> (P<ast::Item>, Option<P<ast::Item>>) {
         tokens: None,
     })).pop().unwrap();
     let reexport = cx.reexport_test_harness_main.map(|s| {
-        // building `use <ident> = __test::main`
-        let reexport_ident = Ident::with_empty_ctxt(s);
+        // building `use __test::main as <ident>;`
+        let rename = Ident::with_empty_ctxt(s);
 
         let use_path = ast::UseTree {
             span: DUMMY_SP,
             prefix: path_node(vec![mod_ident, Ident::from_str("main")]),
-            kind: ast::UseTreeKind::Simple(reexport_ident),
+            kind: ast::UseTreeKind::Simple(Some(rename)),
         };
 
         expander.fold_item(P(ast::Item {
@@ -622,13 +638,20 @@ fn nospan<T>(t: T) -> codemap::Spanned<T> {
 fn path_node(ids: Vec<Ident>) -> ast::Path {
     ast::Path {
         span: DUMMY_SP,
-        segments: ids.into_iter().map(|id| ast::PathSegment::from_ident(id, DUMMY_SP)).collect(),
+        segments: ids.into_iter().map(|id| ast::PathSegment::from_ident(id)).collect(),
     }
 }
 
 fn path_name_i(idents: &[Ident]) -> String {
-    // FIXME: Bad copies (#2543 -- same for everything else that says "bad")
-    idents.iter().map(|i| i.to_string()).collect::<Vec<String>>().join("::")
+    let mut path_name = "".to_string();
+    let mut idents_iter = idents.iter().peekable();
+    while let Some(ident) = idents_iter.next() {
+        path_name.push_str(&ident.name.as_str());
+        if let Some(_) = idents_iter.peek() {
+            path_name.push_str("::")
+        }
+    }
+    path_name
 }
 
 fn mk_tests(cx: &TestCtxt) -> P<ast::Item> {
@@ -681,7 +704,6 @@ fn mk_test_desc_and_fn_rec(cx: &TestCtxt, test: &Test) -> P<ast::Expr> {
     // gensym information.
 
     let span = ignored_span(cx, test.span);
-    let path = test.path.clone();
     let ecx = &cx.ext_cx;
     let self_id = ecx.ident_of("self");
     let test_id = ecx.ident_of("test");
@@ -693,10 +715,11 @@ fn mk_test_desc_and_fn_rec(cx: &TestCtxt, test: &Test) -> P<ast::Expr> {
     // creates $name: $expr
     let field = |name, expr| ecx.field_imm(span, ecx.ident_of(name), expr);
 
-    debug!("encoding {}", path_name_i(&path[..]));
-
     // path to the #[test] function: "foo::bar::baz"
-    let path_string = path_name_i(&path[..]);
+    let path_string = path_name_i(&test.path[..]);
+
+    debug!("encoding {}", path_string);
+
     let name_expr = ecx.expr_str(span, Symbol::intern(&path_string));
 
     // self::test::StaticTestName($name_expr)
@@ -743,7 +766,7 @@ fn mk_test_desc_and_fn_rec(cx: &TestCtxt, test: &Test) -> P<ast::Expr> {
             diag.bug("expected to find top-level re-export name, but found None");
         }
     };
-    visible_path.extend(path);
+    visible_path.extend_from_slice(&test.path[..]);
 
     // Rather than directly give the test function to the test
     // harness, we create a wrapper like one of the following:

@@ -54,6 +54,8 @@ be compiled or run.
 * `ignore-test` always ignores the test
 * `ignore-lldb` and `ignore-gdb` will skip a debuginfo test on that debugger.
 
+`only-X` is the opposite. The test will run only when `X` matches.
+
 Some examples of `X` in `ignore-X`:
 
 * Architecture: `aarch64`, `arm`, `asmjs`, `mips`, `wasm32`, `x86_64`, `x86`, ...
@@ -66,7 +68,7 @@ Some examples of `X` in `ignore-X`:
 
 * `min-{gdb,lldb}-version`
 * `min-llvm-version`
-* `must-compile-successfully` for UI tests, indicates that the test is supposed
+* `compile-pass` for UI tests, indicates that the test is supposed
   to compile, as opposed to the default where the test is supposed to error out.
 * `compile-flags` passes extra command-line args to the compiler,
   e.g. `compile-flags -g` which forces debuginfo to be enabled.
@@ -132,7 +134,7 @@ so forth.
 Normally, the test-runner checks that UI tests fail compilation. If you want
 to do a UI test for code that *compiles* (e.g. to test warnings, or if you
 have a collection of tests, only some of which error out), you can use the
-`// must-compile-successfully` header command to have the test runner instead
+`// compile-pass` header command to have the test runner instead
 check that the test compiles successfully.
 
 ### Editing and updating the reference files

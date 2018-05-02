@@ -53,7 +53,7 @@ impl<'a> ParserAnyMacro<'a> {
         }
 
         // Make sure we don't have any tokens left to parse so we don't silently drop anything.
-        let path = ast::Path::from_ident(site_span, macro_ident);
+        let path = ast::Path::from_ident(macro_ident.with_span_pos(site_span));
         parser.ensure_complete_parse(&path, kind.name(), site_span);
         expansion
     }
@@ -831,7 +831,7 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
             "pat" => match *tok {
                 TokenTree::Token(_, ref tok) => match *tok {
                     FatArrow | Comma | Eq | BinOp(token::Or) => Ok(true),
-                    Ident(i) if i.name == "if" || i.name == "in" => Ok(true),
+                    Ident(i, false) if i.name == "if" || i.name == "in" => Ok(true),
                     _ => Ok(false)
                 },
                 _ => Ok(false),
@@ -840,7 +840,7 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
                 TokenTree::Token(_, ref tok) => match *tok {
                     OpenDelim(token::DelimToken::Brace) | OpenDelim(token::DelimToken::Bracket) |
                     Comma | FatArrow | Colon | Eq | Gt | Semi | BinOp(token::Or) => Ok(true),
-                    Ident(i) if i.name == "as" || i.name == "where" => Ok(true),
+                    Ident(i, false) if i.name == "as" || i.name == "where" => Ok(true),
                     _ => Ok(false)
                 },
                 TokenTree::MetaVarDecl(_, _, frag) if frag.name == "block" => Ok(true),
@@ -860,7 +860,7 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
                 match *tok {
                     TokenTree::Token(_, ref tok) => match *tok {
                         Comma => Ok(true),
-                        Ident(i) if i.name != "priv" => Ok(true),
+                        Ident(i, is_raw) if is_raw || i.name != "priv" => Ok(true),
                         ref tok => Ok(tok.can_begin_type())
                     },
                     TokenTree::MetaVarDecl(_, _, frag) if frag.name == "ident"

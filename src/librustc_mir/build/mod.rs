@@ -20,12 +20,12 @@ use rustc::mir::visit::{MutVisitor, TyContext};
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::subst::Substs;
 use rustc::util::nodemap::NodeMap;
-use rustc_back::PanicStrategy;
+use rustc_target::spec::PanicStrategy;
 use rustc_data_structures::indexed_vec::{IndexVec, Idx};
 use shim;
 use std::mem;
 use std::u32;
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::ast;
 use syntax::attr::{self, UnwindAttr};
 use syntax::symbol::keywords;
@@ -317,7 +317,7 @@ newtype_index!(ScopeId);
 /// macro (and methods below) makes working with `BlockAnd` much more
 /// convenient.
 
-#[must_use] // if you don't use one of these results, you're leaving a dangling edge
+#[must_use = "if you don't use one of these results, you're leaving a dangling edge"]
 struct BlockAnd<T>(BasicBlock, T);
 
 trait BlockAndExtension {
@@ -422,7 +422,7 @@ fn construct_fn<'a, 'gcx, 'tcx, A>(hir: Cx<'a, 'gcx, 'tcx>,
             builder.args_and_body(block, &arguments, arg_scope, &body.value)
         }));
         // Attribute epilogue to function's closing brace
-        let fn_end = span.with_lo(span.hi());
+        let fn_end = span.shrink_to_hi();
         let source_info = builder.source_info(fn_end);
         let return_block = builder.return_block();
         builder.cfg.terminate(block, source_info,
@@ -467,8 +467,8 @@ fn construct_fn<'a, 'gcx, 'tcx, A>(hir: Cx<'a, 'gcx, 'tcx>,
                 mutability: Mutability::Not,
             };
             if let Some(hir::map::NodeBinding(pat)) = tcx.hir.find(var_id) {
-                if let hir::PatKind::Binding(_, _, ref ident, _) = pat.node {
-                    decl.debug_name = ident.node;
+                if let hir::PatKind::Binding(_, _, ref name, _) = pat.node {
+                    decl.debug_name = name.node;
 
                     let bm = *hir.tables.pat_binding_modes()
                                         .get(pat.hir_id)

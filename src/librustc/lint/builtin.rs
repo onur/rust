@@ -255,9 +255,22 @@ declare_lint! {
 }
 
 declare_lint! {
+    pub ABSOLUTE_PATH_STARTING_WITH_MODULE,
+    Allow,
+    "fully qualified paths that start with a module name \
+     instead of `crate`, `self`, or an extern crate name"
+}
+
+declare_lint! {
     pub ILLEGAL_FLOATING_POINT_LITERAL_PATTERN,
     Warn,
     "floating-point literals cannot be used in patterns"
+}
+
+declare_lint! {
+    pub UNSTABLE_NAME_COLLISION,
+    Warn,
+    "detects name collision with an existing but unstable method"
 }
 
 /// Does nothing as a lint pass, but registers some `Lint`s
@@ -307,7 +320,9 @@ impl LintPass for HardwiredLints {
             SINGLE_USE_LIFETIME,
             TYVAR_BEHIND_RAW_POINTER,
             ELIDED_LIFETIME_IN_PATH,
-            BARE_TRAIT_OBJECT
+            BARE_TRAIT_OBJECT,
+            ABSOLUTE_PATH_STARTING_WITH_MODULE,
+            UNSTABLE_NAME_COLLISION,
         )
     }
 }
@@ -317,7 +332,8 @@ impl LintPass for HardwiredLints {
 #[derive(PartialEq, RustcEncodable, RustcDecodable, Debug)]
 pub enum BuiltinLintDiagnostics {
     Normal,
-    BareTraitObject(Span, /* is_global */ bool)
+    BareTraitObject(Span, /* is_global */ bool),
+    AbsPathWithModule(Span),
 }
 
 impl BuiltinLintDiagnostics {
@@ -331,6 +347,23 @@ impl BuiltinLintDiagnostics {
                     Err(_) => format!("dyn <type>")
                 };
                 db.span_suggestion(span, "use `dyn`", sugg);
+            }
+            BuiltinLintDiagnostics::AbsPathWithModule(span) => {
+                let sugg = match sess.codemap().span_to_snippet(span) {
+                    Ok(ref s) => {
+                        // FIXME(Manishearth) ideally the emitting code
+                        // can tell us whether or not this is global
+                        let opt_colon = if s.trim_left().starts_with("::") {
+                            ""
+                        } else {
+                            "::"
+                        };
+
+                        format!("crate{}{}", opt_colon, s)
+                    }
+                    Err(_) => format!("crate::<path>")
+                };
+                db.span_suggestion(span, "use `crate`", sugg);
             }
         }
     }

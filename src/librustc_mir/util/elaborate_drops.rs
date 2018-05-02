@@ -13,6 +13,7 @@ use rustc::hir;
 use rustc::mir::*;
 use rustc::middle::const_val::ConstVal;
 use rustc::middle::lang_items;
+use rustc::traits::Reveal;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::subst::{Kind, Substs};
 use rustc::ty::util::IntTypeExt;
@@ -177,7 +178,7 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
                 });
             }
             DropStyle::Conditional => {
-                let unwind = self.unwind; // FIXME(#6393)
+                let unwind = self.unwind; // FIXME(#43234)
                 let succ = self.succ;
                 let drop_bb = self.complete_drop(Some(DropFlagMode::Deep), succ, unwind);
                 self.elaborator.patch().patch_terminator(bb, TerminatorKind::Goto {
@@ -206,6 +207,7 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
             let field = Field::new(i);
             let subpath = self.elaborator.field_subpath(variant_path, field);
 
+            assert_eq!(self.elaborator.param_env().reveal, Reveal::All);
             let field_ty = self.tcx().normalize_erasing_regions(
                 self.elaborator.param_env(),
                 f.ty(self.tcx(), substs),
@@ -268,7 +270,7 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
         // Clear the "master" drop flag at the end. This is needed
         // because the "master" drop protects the ADT's discriminant,
         // which is invalidated after the ADT is dropped.
-        let (succ, unwind) = (self.succ, self.unwind); // FIXME(#6393)
+        let (succ, unwind) = (self.succ, self.unwind); // FIXME(#43234)
         (
             self.drop_flag_reset_block(DropFlagMode::Shallow, succ, unwind),
             unwind.map(|unwind| {
@@ -337,18 +339,19 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
         self.drop_ladder(fields, succ, unwind).0
     }
 
-    fn open_drop_for_box<'a>(&mut self, ty: Ty<'tcx>) -> BasicBlock
+    fn open_drop_for_box<'a>(&mut self, adt: &'tcx ty::AdtDef, substs: &'tcx Substs<'tcx>)
+                             -> BasicBlock
     {
-        debug!("open_drop_for_box({:?}, {:?})", self, ty);
+        debug!("open_drop_for_box({:?}, {:?}, {:?})", self, adt, substs);
 
         let interior = self.place.clone().deref();
         let interior_path = self.elaborator.deref_subpath(self.path);
 
-        let succ = self.succ; // FIXME(#6393)
+        let succ = self.succ; // FIXME(#43234)
         let unwind = self.unwind;
-        let succ = self.box_free_block(ty, succ, unwind);
+        let succ = self.box_free_block(adt, substs, succ, unwind);
         let unwind_succ = self.unwind.map(|unwind| {
-            self.box_free_block(ty, unwind, Unwind::InCleanup)
+            self.box_free_block(adt, substs, unwind, Unwind::InCleanup)
         });
 
         self.drop_subpath(&interior, interior_path, succ, unwind_succ)
@@ -717,7 +720,7 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
                            ptr_based)
         });
 
-        let succ = self.succ; // FIXME(#6393)
+        let succ = self.succ; // FIXME(#43234)
         let loop_block = self.drop_loop(
             succ,
             cur,
@@ -791,14 +794,15 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
             ty::TyTuple(tys) => {
                 self.open_drop_for_tuple(tys)
             }
-            ty::TyAdt(def, _) if def.is_box() => {
-                self.open_drop_for_box(ty.boxed_ty())
-            }
             ty::TyAdt(def, substs) => {
-                self.open_drop_for_adt(def, substs)
+                if def.is_box() {
+                    self.open_drop_for_box(def, substs)
+                } else {
+                    self.open_drop_for_adt(def, substs)
+                }
             }
             ty::TyDynamic(..) => {
-                let unwind = self.unwind; // FIXME(#6393)
+                let unwind = self.unwind; // FIXME(#43234)
                 let succ = self.succ;
                 self.complete_drop(Some(DropFlagMode::Deep), succ, unwind)
             }
@@ -849,7 +853,7 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
 
     fn elaborated_drop_block<'a>(&mut self) -> BasicBlock {
         debug!("elaborated_drop_block({:?})", self);
-        let unwind = self.unwind; // FIXME(#6393)
+        let unwind = self.unwind; // FIXME(#43234)
         let succ = self.succ;
         let blk = self.drop_block(succ, unwind);
         self.elaborate_drop(blk);
@@ -858,31 +862,37 @@ impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
 
     fn box_free_block<'a>(
         &mut self,
-        ty: Ty<'tcx>,
+        adt: &'tcx ty::AdtDef,
+        substs: &'tcx Substs<'tcx>,
         target: BasicBlock,
         unwind: Unwind,
     ) -> BasicBlock {
-        let block = self.unelaborated_free_block(ty, target, unwind);
+        let block = self.unelaborated_free_block(adt, substs, target, unwind);
         self.drop_flag_test_block(block, target, unwind)
     }
 
     fn unelaborated_free_block<'a>(
         &mut self,
-        ty: Ty<'tcx>,
+        adt: &'tcx ty::AdtDef,
+        substs: &'tcx Substs<'tcx>,
         target: BasicBlock,
         unwind: Unwind
     ) -> BasicBlock {
         let tcx = self.tcx();
         let unit_temp = Place::Local(self.new_temp(tcx.mk_nil()));
         let free_func = tcx.require_lang_item(lang_items::BoxFreeFnLangItem);
-        let substs = tcx.mk_substs(iter::once(Kind::from(ty)));
+        let args = adt.variants[0].fields.iter().enumerate().map(|(i, f)| {
+            let field = Field::new(i);
+            let field_ty = f.ty(self.tcx(), substs);
+            Operand::Move(self.place.clone().field(field, field_ty))
+        }).collect();
 
         let call = TerminatorKind::Call {
             func: Operand::function_handle(tcx, free_func, substs, self.source_info.span),
-            args: vec![Operand::Move(self.place.clone())],
+            args: args,
             destination: Some((unit_temp, target)),
             cleanup: None
-        }; // FIXME(#6393)
+        }; // FIXME(#43234)
         let free_block = self.new_block(unwind, call);
 
         let block_start = Location { block: free_block, statement_index: 0 };

@@ -250,7 +250,10 @@ An unstable feature was used.
 Erroneous code example:
 
 ```compile_fail,E658
-let x = ::std::u128::MAX; // error: use of unstable library feature 'i128'
+#[repr(u128)] // error: use of unstable library feature 'repr128'
+enum Foo {
+    Bar(u64),
+}
 ```
 
 If you're using a stable or a beta version of rustc, you won't be able to use
@@ -261,10 +264,11 @@ If you're using a nightly version of rustc, just add the corresponding feature
 to be able to use it:
 
 ```
-#![feature(i128)]
+#![feature(repr128)]
 
-fn main() {
-    let x = ::std::u128::MAX; // ok!
+#[repr(u128)] // ok!
+enum Foo {
+    Bar(u64),
 }
 ```
 "##,
@@ -320,4 +324,5 @@ register_diagnostics! {
     E0589, // invalid `repr(align)` attribute
     E0629, // missing 'feature' (rustc_const_unstable)
     E0630, // rustc_const_unstable attribute must be paired with stable/unstable attribute
+    E0693, // incorrect `repr(align)` attribute format
 }

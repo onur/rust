@@ -12,11 +12,14 @@
 // ignore-aarch64
 // ignore-wasm
 // ignore-emscripten
+// ignore-mips
+// ignore-powerpc
+// ignore-s390x
 
 #![feature(target_feature)]
 
 #[target_feature = "+sse2"]
-//~^ WARN: deprecated
+//~^ ERROR: must be of the form
 #[target_feature(enable = "foo")]
 //~^ ERROR: not valid for this target
 #[target_feature(bar)]
@@ -32,6 +35,11 @@ fn bar() {}
 #[target_feature(enable = "sse2")]
 //~^ ERROR: should be applied to a function
 mod another {}
+
+#[inline(always)]
+//~^ ERROR: cannot use #[inline(always)]
+#[target_feature(enable = "sse2")]
+unsafe fn test() {}
 
 fn main() {
     unsafe {

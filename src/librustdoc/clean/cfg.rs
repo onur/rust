@@ -67,7 +67,7 @@ impl Cfg {
     /// If the content is not properly formatted, it will return an error indicating what and where
     /// the error is.
     pub fn parse(cfg: &MetaItem) -> Result<Cfg, InvalidCfgError> {
-        let name = cfg.name();
+        let name = cfg.ident.name;
         match cfg.node {
             MetaItemKind::Word => Ok(Cfg::Cfg(name, None)),
             MetaItemKind::NameValue(ref lit) => match lit.node {
@@ -138,7 +138,7 @@ impl Cfg {
 
     /// Renders the configuration for human display, as a short HTML description.
     pub(crate) fn render_short_html(&self) -> String {
-        let mut msg = Html(self).to_string();
+        let mut msg = ShortHtml(self).to_string();
         if self.should_capitalize_first_letter() {
             if let Some(i) = msg.find(|c: char| c.is_ascii_alphanumeric()) {
                 msg[i .. i+1].make_ascii_uppercase();
@@ -149,7 +149,13 @@ impl Cfg {
 
     /// Renders the configuration for long display, as a long HTML description.
     pub(crate) fn render_long_html(&self) -> String {
-        let mut msg = format!("This is supported on <strong>{}</strong>", Html(self));
+        let on = if self.should_use_with_in_description() {
+            "with"
+        } else {
+            "on"
+        };
+
+        let mut msg = format!("This is supported {} <strong>{}</strong>", on, Html(self));
         if self.should_append_only_to_description() {
             msg.push_str(" only");
         }
@@ -178,6 +184,13 @@ impl Cfg {
                 Cfg::Cfg(..) => true,
                 _ => false,
             }
+        }
+    }
+
+    fn should_use_with_in_description(&self) -> bool {
+        match *self {
+            Cfg::Cfg(ref name, _) if name == &"target_feature" => true,
+            _ => false,
         }
     }
 }
@@ -376,6 +389,8 @@ impl<'a> fmt::Display for Html<'a> {
                     },
                     ("target_endian", Some(endian)) => return write!(fmt, "{}-endian", endian),
                     ("target_pointer_width", Some(bits)) => return write!(fmt, "{}-bit", bits),
+                    ("target_feature", Some(feat)) =>
+                        return write!(fmt, "target feature <code>{}</code>", feat),
                     _ => "",
                 };
                 if !human_readable.is_empty() {
@@ -386,6 +401,19 @@ impl<'a> fmt::Display for Html<'a> {
                     write!(fmt, "<code>{}</code>", Escape(n))
                 }
             }
+        }
+    }
+}
+
+struct ShortHtml<'a>(&'a Cfg);
+
+impl<'a> fmt::Display for ShortHtml<'a> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        match *self.0 {
+            Cfg::Cfg(ref name, Some(ref vendor)) if name == &"target_feature" => {
+                write!(fmt, "<code>{}</code>", vendor)
+            },
+            ref cfg => write!(fmt, "{}", Html(cfg)),
         }
     }
 }
@@ -534,14 +562,14 @@ mod test {
     fn test_parse_ok() {
         with_globals(|| {
             let mi = MetaItem {
-                name: Symbol::intern("all"),
+                ident: Ident::from_str("all"),
                 node: MetaItemKind::Word,
                 span: DUMMY_SP,
             };
             assert_eq!(Cfg::parse(&mi), Ok(word_cfg("all")));
 
             let mi = MetaItem {
-                name: Symbol::intern("all"),
+                ident: Ident::from_str("all"),
                 node: MetaItemKind::NameValue(dummy_spanned(LitKind::Str(
                     Symbol::intern("done"),
                     StrStyle::Cooked,
@@ -551,15 +579,15 @@ mod test {
             assert_eq!(Cfg::parse(&mi), Ok(name_value_cfg("all", "done")));
 
             let mi = MetaItem {
-                name: Symbol::intern("all"),
+                ident: Ident::from_str("all"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("a"),
+                        ident: Ident::from_str("a"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("b"),
+                        ident: Ident::from_str("b"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
@@ -569,15 +597,15 @@ mod test {
             assert_eq!(Cfg::parse(&mi), Ok(word_cfg("a") & word_cfg("b")));
 
             let mi = MetaItem {
-                name: Symbol::intern("any"),
+                ident: Ident::from_str("any"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("a"),
+                        ident: Ident::from_str("a"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("b"),
+                        ident: Ident::from_str("b"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
@@ -587,10 +615,10 @@ mod test {
             assert_eq!(Cfg::parse(&mi), Ok(word_cfg("a") | word_cfg("b")));
 
             let mi = MetaItem {
-                name: Symbol::intern("not"),
+                ident: Ident::from_str("not"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("a"),
+                        ident: Ident::from_str("a"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
@@ -600,26 +628,26 @@ mod test {
             assert_eq!(Cfg::parse(&mi), Ok(!word_cfg("a")));
 
             let mi = MetaItem {
-                name: Symbol::intern("not"),
+                ident: Ident::from_str("not"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("any"),
+                        ident: Ident::from_str("any"),
                         node: MetaItemKind::List(vec![
                             dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                                name: Symbol::intern("a"),
+                                ident: Ident::from_str("a"),
                                 node: MetaItemKind::Word,
                                 span: DUMMY_SP,
                             })),
                             dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                                name: Symbol::intern("all"),
+                                ident: Ident::from_str("all"),
                                 node: MetaItemKind::List(vec![
                                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                                        name: Symbol::intern("b"),
+                                        ident: Ident::from_str("b"),
                                         node: MetaItemKind::Word,
                                         span: DUMMY_SP,
                                     })),
                                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                                        name: Symbol::intern("c"),
+                                        ident: Ident::from_str("c"),
                                         node: MetaItemKind::Word,
                                         span: DUMMY_SP,
                                     })),
@@ -635,20 +663,20 @@ mod test {
             assert_eq!(Cfg::parse(&mi), Ok(!(word_cfg("a") | (word_cfg("b") & word_cfg("c")))));
 
             let mi = MetaItem {
-                name: Symbol::intern("all"),
+                ident: Ident::from_str("all"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("a"),
+                        ident: Ident::from_str("a"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("b"),
+                        ident: Ident::from_str("b"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("c"),
+                        ident: Ident::from_str("c"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
@@ -663,22 +691,22 @@ mod test {
     fn test_parse_err() {
         with_globals(|| {
             let mi = MetaItem {
-                name: Symbol::intern("foo"),
+                ident: Ident::from_str("foo"),
                 node: MetaItemKind::NameValue(dummy_spanned(LitKind::Bool(false))),
                 span: DUMMY_SP,
             };
             assert!(Cfg::parse(&mi).is_err());
 
             let mi = MetaItem {
-                name: Symbol::intern("not"),
+                ident: Ident::from_str("not"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("a"),
+                        ident: Ident::from_str("a"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("b"),
+                        ident: Ident::from_str("b"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
@@ -688,17 +716,17 @@ mod test {
             assert!(Cfg::parse(&mi).is_err());
 
             let mi = MetaItem {
-                name: Symbol::intern("not"),
+                ident: Ident::from_str("not"),
                 node: MetaItemKind::List(vec![]),
                 span: DUMMY_SP,
             };
             assert!(Cfg::parse(&mi).is_err());
 
             let mi = MetaItem {
-                name: Symbol::intern("foo"),
+                ident: Ident::from_str("foo"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("a"),
+                        ident: Ident::from_str("a"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
@@ -708,15 +736,15 @@ mod test {
             assert!(Cfg::parse(&mi).is_err());
 
             let mi = MetaItem {
-                name: Symbol::intern("all"),
+                ident: Ident::from_str("all"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("foo"),
+                        ident: Ident::from_str("foo"),
                         node: MetaItemKind::List(vec![]),
                         span: DUMMY_SP,
                     })),
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("b"),
+                        ident: Ident::from_str("b"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
@@ -726,15 +754,15 @@ mod test {
             assert!(Cfg::parse(&mi).is_err());
 
             let mi = MetaItem {
-                name: Symbol::intern("any"),
+                ident: Ident::from_str("any"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("a"),
+                        ident: Ident::from_str("a"),
                         node: MetaItemKind::Word,
                         span: DUMMY_SP,
                     })),
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("foo"),
+                        ident: Ident::from_str("foo"),
                         node: MetaItemKind::List(vec![]),
                         span: DUMMY_SP,
                     })),
@@ -744,10 +772,10 @@ mod test {
             assert!(Cfg::parse(&mi).is_err());
 
             let mi = MetaItem {
-                name: Symbol::intern("not"),
+                ident: Ident::from_str("not"),
                 node: MetaItemKind::List(vec![
                     dummy_spanned(NestedMetaItemKind::MetaItem(MetaItem {
-                        name: Symbol::intern("foo"),
+                        ident: Ident::from_str("foo"),
                         node: MetaItemKind::List(vec![]),
                         span: DUMMY_SP,
                     })),
@@ -824,6 +852,10 @@ mod test {
                 ).render_short_html(),
                 "(Debug-assertions enabled or Windows) and Unix"
             );
+            assert_eq!(
+                name_value_cfg("target_feature", "sse2").render_short_html(),
+                "<code>sse2</code>"
+            );
         })
     }
 
@@ -897,6 +929,10 @@ mod test {
                 ).render_long_html(),
                 "This is supported on <strong>(debug-assertions enabled or Windows) and Unix\
                 </strong> only."
+            );
+            assert_eq!(
+                name_value_cfg("target_feature", "sse2").render_long_html(),
+                "This is supported with <strong>target feature <code>sse2</code></strong> only."
             );
         })
     }

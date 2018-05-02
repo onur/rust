@@ -13,6 +13,7 @@ use common::{CompileFail, ParseFail, Pretty, RunFail, RunPass, RunPassValgrind};
 use common::{Codegen, CodegenUnits, DebugInfoGdb, DebugInfoLldb, Rustdoc};
 use common::{Incremental, MirOpt, RunMake, Ui};
 use common::{expected_output_path, UI_STDERR, UI_STDOUT};
+use common::CompareMode;
 use diff;
 use errors::{self, Error, ErrorKind};
 use filetime::FileTime;
@@ -25,7 +26,7 @@ use std::collections::VecDeque;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, create_dir_all, File};
 use std::fmt;
 use std::io::prelude::*;
@@ -67,6 +68,26 @@ impl Mismatch {
         Mismatch {
             line_number: line_number,
             lines: Vec::new(),
+        }
+    }
+}
+
+trait PathBufExt {
+    /// Append an extension to the path, even if it already has one.
+    fn with_extra_extension<S: AsRef<OsStr>>(&self, extension: S) -> PathBuf;
+}
+
+impl PathBufExt for PathBuf {
+    fn with_extra_extension<S: AsRef<OsStr>>(&self, extension: S) -> PathBuf {
+        if extension.as_ref().len() == 0 {
+            self.clone()
+        } else {
+            let mut fname = self.file_name().unwrap().to_os_string();
+            if !extension.as_ref().to_str().unwrap().starts_with(".") {
+                fname.push(".");
+            }
+            fname.push(extension);
+            self.with_file_name(fname)
         }
     }
 }
@@ -231,7 +252,7 @@ impl<'test> TestCx<'test> {
     }
 
     fn check_if_test_should_compile(&self, proc_res: &ProcRes) {
-        if self.props.must_compile_successfully {
+        if self.props.compile_pass {
             if !proc_res.status.success() {
                 self.fatal_proc_rec("test compilation failed although it shouldn't!", proc_res);
             }
@@ -322,9 +343,11 @@ impl<'test> TestCx<'test> {
             "run-pass tests with expected warnings should be moved to ui/"
         );
 
-        let proc_res = self.exec_compiled_test();
-        if !proc_res.status.success() {
-            self.fatal_proc_rec("test run failed!", &proc_res);
+        if !self.props.skip_trans {
+            let proc_res = self.exec_compiled_test();
+            if !proc_res.status.success() {
+                self.fatal_proc_rec("test run failed!", &proc_res);
+            }
         }
     }
 
@@ -1099,7 +1122,7 @@ impl<'test> TestCx<'test> {
 
     fn check_error_patterns(&self, output_to_check: &str, proc_res: &ProcRes) {
         if self.props.error_patterns.is_empty() {
-            if self.props.must_compile_successfully {
+            if self.props.compile_pass {
                 return;
             } else {
                 self.fatal(&format!(
@@ -1145,6 +1168,8 @@ impl<'test> TestCx<'test> {
         for line in proc_res.stderr.lines() {
             if line.contains("error: internal compiler error") {
                 self.fatal_proc_rec("compiler encountered internal error", proc_res);
+            } else if line.contains(" panicked at ") {
+                self.fatal_proc_rec("compiler panicked", proc_res);
             }
         }
     }
@@ -1287,7 +1312,9 @@ impl<'test> TestCx<'test> {
                 // want to actually assert warnings about all this code. Instead
                 // let's just ignore unused code warnings by defaults and tests
                 // can turn it back on if needed.
-                rustc.args(&["-A", "unused"]);
+                if !self.config.src_base.ends_with("rustdoc-ui") {
+                    rustc.args(&["-A", "unused"]);
+                }
             }
             _ => {}
         }
@@ -1324,6 +1351,8 @@ impl<'test> TestCx<'test> {
         let mut rustdoc = Command::new(rustdoc_path);
 
         rustdoc
+            .arg("-L")
+            .arg(self.config.run_lib_path.to_str().unwrap())
             .arg("-L")
             .arg(aux_dir)
             .arg("-o")
@@ -1579,7 +1608,12 @@ impl<'test> TestCx<'test> {
     }
 
     fn make_compile_args(&self, input_file: &Path, output_file: TargetLocation) -> Command {
-        let mut rustc = Command::new(&self.config.rustc_path);
+        let is_rustdoc = self.config.src_base.ends_with("rustdoc-ui");
+        let mut rustc = if !is_rustdoc {
+            Command::new(&self.config.rustc_path)
+        } else {
+            Command::new(&self.config.rustdoc_path.clone().expect("no rustdoc built yet"))
+        };
         rustc.arg(input_file).arg("-L").arg(&self.config.build_base);
 
         // Optionally prevent default --target if specified in test compile-flags.
@@ -1602,17 +1636,19 @@ impl<'test> TestCx<'test> {
             rustc.args(&["--cfg", revision]);
         }
 
-        if let Some(ref incremental_dir) = self.props.incremental_dir {
-            rustc.args(&[
-                "-C",
-                &format!("incremental={}", incremental_dir.display()),
-            ]);
-            rustc.args(&["-Z", "incremental-verify-ich"]);
-            rustc.args(&["-Z", "incremental-queries"]);
-        }
+        if !is_rustdoc {
+            if let Some(ref incremental_dir) = self.props.incremental_dir {
+                rustc.args(&[
+                    "-C",
+                    &format!("incremental={}", incremental_dir.display()),
+                ]);
+                rustc.args(&["-Z", "incremental-verify-ich"]);
+                rustc.args(&["-Z", "incremental-queries"]);
+            }
 
-        if self.config.mode == CodegenUnits {
-            rustc.args(&["-Z", "human_readable_cgu_names"]);
+            if self.config.mode == CodegenUnits {
+                rustc.args(&["-Z", "human_readable_cgu_names"]);
+            }
         }
 
         match self.config.mode {
@@ -1665,11 +1701,17 @@ impl<'test> TestCx<'test> {
             }
         }
 
+        if self.props.skip_trans {
+            assert!(!self.props.compile_flags.iter().any(|s| s.starts_with("--emit")));
+            rustc.args(&["--emit", "metadata"]);
+        }
 
-        if self.config.target == "wasm32-unknown-unknown" {
-            // rustc.arg("-g"); // get any backtrace at all on errors
-        } else if !self.props.no_prefer_dynamic {
-            rustc.args(&["-C", "prefer-dynamic"]);
+        if !is_rustdoc {
+            if self.config.target == "wasm32-unknown-unknown" {
+                // rustc.arg("-g"); // get any backtrace at all on errors
+            } else if !self.props.no_prefer_dynamic {
+                rustc.args(&["-C", "prefer-dynamic"]);
+            }
         }
 
         match output_file {
@@ -1681,13 +1723,22 @@ impl<'test> TestCx<'test> {
             }
         }
 
+        match self.config.compare_mode {
+            Some(CompareMode::Nll) => {
+                rustc.args(&["-Zborrowck=mir", "-Ztwo-phase-borrows"]);
+            },
+            None => {},
+        }
+
         if self.props.force_host {
             rustc.args(self.split_maybe_args(&self.config.host_rustcflags));
         } else {
             rustc.args(self.split_maybe_args(&self.config.target_rustcflags));
         }
-        if let Some(ref linker) = self.config.linker {
-            rustc.arg(format!("-Clinker={}", linker));
+        if !is_rustdoc {
+            if let Some(ref linker) = self.config.linker {
+                rustc.arg(format!("-Clinker={}", linker));
+            }
         }
 
         rustc.args(&self.props.compile_flags);
@@ -1703,20 +1754,14 @@ impl<'test> TestCx<'test> {
     }
 
     fn make_exe_name(&self) -> PathBuf {
-        let mut f = self.output_base_name();
+        let mut f = self.output_base_name_stage();
         // FIXME: This is using the host architecture exe suffix, not target!
         if self.config.target.contains("emscripten") {
-            let mut fname = f.file_name().unwrap().to_os_string();
-            fname.push(".js");
-            f.set_file_name(&fname);
+            f = f.with_extra_extension("js");
         } else if self.config.target.contains("wasm32") {
-            let mut fname = f.file_name().unwrap().to_os_string();
-            fname.push(".wasm");
-            f.set_file_name(&fname);
+            f = f.with_extra_extension("wasm");
         } else if !env::consts::EXE_SUFFIX.is_empty() {
-            let mut fname = f.file_name().unwrap().to_os_string();
-            fname.push(env::consts::EXE_SUFFIX);
-            f.set_file_name(&fname);
+            f = f.with_extra_extension(env::consts::EXE_SUFFIX);
         }
         f
     }
@@ -1824,25 +1869,28 @@ impl<'test> TestCx<'test> {
     }
 
     fn aux_output_dir_name(&self) -> PathBuf {
-        let f = self.output_base_name();
-        let mut fname = f.file_name().unwrap().to_os_string();
-        fname.push(&format!("{}.aux", self.config.mode.disambiguator()));
-        f.with_file_name(&fname)
+        self.output_base_name_stage()
+            .with_extra_extension(self.config.mode.disambiguator())
+            .with_extra_extension(".aux")
     }
 
     fn output_testname(&self, filepath: &Path) -> PathBuf {
         PathBuf::from(filepath.file_stem().unwrap())
     }
 
-    /// Given a test path like `compile-fail/foo/bar.rs` Returns a name like
-    ///
-    ///     <output>/foo/bar-stage1
+    /// Given a test path like `compile-fail/foo/bar.rs` returns a name like
+    /// `/path/to/build/<triple>/test/compile-fail/foo/bar`.
     fn output_base_name(&self) -> PathBuf {
         let dir = self.config.build_base.join(&self.testpaths.relative_dir);
 
         // Note: The directory `dir` is created during `collect_tests_from_dir`
         dir.join(&self.output_testname(&self.testpaths.file))
-            .with_extension(&self.config.stage_id)
+    }
+
+    /// Same as `output_base_name`, but includes the stage ID as an extension,
+    /// such as: `.../compile-fail/foo/bar.stage1-<triple>`
+    fn output_base_name_stage(&self) -> PathBuf {
+        self.output_base_name().with_extension(&self.config.stage_id)
     }
 
     fn maybe_dump_to_stdout(&self, out: &str, err: &str) {
@@ -1967,7 +2015,7 @@ impl<'test> TestCx<'test> {
     fn run_rustdoc_test(&self) {
         assert!(self.revision.is_none(), "revisions not relevant here");
 
-        let out_dir = self.output_base_name();
+        let out_dir = self.output_base_name_stage();
         let _ = fs::remove_dir_all(&out_dir);
         create_dir_all(&out_dir).unwrap();
 
@@ -2358,11 +2406,6 @@ impl<'test> TestCx<'test> {
     }
 
     fn run_rmake_test(&self) {
-        // FIXME(#11094): we should fix these tests
-        if self.config.host != self.config.target {
-            return;
-        }
-
         let cwd = env::current_dir().unwrap();
         let src_root = self.config
             .src_base
@@ -2374,7 +2417,7 @@ impl<'test> TestCx<'test> {
             .unwrap();
         let src_root = cwd.join(&src_root);
 
-        let tmpdir = cwd.join(self.output_base_name());
+        let tmpdir = cwd.join(self.output_base_name_stage());
         if tmpdir.exists() {
             self.aggressive_rm_rf(&tmpdir).unwrap();
         }
@@ -2399,13 +2442,6 @@ impl<'test> TestCx<'test> {
             .env("S", src_root)
             .env("RUST_BUILD_STAGE", &self.config.stage_id)
             .env("RUSTC", cwd.join(&self.config.rustc_path))
-            .env(
-                "RUSTDOC",
-                cwd.join(&self.config
-                    .rustdoc_path
-                    .as_ref()
-                    .expect("--rustdoc-path passed")),
-            )
             .env("TMPDIR", &tmpdir)
             .env("LD_LIB_PATH_ENVVAR", dylib_env_var())
             .env("HOST_RPATH_DIR", cwd.join(&self.config.compile_lib_path))
@@ -2420,6 +2456,14 @@ impl<'test> TestCx<'test> {
             .env_remove("MFLAGS")
             .env_remove("CARGO_MAKEFLAGS");
 
+        if let Some(ref rustdoc) = self.config.rustdoc_path {
+            cmd.env("RUSTDOC", cwd.join(rustdoc));
+        }
+
+        if let Some(ref node) = self.config.nodejs {
+            cmd.env("NODE", node);
+        }
+
         if let Some(ref linker) = self.config.linker {
             cmd.env("RUSTC_LINKER", linker);
         }
@@ -2428,7 +2472,7 @@ impl<'test> TestCx<'test> {
         // compiler flags set in the test cases:
         cmd.env_remove("RUSTFLAGS");
 
-        if self.config.target.contains("msvc") {
+        if self.config.target.contains("msvc") && self.config.cc != "" {
             // We need to pass a path to `lib.exe`, so assume that `cc` is `cl.exe`
             // and that `lib.exe` lives next to it.
             let lib = Path::new(&self.config.cc).parent().unwrap().join("lib.exe");
@@ -2503,15 +2547,11 @@ impl<'test> TestCx<'test> {
             .compile_flags
             .iter()
             .any(|s| s.contains("--error-format"));
-
         let proc_res = self.compile_test();
         self.check_if_test_should_compile(&proc_res);
 
-        let expected_stderr_path = self.expected_output_path(UI_STDERR);
-        let expected_stderr = self.load_expected_output(&expected_stderr_path);
-
-        let expected_stdout_path = self.expected_output_path(UI_STDOUT);
-        let expected_stdout = self.load_expected_output(&expected_stdout_path);
+        let expected_stderr = self.load_expected_output(UI_STDERR);
+        let expected_stdout = self.load_expected_output(UI_STDOUT);
 
         let normalized_stdout =
             self.normalize_output(&proc_res.stdout, &self.props.normalize_stdout);
@@ -2554,7 +2594,7 @@ impl<'test> TestCx<'test> {
                 self.fatal_proc_rec("test run failed!", &proc_res);
             }
         }
-        if !explicit {
+        if !explicit && self.config.compare_mode.is_none() {
             if !expected_errors.is_empty() || !proc_res.status.success() {
                 // "// error-pattern" comments
                 self.check_expected_errors(expected_errors, &proc_res);
@@ -2798,18 +2838,35 @@ impl<'test> TestCx<'test> {
     }
 
     fn expected_output_path(&self, kind: &str) -> PathBuf {
-        expected_output_path(&self.testpaths, self.revision, kind)
-    }
-
-    fn load_expected_output(&self, path: &Path) -> String {
-        if !path.exists() {
-            return String::new();
+        let mut path = expected_output_path(&self.testpaths,
+                                            self.revision,
+                                            &self.config.compare_mode,
+                                            kind);
+        if !path.exists() && self.config.compare_mode.is_some() {
+            // fallback!
+            path = expected_output_path(&self.testpaths, self.revision, &None, kind);
         }
 
+        path
+    }
+
+    fn load_expected_output(&self, kind: &str) -> String {
+        let path = self.expected_output_path(kind);
+        if path.exists() {
+            match self.load_expected_output_from_path(&path) {
+                Ok(x) => x,
+                Err(x) => self.fatal(&x),
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    fn load_expected_output_from_path(&self, path: &Path) -> Result<String, String> {
         let mut result = String::new();
         match File::open(path).and_then(|mut f| f.read_to_string(&mut result)) {
-            Ok(_) => result,
-            Err(e) => self.fatal(&format!(
+            Ok(_) => Ok(result),
+            Err(e) => Err(format!(
                 "failed to load expected output from `{}`: {}",
                 path.display(),
                 e
@@ -2848,7 +2905,12 @@ impl<'test> TestCx<'test> {
             }
         }
 
-        let output_file = self.output_base_name().with_extension(kind);
+        let mode = self.config.compare_mode.as_ref().map_or("", |m| m.to_str());
+        let output_file = self.output_base_name()
+            .with_extra_extension(self.revision.unwrap_or(""))
+            .with_extra_extension(mode)
+            .with_extra_extension(kind);
+
         match File::create(&output_file).and_then(|mut f| f.write_all(actual.as_bytes())) {
             Ok(()) => {}
             Err(e) => self.fatal(&format!(

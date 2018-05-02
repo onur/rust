@@ -11,11 +11,15 @@
 
 use std::ffi::{CStr, CString};
 
-use rustc::hir::TransFnAttrFlags;
+use rustc::hir::{self, TransFnAttrFlags};
 use rustc::hir::def_id::{DefId, LOCAL_CRATE};
+use rustc::hir::itemlikevisit::ItemLikeVisitor;
+use rustc::session::Session;
 use rustc::session::config::Sanitizer;
+use rustc::ty::TyCtxt;
 use rustc::ty::maps::Providers;
 use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::fx::FxHashMap;
 
 use llvm::{self, Attribute, ValueRef};
 use llvm::AttributePlace::Function;
@@ -65,8 +69,6 @@ pub fn naked(val: ValueRef, is_naked: bool) {
 }
 
 pub fn set_frame_pointer_elimination(cx: &CodegenCx, llfn: ValueRef) {
-    // FIXME: #11906: Omitting frame pointers breaks retrieving the value of a
-    // parameter.
     if cx.sess().must_not_eliminate_frame_pointers() {
         llvm::AddFunctionAttrStringValue(
             llfn, llvm::AttributePlace::Function,
@@ -89,11 +91,28 @@ pub fn set_probestack(cx: &CodegenCx, llfn: ValueRef) {
         _ => {}
     }
 
+    // probestack doesn't play nice either with pgo-gen.
+    if cx.sess().opts.debugging_opts.pgo_gen.is_some() {
+        return;
+    }
+
     // Flag our internal `__rust_probestack` function as the stack probe symbol.
     // This is defined in the `compiler-builtins` crate for each architecture.
     llvm::AddFunctionAttrStringValue(
         llfn, llvm::AttributePlace::Function,
         cstr("probe-stack\0"), cstr("__rust_probestack\0"));
+}
+
+pub fn llvm_target_features(sess: &Session) -> impl Iterator<Item = &str> {
+    const RUSTC_SPECIFIC_FEATURES: &[&str] = &[
+        "crt-static",
+    ];
+
+    let cmdline = sess.opts.cg.target_feature.split(',')
+        .filter(|f| !RUSTC_SPECIFIC_FEATURES.iter().any(|s| f.contains(s)));
+    sess.target.target.options.features.split(',')
+        .chain(cmdline)
+        .filter(|l| !l.is_empty())
 }
 
 /// Composite function which sets LLVM attributes for function depending on its AST (#[attribute])
@@ -123,13 +142,16 @@ pub fn from_fn_attrs(cx: &CodegenCx, llfn: ValueRef, id: DefId) {
         unwind(llfn, false);
     }
 
-    let features =
-        trans_fn_attrs.target_features
-        .iter()
-        .map(|f| {
-            let feature = &*f.as_str();
-            format!("+{}", llvm_util::to_llvm_feature(cx.tcx.sess, feature))
-        })
+    let features = llvm_target_features(cx.tcx.sess)
+        .map(|s| s.to_string())
+        .chain(
+            trans_fn_attrs.target_features
+                .iter()
+                .map(|f| {
+                    let feature = &*f.as_str();
+                    format!("+{}", llvm_util::to_llvm_feature(cx.tcx.sess, feature))
+                })
+        )
         .collect::<Vec<String>>()
         .join(",");
 
@@ -138,6 +160,20 @@ pub fn from_fn_attrs(cx: &CodegenCx, llfn: ValueRef, id: DefId) {
         llvm::AddFunctionAttrStringValue(
             llfn, llvm::AttributePlace::Function,
             cstr("target-features\0"), &val);
+    }
+
+    // Note that currently the `wasm-import-module` doesn't do anything, but
+    // eventually LLVM 7 should read this and ferry the appropriate import
+    // module to the output file.
+    if cx.tcx.sess.target.target.arch == "wasm32" {
+        if let Some(module) = wasm_import_module(cx.tcx, id) {
+            llvm::AddFunctionAttrStringValue(
+                llfn,
+                llvm::AttributePlace::Function,
+                cstr("wasm-import-module\0"),
+                &module,
+            );
+        }
     }
 }
 
@@ -148,9 +184,76 @@ fn cstr(s: &'static str) -> &CStr {
 pub fn provide(providers: &mut Providers) {
     providers.target_features_whitelist = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);
-        Lrc::new(llvm_util::target_feature_whitelist(tcx.sess)
-            .iter()
-            .map(|c| c.to_string())
-            .collect())
+        if tcx.sess.opts.actually_rustdoc {
+            // rustdoc needs to be able to document functions that use all the features, so
+            // whitelist them all
+            Lrc::new(llvm_util::all_known_features()
+                .map(|(a, b)| (a.to_string(), b.map(|s| s.to_string())))
+                .collect())
+        } else {
+            Lrc::new(llvm_util::target_feature_whitelist(tcx.sess)
+                .iter()
+                .map(|&(a, b)| (a.to_string(), b.map(|s| s.to_string())))
+                .collect())
+        }
     };
+
+    providers.wasm_custom_sections = |tcx, cnum| {
+        assert_eq!(cnum, LOCAL_CRATE);
+        let mut finder = WasmSectionFinder { tcx, list: Vec::new() };
+        tcx.hir.krate().visit_all_item_likes(&mut finder);
+        Lrc::new(finder.list)
+    };
+
+    provide_extern(providers);
+}
+
+struct WasmSectionFinder<'a, 'tcx: 'a> {
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    list: Vec<DefId>,
+}
+
+impl<'a, 'tcx: 'a> ItemLikeVisitor<'tcx> for WasmSectionFinder<'a, 'tcx> {
+    fn visit_item(&mut self, i: &'tcx hir::Item) {
+        match i.node {
+            hir::ItemConst(..) => {}
+            _ => return,
+        }
+        if i.attrs.iter().any(|i| i.check_name("wasm_custom_section")) {
+            self.list.push(self.tcx.hir.local_def_id(i.id));
+        }
+    }
+
+    fn visit_trait_item(&mut self, _: &'tcx hir::TraitItem) {}
+
+    fn visit_impl_item(&mut self, _: &'tcx hir::ImplItem) {}
+}
+
+pub fn provide_extern(providers: &mut Providers) {
+    providers.wasm_import_module_map = |tcx, cnum| {
+        let mut ret = FxHashMap();
+        for lib in tcx.foreign_modules(cnum).iter() {
+            let attrs = tcx.get_attrs(lib.def_id);
+            let mut module = None;
+            for attr in attrs.iter().filter(|a| a.check_name("wasm_import_module")) {
+                module = attr.value_str();
+            }
+            let module = match module {
+                Some(s) => s,
+                None => continue,
+            };
+            for id in lib.foreign_items.iter() {
+                assert_eq!(id.krate, cnum);
+                ret.insert(*id, module.to_string());
+            }
+        }
+
+        Lrc::new(ret)
+    }
+}
+
+fn wasm_import_module(tcx: TyCtxt, id: DefId) -> Option<CString> {
+    tcx.wasm_import_module_map(id.krate)
+        .get(&id)
+        .map(|s| CString::new(&s[..]).unwrap())
 }

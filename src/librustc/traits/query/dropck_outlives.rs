@@ -15,7 +15,7 @@ use std::iter::FromIterator;
 use traits::query::CanonicalTyGoal;
 use ty::{self, Ty, TyCtxt};
 use ty::subst::Kind;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 
 impl<'cx, 'gcx, 'tcx> At<'cx, 'gcx, 'tcx> {
     /// Given a type `ty` of some value being dropped, computes a set
@@ -51,6 +51,7 @@ impl<'cx, 'gcx, 'tcx> At<'cx, 'gcx, 'tcx> {
         let gcx = tcx.global_tcx();
         let (c_ty, orig_values) = self.infcx.canonicalize_query(&self.param_env.and(ty));
         let span = self.cause.span;
+        debug!("c_ty = {:?}", c_ty);
         match &gcx.dropck_outlives(c_ty) {
             Ok(result) if result.is_proven() => {
                 match self.infcx.instantiate_query_result(
@@ -182,13 +183,13 @@ impl_stable_hash_for!(struct DropckOutlivesResult<'tcx> {
 
 impl<'gcx: 'tcx, 'tcx> Canonicalize<'gcx, 'tcx> for QueryResult<'tcx, DropckOutlivesResult<'tcx>> {
     // we ought to intern this, but I'm too lazy just now
-    type Canonicalized = Rc<Canonical<'gcx, QueryResult<'gcx, DropckOutlivesResult<'gcx>>>>;
+    type Canonicalized = Lrc<Canonical<'gcx, QueryResult<'gcx, DropckOutlivesResult<'gcx>>>>;
 
     fn intern(
         _gcx: TyCtxt<'_, 'gcx, 'gcx>,
         value: Canonical<'gcx, Self::Lifted>,
     ) -> Self::Canonicalized {
-        Rc::new(value)
+        Lrc::new(value)
     }
 }
 

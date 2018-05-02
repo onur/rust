@@ -12,7 +12,7 @@ use self::Destination::*;
 
 use syntax_pos::{DUMMY_SP, FileMap, Span, MultiSpan};
 
-use {Level, CodeSuggestion, DiagnosticBuilder, SubDiagnostic, CodeMapper, DiagnosticId};
+use {Level, CodeSuggestion, DiagnosticBuilder, SubDiagnostic, CodeMapperDyn, DiagnosticId};
 use snippet::{Annotation, AnnotationType, Line, MultilineAnnotation, StyledString, Style};
 use styled_buffer::StyledBuffer;
 
@@ -120,7 +120,7 @@ impl ColorConfig {
 
 pub struct EmitterWriter {
     dst: Destination,
-    cm: Option<Lrc<CodeMapper>>,
+    cm: Option<Lrc<CodeMapperDyn>>,
     short_message: bool,
     teach: bool,
     ui_testing: bool,
@@ -134,7 +134,7 @@ struct FileWithAnnotatedLines {
 
 impl EmitterWriter {
     pub fn stderr(color_config: ColorConfig,
-                  code_map: Option<Lrc<CodeMapper>>,
+                  code_map: Option<Lrc<CodeMapperDyn>>,
                   short_message: bool,
                   teach: bool)
                   -> EmitterWriter {
@@ -149,7 +149,7 @@ impl EmitterWriter {
     }
 
     pub fn new(dst: Box<Write + Send>,
-               code_map: Option<Lrc<CodeMapper>>,
+               code_map: Option<Lrc<CodeMapperDyn>>,
                short_message: bool,
                teach: bool)
                -> EmitterWriter {
@@ -1195,8 +1195,6 @@ impl EmitterWriter {
                                level: &Level,
                                max_line_num_len: usize)
                                -> io::Result<()> {
-        use std::borrow::Borrow;
-
         if let Some(ref cm) = self.cm {
             let mut buffer = StyledBuffer::new();
 
@@ -1213,7 +1211,7 @@ impl EmitterWriter {
                                Some(Style::HeaderMsg));
 
             // Render the replacements for each suggestion
-            let suggestions = suggestion.splice_lines(cm.borrow());
+            let suggestions = suggestion.splice_lines(&**cm);
 
             let mut row_num = 2;
             for &(ref complete, ref parts) in suggestions.iter().take(MAX_SUGGESTIONS) {
@@ -1391,8 +1389,8 @@ fn num_overlap(a_start: usize, a_end: usize, b_start: usize, b_end:usize, inclus
     } else {
         0
     };
-    (b_start..b_end + extra).contains(a_start) ||
-    (a_start..a_end + extra).contains(b_start)
+    (b_start..b_end + extra).contains(&a_start) ||
+    (a_start..a_end + extra).contains(&b_start)
 }
 fn overlaps(a1: &Annotation, a2: &Annotation, padding: usize) -> bool {
     num_overlap(a1.start_col, a1.end_col + padding, a2.start_col, a2.end_col, false)
