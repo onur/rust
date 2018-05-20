@@ -35,6 +35,7 @@ use std::{cmp, fs};
 
 use syntax::ast;
 use syntax::attr;
+use syntax::edition::Edition;
 use syntax::ext::base::SyntaxExtension;
 use syntax::symbol::Symbol;
 use syntax::visit;
@@ -51,7 +52,6 @@ pub struct Library {
 pub struct CrateLoader<'a> {
     pub sess: &'a Session,
     cstore: &'a CStore,
-    next_crate_num: CrateNum,
     local_crate_name: Symbol,
 }
 
@@ -102,7 +102,6 @@ impl<'a> CrateLoader<'a> {
         CrateLoader {
             sess,
             cstore,
-            next_crate_num: cstore.next_crate_num(),
             local_crate_name: Symbol::intern(local_crate_name),
         }
     }
@@ -198,8 +197,7 @@ impl<'a> CrateLoader<'a> {
         self.verify_no_symbol_conflicts(span, &crate_root);
 
         // Claim this crate number and cache it
-        let cnum = self.next_crate_num;
-        self.next_crate_num = CrateNum::from_u32(cnum.as_u32() + 1);
+        let cnum = self.cstore.alloc_new_crate_num();
 
         // Stash paths for top-most crate locally if necessary.
         let crate_paths = if root.is_none() {
@@ -218,6 +216,8 @@ impl<'a> CrateLoader<'a> {
         let Library { dylib, rlib, rmeta, metadata } = lib;
 
         let cnum_map = self.resolve_crate_deps(root, &crate_root, &metadata, cnum, span, dep_kind);
+
+        let dependencies: Vec<CrateNum> = cnum_map.iter().cloned().collect();
 
         let def_path_table = record_time(&self.sess.perf_stats.decode_def_path_tables_time, || {
             crate_root.def_path_table.decode((&metadata, self.sess))
@@ -239,8 +239,9 @@ impl<'a> CrateLoader<'a> {
             }),
             root: crate_root,
             blob: metadata,
-            cnum_map: Lock::new(cnum_map),
+            cnum_map,
             cnum,
+            dependencies: Lock::new(dependencies),
             codemap_import_info: RwLock::new(vec![]),
             attribute_cache: Lock::new([Vec::new(), Vec::new()]),
             dep_kind: Lock::new(dep_kind),
@@ -392,7 +393,7 @@ impl<'a> CrateLoader<'a> {
 
         // Propagate the extern crate info to dependencies.
         extern_crate.direct = false;
-        for &dep_cnum in cmeta.cnum_map.borrow().iter() {
+        for &dep_cnum in cmeta.dependencies.borrow().iter() {
             self.update_extern_crate(dep_cnum, extern_crate, visited);
         }
     }
@@ -535,7 +536,10 @@ impl<'a> CrateLoader<'a> {
             mem::transmute::<*mut u8, fn(&mut Registry)>(sym)
         };
 
-        struct MyRegistrar(Vec<(ast::Name, Lrc<SyntaxExtension>)>);
+        struct MyRegistrar {
+            extensions: Vec<(ast::Name, Lrc<SyntaxExtension>)>,
+            edition: Edition,
+        }
 
         impl Registry for MyRegistrar {
             fn register_custom_derive(&mut self,
@@ -544,36 +548,38 @@ impl<'a> CrateLoader<'a> {
                                       attributes: &[&'static str]) {
                 let attrs = attributes.iter().cloned().map(Symbol::intern).collect::<Vec<_>>();
                 let derive = ProcMacroDerive::new(expand, attrs.clone());
-                let derive = SyntaxExtension::ProcMacroDerive(Box::new(derive), attrs);
-                self.0.push((Symbol::intern(trait_name), Lrc::new(derive)));
+                let derive = SyntaxExtension::ProcMacroDerive(
+                    Box::new(derive), attrs, self.edition
+                );
+                self.extensions.push((Symbol::intern(trait_name), Lrc::new(derive)));
             }
 
             fn register_attr_proc_macro(&mut self,
                                         name: &str,
                                         expand: fn(TokenStream, TokenStream) -> TokenStream) {
                 let expand = SyntaxExtension::AttrProcMacro(
-                    Box::new(AttrProcMacro { inner: expand })
+                    Box::new(AttrProcMacro { inner: expand }), self.edition
                 );
-                self.0.push((Symbol::intern(name), Lrc::new(expand)));
+                self.extensions.push((Symbol::intern(name), Lrc::new(expand)));
             }
 
             fn register_bang_proc_macro(&mut self,
                                         name: &str,
                                         expand: fn(TokenStream) -> TokenStream) {
                 let expand = SyntaxExtension::ProcMacro(
-                    Box::new(BangProcMacro { inner: expand })
+                    Box::new(BangProcMacro { inner: expand }), self.edition
                 );
-                self.0.push((Symbol::intern(name), Lrc::new(expand)));
+                self.extensions.push((Symbol::intern(name), Lrc::new(expand)));
             }
         }
 
-        let mut my_registrar = MyRegistrar(Vec::new());
+        let mut my_registrar = MyRegistrar { extensions: Vec::new(), edition: root.edition };
         registrar(&mut my_registrar);
 
         // Intentionally leak the dynamic library. We can't ever unload it
         // since the library can make things that will live arbitrarily long.
         mem::forget(lib);
-        my_registrar.0
+        my_registrar.extensions
     }
 
     /// Look for a plugin registrar. Returns library path, crate
@@ -1040,7 +1046,7 @@ impl<'a> CrateLoader<'a> {
             }
 
             info!("injecting a dep from {} to {}", cnum, krate);
-            data.cnum_map.borrow_mut().push(krate);
+            data.dependencies.borrow_mut().push(krate);
         });
     }
 }

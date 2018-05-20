@@ -172,7 +172,7 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
 
             match tables.expr_ty_adjusted(&base).sty {
                 // All valid indexing looks like this
-                ty::TyRef(_, ty::TypeAndMut { ty: ref base_ty, .. }) => {
+                ty::TyRef(_, base_ty, _) => {
                     let index_ty = tables.expr_ty_adjusted(&index);
                     let index_ty = self.fcx.resolve_type_vars_if_possible(&index_ty);
 
@@ -593,7 +593,7 @@ impl<'cx, 'gcx, 'tcx> Resolver<'cx, 'gcx, 'tcx> {
     fn report_error(&self, t: Ty<'tcx>) {
         if !self.tcx.sess.has_errors() {
             self.infcx
-                .need_type_info(Some(self.body.id()), self.span.to_span(&self.tcx), t);
+                .need_type_info_err(Some(self.body.id()), self.span.to_span(&self.tcx), t).emit();
         }
     }
 }

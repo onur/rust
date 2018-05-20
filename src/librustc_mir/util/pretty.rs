@@ -137,7 +137,7 @@ fn dump_matched_mir_node<'a, 'gcx, 'tcx, F>(
 ) where
     F: FnMut(PassWhere, &mut dyn Write) -> io::Result<()>,
 {
-    let _: io::Result<()> = do_catch! {{
+    let _: io::Result<()> = do catch {
         let mut file = create_dump_file(tcx, "mir", pass_num, pass_name, disambiguator, source)?;
         writeln!(file, "// MIR for `{}`", node_path)?;
         writeln!(file, "// source = {:?}", source)?;
@@ -150,14 +150,14 @@ fn dump_matched_mir_node<'a, 'gcx, 'tcx, F>(
         extra_data(PassWhere::BeforeCFG, &mut file)?;
         write_mir_fn(tcx, source, mir, &mut extra_data, &mut file)?;
         extra_data(PassWhere::AfterCFG, &mut file)?;
-    }};
+    };
 
     if tcx.sess.opts.debugging_opts.dump_mir_graphviz {
-        let _: io::Result<()> = do_catch! {{
+        let _: io::Result<()> = do catch {
             let mut file =
                 create_dump_file(tcx, "dot", pass_num, pass_name, disambiguator, source)?;
             write_mir_fn_graphviz(tcx, source.def_id, mir, &mut file)?;
-        }};
+        };
     }
 }
 
@@ -402,7 +402,7 @@ impl<'cx, 'gcx, 'tcx> Visitor<'tcx> for ExtraComments<'cx, 'gcx, 'tcx> {
 
     fn visit_const(&mut self, constant: &&'tcx ty::Const<'tcx>, _: Location) {
         self.super_const(constant);
-        let ty::Const { ty, val } = constant;
+        let ty::Const { ty, val, .. } = constant;
         self.push(&format!("ty::Const"));
         self.push(&format!("+ ty: {:?}", ty));
         self.push(&format!("+ val: {:?}", val));
@@ -418,11 +418,11 @@ impl<'cx, 'gcx, 'tcx> Visitor<'tcx> for ExtraComments<'cx, 'gcx, 'tcx> {
                     self.push(&format!("+ substs: {:#?}", substs));
                 }
 
-                AggregateKind::Generator(def_id, substs, interior) => {
+                AggregateKind::Generator(def_id, substs, movability) => {
                     self.push(&format!("generator"));
                     self.push(&format!("+ def_id: {:?}", def_id));
                     self.push(&format!("+ substs: {:#?}", substs));
-                    self.push(&format!("+ interior: {:?}", interior));
+                    self.push(&format!("+ movability: {:?}", movability));
                 }
 
                 _ => {}

@@ -99,25 +99,30 @@ fn test_env<F>(source_string: &str,
     where F: FnOnce(Env)
 {
     syntax::with_globals(|| {
-        test_env_impl(source_string, args, body)
+        let mut options = config::basic_options();
+        options.debugging_opts.verbose = true;
+        options.unstable_features = UnstableFeatures::Allow;
+
+        driver::spawn_thread_pool(options, |options| {
+            test_env_with_pool(options, source_string, args, body)
+        })
     });
 }
 
-fn test_env_impl<F>(source_string: &str,
-                    (emitter, expected_err_count): (Box<Emitter + sync::Send>, usize),
-                    body: F)
+fn test_env_with_pool<F>(
+    options: config::Options,
+    source_string: &str,
+    (emitter, expected_err_count): (Box<Emitter + sync::Send>, usize),
+    body: F
+)
     where F: FnOnce(Env)
 {
-    let mut options = config::basic_options();
-    options.debugging_opts.verbose = true;
-    options.unstable_features = UnstableFeatures::Allow;
     let diagnostic_handler = errors::Handler::with_emitter(true, false, emitter);
-
     let sess = session::build_session_(options,
                                        None,
                                        diagnostic_handler,
                                        Lrc::new(CodeMap::new(FilePathMapping::empty())));
-    let cstore = CStore::new(::get_trans(&sess).metadata_loader());
+    let cstore = CStore::new(::get_codegen_backend(&sess).metadata_loader());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     let input = config::Input::Str {
         name: FileName::Anon,
@@ -303,7 +308,7 @@ impl<'a, 'gcx, 'tcx> Env<'a, 'gcx, 'tcx> {
 
     pub fn t_param(&self, index: u32) -> Ty<'tcx> {
         let name = format!("T{}", index);
-        self.infcx.tcx.mk_param(index, Symbol::intern(&name).as_interned_str())
+        self.infcx.tcx.mk_ty_param(index, Symbol::intern(&name).as_interned_str())
     }
 
     pub fn re_early_bound(&self, index: u32, name: &'static str) -> ty::Region<'tcx> {

@@ -593,6 +593,7 @@ impl<'a> LoweringContext<'a> {
                 span: Some(span),
                 allow_internal_unstable: true,
                 allow_internal_unsafe: false,
+                edition: codemap::hygiene::default_edition(),
             },
         });
         span.with_ctxt(SyntaxContext::empty().apply_mark(mark))
@@ -928,29 +929,27 @@ impl<'a> LoweringContext<'a> {
     fn lower_loop_destination(&mut self, destination: Option<(NodeId, Label)>) -> hir::Destination {
         match destination {
             Some((id, label)) => {
-                let target = if let Def::Label(loop_id) = self.expect_full_def(id) {
-                    hir::LoopIdResult::Ok(self.lower_node_id(loop_id).node_id)
+                let target_id = if let Def::Label(loop_id) = self.expect_full_def(id) {
+                    Ok(self.lower_node_id(loop_id).node_id)
                 } else {
-                    hir::LoopIdResult::Err(hir::LoopIdError::UnresolvedLabel)
+                    Err(hir::LoopIdError::UnresolvedLabel)
                 };
                 hir::Destination {
                     label: self.lower_label(Some(label)),
-                    target_id: hir::ScopeTarget::Loop(target),
+                    target_id,
                 }
             }
             None => {
-                let loop_id = self.loop_scopes
+                let target_id = self.loop_scopes
                     .last()
-                    .map(|innermost_loop_id| *innermost_loop_id);
+                    .map(|innermost_loop_id| *innermost_loop_id)
+                    .map(|id| Ok(self.lower_node_id(id).node_id))
+                    .unwrap_or(Err(hir::LoopIdError::OutsideLoopScope))
+                    .into();
 
                 hir::Destination {
                     label: None,
-                    target_id: hir::ScopeTarget::Loop(
-                        loop_id
-                            .map(|id| Ok(self.lower_node_id(id).node_id))
-                            .unwrap_or(Err(hir::LoopIdError::OutsideLoopScope))
-                            .into(),
-                    ),
+                    target_id,
                 }
             }
         }
@@ -1459,10 +1458,9 @@ impl<'a> LoweringContext<'a> {
                             return n;
                         }
                         assert!(!def_id.is_local());
-                        let n = self.cstore
-                            .item_generics_cloned_untracked(def_id, self.sess)
-                            .regions
-                            .len();
+                        let item_generics =
+                            self.cstore.item_generics_cloned_untracked(def_id, self.sess);
+                        let n = item_generics.own_counts().lifetimes;
                         self.type_def_lifetime_params.insert(def_id, n);
                         n
                     });
@@ -3051,7 +3049,7 @@ impl<'a> LoweringContext<'a> {
                     );
                     block.expr = Some(this.wrap_in_try_constructor(
                         "from_ok", tail, unstable_span));
-                    hir::ExprBlock(P(block))
+                    hir::ExprBlock(P(block), None)
                 })
             }
             ExprKind::Match(ref expr, ref arms) => hir::ExprMatch(
@@ -3103,7 +3101,11 @@ impl<'a> LoweringContext<'a> {
                     })
                 })
             }
-            ExprKind::Block(ref blk) => hir::ExprBlock(self.lower_block(blk, false)),
+            ExprKind::Block(ref blk, opt_label) => {
+                hir::ExprBlock(self.lower_block(blk,
+                                                opt_label.is_some()),
+                                                self.lower_label(opt_label))
+            }
             ExprKind::Assign(ref el, ref er) => {
                 hir::ExprAssign(P(self.lower_expr(el)), P(self.lower_expr(er)))
             }
@@ -3121,9 +3123,9 @@ impl<'a> LoweringContext<'a> {
             }
             // Desugar `<start>..=<end>` to `std::ops::RangeInclusive::new(<start>, <end>)`
             ExprKind::Range(Some(ref e1), Some(ref e2), RangeLimits::Closed) => {
-                // FIXME: Use head_sp directly after RangeInclusive::new() is stabilized in stage0.
+                // FIXME: Use e.span directly after RangeInclusive::new() is stabilized in stage0.
                 let span = self.allow_internal_unstable(CompilerDesugaringKind::DotFill, e.span);
-                let id = self.lower_node_id(e.id);
+                let id = self.next_id();
                 let e1 = self.lower_expr(e1);
                 let e2 = self.lower_expr(e2);
                 let ty_path = P(self.std_path(span, &["ops", "RangeInclusive"], false));
@@ -3193,9 +3195,7 @@ impl<'a> LoweringContext<'a> {
                 let destination = if self.is_in_loop_condition && opt_label.is_none() {
                     hir::Destination {
                         label: None,
-                        target_id: hir::ScopeTarget::Loop(
-                            Err(hir::LoopIdError::UnlabeledCfInWhileCondition).into(),
-                        ),
+                        target_id: Err(hir::LoopIdError::UnlabeledCfInWhileCondition).into(),
                     }
                 } else {
                     self.lower_loop_destination(opt_label.map(|label| (e.id, label)))
@@ -3209,9 +3209,7 @@ impl<'a> LoweringContext<'a> {
                 hir::ExprAgain(if self.is_in_loop_condition && opt_label.is_none() {
                     hir::Destination {
                         label: None,
-                        target_id: hir::ScopeTarget::Loop(
-                            Err(hir::LoopIdError::UnlabeledCfInWhileCondition).into(),
-                        ),
+                        target_id: Err(hir::LoopIdError::UnlabeledCfInWhileCondition).into(),
                     }
                 } else {
                     self.lower_loop_destination(opt_label.map(|label| (e.id, label)))
@@ -3604,7 +3602,7 @@ impl<'a> LoweringContext<'a> {
                             hir::ExprBreak(
                                 hir::Destination {
                                     label: None,
-                                    target_id: hir::ScopeTarget::Block(catch_node),
+                                    target_id: Ok(catch_node),
                                 },
                                 Some(from_err_expr),
                             ),
@@ -3850,7 +3848,7 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn expr_block(&mut self, b: P<hir::Block>, attrs: ThinVec<Attribute>) -> hir::Expr {
-        self.expr(b.span, hir::ExprBlock(b), attrs)
+        self.expr(b.span, hir::ExprBlock(b, None), attrs)
     }
 
     fn expr_tuple(&mut self, sp: Span, exprs: hir::HirVec<hir::Expr>) -> P<hir::Expr> {

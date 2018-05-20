@@ -11,15 +11,15 @@
 //! This module provides constants which are specific to the implementation
 //! of the `f32` floating point data type.
 //!
-//! Mathematically significant numbers are provided in the `consts` sub-module.
-//!
 //! *[See also the `f32` primitive type](../../std/primitive.f32.html).*
+//!
+//! Mathematically significant numbers are provided in the `consts` sub-module.
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use mem;
 use num::Float;
-#[cfg(not(stage0))] use num::FpCategory;
+use num::FpCategory;
 use num::FpCategory as Fp;
 
 /// The radix or base of the internal representation of `f32`.
@@ -128,9 +128,17 @@ pub mod consts {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const LOG2_E: f32 = 1.44269504088896340735992468100189214_f32;
 
+    /// log<sub>2</sub>(10)
+    #[unstable(feature = "extra_log_consts", issue = "50540")]
+    pub const LOG2_10: f32 = 3.32192809488736234787031942948939018_f32;
+
     /// log<sub>10</sub>(e)
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const LOG10_E: f32 = 0.434294481903251827651128918916605082_f32;
+
+    /// log<sub>10</sub>(2)
+    #[unstable(feature = "extra_log_consts", issue = "50540")]
+    pub const LOG10_2: f32 = 0.301029995663981195213738894724493027_f32;
 
     /// ln(2)
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -269,7 +277,6 @@ impl Float for f32 {
 
 // FIXME: remove (inline) this macro and the Float trait
 // when updating to a bootstrap compiler that has the new lang items.
-#[cfg_attr(stage0, macro_export)]
 #[unstable(feature = "core_float", issue = "32110")]
 macro_rules! f32_core_methods { () => {
     /// Returns `true` if this value is `NaN` and false otherwise.
@@ -545,7 +552,6 @@ macro_rules! f32_core_methods { () => {
 
 #[lang = "f32"]
 #[cfg(not(test))]
-#[cfg(not(stage0))]
 impl f32 {
     f32_core_methods!();
 }

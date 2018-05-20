@@ -1,6 +1,6 @@
 use rustc::mir;
-use rustc::ty::{self, Ty};
-use rustc::ty::layout::{self, Align, LayoutOf, TyLayout};
+use rustc::ty::{self, Ty, TyCtxt};
+use rustc::ty::layout::{self, Align, LayoutOf, TyLayout, Size};
 use rustc_data_structures::indexed_vec::Idx;
 
 use rustc::mir::interpret::{GlobalId, Value, PrimVal, EvalResult, Pointer, MemoryPointer};
@@ -69,9 +69,13 @@ impl<'tcx> Place {
         self.to_ptr_align().0.to_ptr()
     }
 
-    pub(super) fn elem_ty_and_len(self, ty: Ty<'tcx>) -> (Ty<'tcx>, u64) {
+    pub(super) fn elem_ty_and_len(
+        self,
+        ty: Ty<'tcx>,
+        tcx: TyCtxt<'_, 'tcx, '_>
+    ) -> (Ty<'tcx>, u64) {
         match ty.sty {
-            ty::TyArray(elem, n) => (elem, n.val.unwrap_u64() as u64),
+            ty::TyArray(elem, n) => (elem, n.unwrap_usize(tcx)),
 
             ty::TySlice(elem) => {
                 match self {
@@ -206,7 +210,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                 };
                 let alloc = Machine::init_static(self, cid)?;
                 Place::Ptr {
-                    ptr: MemoryPointer::new(alloc, 0).into(),
+                    ptr: MemoryPointer::new(alloc, Size::from_bytes(0)).into(),
                     align: layout.align,
                     extra: PlaceExtra::None,
                 }
@@ -263,9 +267,9 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                     base_layout.ty,
                     base_ptr.to_value_with_vtable(tab),
                 )?;
-                offset.abi_align(align).bytes()
+                offset.abi_align(align)
             }
-            _ => offset.bytes(),
+            _ => offset,
         };
 
         let ptr = base_ptr.offset(offset, &self)?;
@@ -320,15 +324,15 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
         let base = self.force_allocation(base)?;
         let (base_ptr, align) = base.to_ptr_align();
 
-        let (elem_ty, len) = base.elem_ty_and_len(outer_ty);
-        let elem_size = self.layout_of(elem_ty)?.size.bytes();
+        let (elem_ty, len) = base.elem_ty_and_len(outer_ty, self.tcx.tcx);
+        let elem_size = self.layout_of(elem_ty)?.size;
         assert!(
             n < len,
             "Tried to access element {} of array/slice with length {}",
             n,
             len
         );
-        let ptr = base_ptr.offset(n * elem_size, &*self)?;
+        let ptr = base_ptr.offset(elem_size * n, &*self)?;
         Ok(Place::Ptr {
             ptr,
             align,
@@ -369,8 +373,8 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                 let val = self.read_place(base)?;
 
                 let pointee_type = match base_ty.sty {
-                    ty::TyRawPtr(ref tam) |
-                    ty::TyRef(_, ref tam) => tam.ty,
+                    ty::TyRawPtr(ref tam) => tam.ty,
+                    ty::TyRef(_, ty, _) => ty,
                     ty::TyAdt(def, _) if def.is_box() => base_ty.boxed_ty(),
                     _ => bug!("can only deref pointer types"),
                 };
@@ -396,8 +400,8 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                 let base = self.force_allocation(base)?;
                 let (base_ptr, align) = base.to_ptr_align();
 
-                let (elem_ty, n) = base.elem_ty_and_len(base_ty);
-                let elem_size = self.layout_of(elem_ty)?.size.bytes();
+                let (elem_ty, n) = base.elem_ty_and_len(base_ty, self.tcx.tcx);
+                let elem_size = self.layout_of(elem_ty)?.size;
                 assert!(n >= min_length as u64);
 
                 let index = if from_end {
@@ -406,7 +410,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                     u64::from(offset)
                 };
 
-                let ptr = base_ptr.offset(index * elem_size, &self)?;
+                let ptr = base_ptr.offset(elem_size * index, &self)?;
                 Ok(Place::Ptr { ptr, align, extra: PlaceExtra::None })
             }
 
@@ -415,10 +419,10 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                 let base = self.force_allocation(base)?;
                 let (base_ptr, align) = base.to_ptr_align();
 
-                let (elem_ty, n) = base.elem_ty_and_len(base_ty);
-                let elem_size = self.layout_of(elem_ty)?.size.bytes();
+                let (elem_ty, n) = base.elem_ty_and_len(base_ty, self.tcx.tcx);
+                let elem_size = self.layout_of(elem_ty)?.size;
                 assert!(u64::from(from) <= n - u64::from(to));
-                let ptr = base_ptr.offset(u64::from(from) * elem_size, &self)?;
+                let ptr = base_ptr.offset(elem_size * u64::from(from), &self)?;
                 // sublicing arrays produces arrays
                 let extra = if self.type_is_sized(base_ty) {
                     PlaceExtra::None

@@ -77,6 +77,8 @@ use html::item_type::ItemType;
 use html::markdown::{self, Markdown, MarkdownHtml, MarkdownSummaryLine};
 use html::{highlight, layout};
 
+use minifier;
+
 /// A pair of name and its optional document.
 pub type NameDoc = (String, Option<String>);
 
@@ -414,9 +416,9 @@ impl ToJson for Type {
         match self.name {
             Some(ref name) => {
                 let mut data = BTreeMap::new();
-                data.insert("name".to_owned(), name.to_json());
+                data.insert("n".to_owned(), name.to_json());
                 if let Some(ref generics) = self.generics {
-                    data.insert("generics".to_owned(), generics.to_json());
+                    data.insert("g".to_owned(), generics.to_json());
                 }
                 Json::Object(data)
             },
@@ -439,8 +441,12 @@ impl ToJson for IndexItemFunctionType {
             Json::Null
         } else {
             let mut data = BTreeMap::new();
-            data.insert("inputs".to_owned(), self.inputs.to_json());
-            data.insert("output".to_owned(), self.output.to_json());
+            if !self.inputs.is_empty() {
+                data.insert("i".to_owned(), self.inputs.to_json());
+            }
+            if let Some(ref output) = self.output {
+                data.insert("o".to_owned(), output.to_json());
+            }
             Json::Object(data)
         }
     }
@@ -511,7 +517,8 @@ pub fn run(mut krate: clean::Crate,
            css_file_extension: Option<PathBuf>,
            renderinfo: RenderInfo,
            sort_modules_alphabetically: bool,
-           themes: Vec<PathBuf>) -> Result<(), Error> {
+           themes: Vec<PathBuf>,
+           enable_minification: bool) -> Result<(), Error> {
     let src_root = match krate.src {
         FileName::Real(ref p) => match p.parent() {
             Some(p) => p.to_path_buf(),
@@ -665,7 +672,7 @@ pub fn run(mut krate: clean::Crate,
     CACHE_KEY.with(|v| *v.borrow_mut() = cache.clone());
     CURRENT_LOCATION_KEY.with(|s| s.borrow_mut().clear());
 
-    write_shared(&cx, &krate, &*cache, index)?;
+    write_shared(&cx, &krate, &*cache, index, enable_minification)?;
 
     // And finally render the whole crate's documentation
     cx.krate(krate)
@@ -744,7 +751,8 @@ fn build_index(krate: &clean::Crate, cache: &mut Cache) -> String {
 fn write_shared(cx: &Context,
                 krate: &clean::Crate,
                 cache: &Cache,
-                search_index: String) -> Result<(), Error> {
+                search_index: String,
+                enable_minification: bool) -> Result<(), Error> {
     // Write out the shared files. Note that these are shared among all rustdoc
     // docs placed in the output directory, so this needs to be a synchronized
     // operation with respect to all other rustdocs running around.
@@ -793,7 +801,8 @@ fn write_shared(cx: &Context,
           format!(
 r#"var themes = document.getElementById("theme-choices");
 var themePicker = document.getElementById("theme-picker");
-themePicker.onclick = function() {{
+
+function switchThemeButtonState() {{
     if (themes.style.display === "block") {{
         themes.style.display = "none";
         themePicker.style.borderBottomRightRadius = "3px";
@@ -804,12 +813,29 @@ themePicker.onclick = function() {{
         themePicker.style.borderBottomLeftRadius = "0";
     }}
 }};
+
+function handleThemeButtonsBlur(e) {{
+    var active = document.activeElement;
+    var related = e.relatedTarget;
+
+    if (active.id !== "themePicker" &&
+        (!active.parentNode || active.parentNode.id !== "theme-choices") &&
+        (!related ||
+         (related.id !== "themePicker" &&
+          (!related.parentNode || related.parentNode.id !== "theme-choices")))) {{
+        switchThemeButtonState();
+    }}
+}}
+
+themePicker.onclick = switchThemeButtonState;
+themePicker.onblur = handleThemeButtonsBlur;
 [{}].forEach(function(item) {{
     var but = document.createElement('button');
     but.innerHTML = item;
     but.onclick = function(el) {{
         switchTheme(currentTheme, mainTheme, item);
     }};
+    but.onblur = handleThemeButtonsBlur;
     themes.appendChild(but);
 }});"#,
                  themes.iter()
@@ -818,16 +844,20 @@ themePicker.onclick = function() {{
                        .join(",")).as_bytes(),
     )?;
 
-    write(cx.dst.join(&format!("main{}.js", cx.shared.resource_suffix)),
-                      include_bytes!("static/main.js"))?;
-    write(cx.dst.join(&format!("settings{}.js", cx.shared.resource_suffix)),
-                      include_bytes!("static/settings.js"))?;
+    write_minify(cx.dst.join(&format!("main{}.js", cx.shared.resource_suffix)),
+                 include_str!("static/main.js"),
+                 enable_minification)?;
+    write_minify(cx.dst.join(&format!("settings{}.js", cx.shared.resource_suffix)),
+                 include_str!("static/settings.js"),
+                 enable_minification)?;
 
     {
         let mut data = format!("var resourcesSuffix = \"{}\";\n",
-                               cx.shared.resource_suffix).into_bytes();
-        data.extend_from_slice(include_bytes!("static/storage.js"));
-        write(cx.dst.join(&format!("storage{}.js", cx.shared.resource_suffix)), &data)?;
+                               cx.shared.resource_suffix);
+        data.push_str(include_str!("static/storage.js"));
+        write_minify(cx.dst.join(&format!("storage{}.js", cx.shared.resource_suffix)),
+                     &data,
+                     enable_minification)?;
     }
 
     if let Some(ref css) = cx.shared.css_file_extension {
@@ -883,8 +913,8 @@ themePicker.onclick = function() {{
     }
 
     fn show_item(item: &IndexItem, krate: &str) -> String {
-        format!("{{'crate':'{}','ty':{},'name':'{}','path':'{}'{}}}",
-                krate, item.ty as usize, item.name, item.path,
+        format!("{{'crate':'{}','ty':{},'name':'{}','desc':'{}','p':'{}'{}}}",
+                krate, item.ty as usize, item.name, item.desc.replace("'", "\\'"), item.path,
                 if let Some(p) = item.parent_idx {
                     format!(",'parent':{}", p)
                 } else {
@@ -1022,6 +1052,14 @@ fn render_sources(dst: &Path, scx: &mut SharedContext,
 /// catch any errors.
 fn write(dst: PathBuf, contents: &[u8]) -> Result<(), Error> {
     Ok(try_err!(fs::write(&dst, contents), &dst))
+}
+
+fn write_minify(dst: PathBuf, contents: &str, enable_minification: bool) -> Result<(), Error> {
+    if enable_minification {
+        write(dst, minifier::js::minify(contents).as_bytes())
+    } else {
+        write(dst, contents.as_bytes())
+    }
 }
 
 /// Takes a path to a source file and cleans the path to it. This canonicalizes
@@ -1430,8 +1468,11 @@ impl DocFolder for Cache {
 impl<'a> Cache {
     fn generics(&mut self, generics: &clean::Generics) {
         for param in &generics.params {
-            if let clean::GenericParam::Type(ref typ) = *param {
-                self.typarams.insert(typ.did, typ.name.clone());
+            match *param {
+                clean::GenericParamDef::Type(ref typ) => {
+                    self.typarams.insert(typ.did, typ.name.clone());
+                }
+                clean::GenericParamDef::Lifetime(_) => {}
             }
         }
     }
@@ -1442,7 +1483,7 @@ impl<'a> Cache {
         }
         if let Some(ref item_name) = item.name {
             let path = self.paths.get(&item.def_id)
-                                 .map(|p| p.0.join("::").to_string())
+                                 .map(|p| p.0[..p.0.len() - 1].join("::"))
                                  .unwrap_or("std".to_owned());
             for alias in item.attrs.lists("doc")
                                    .filter(|a| a.check_name("alias"))
@@ -1457,7 +1498,7 @@ impl<'a> Cache {
                                 ty: item.type_(),
                                 name: item_name.to_string(),
                                 path: path.clone(),
-                                desc: String::new(),
+                                desc: plain_summary_line(item.doc_value()),
                                 parent: None,
                                 parent_idx: None,
                                 search_type: get_index_search_type(&item),
@@ -2594,7 +2635,7 @@ fn item_function(w: &mut fmt::Formatter, cx: &Context, it: &clean::Item,
 }
 
 fn render_implementor(cx: &Context, implementor: &Impl, w: &mut fmt::Formatter,
-                      implementor_dups: &FxHashMap<&str, (DefId, bool)>) -> Result<(), fmt::Error> {
+                      implementor_dups: &FxHashMap<&str, (DefId, bool)>) -> fmt::Result {
     write!(w, "<li><table class='table-display'><tbody><tr><td><code>")?;
     // If there's already another implementor that has the same abbridged name, use the
     // full path, for example in `std::iter::ExactSizeIterator`
@@ -2627,7 +2668,7 @@ fn render_implementor(cx: &Context, implementor: &Impl, w: &mut fmt::Formatter,
 
 fn render_impls(cx: &Context, w: &mut fmt::Formatter,
                 traits: &[&&Impl],
-                containing_item: &clean::Item) -> Result<(), fmt::Error> {
+                containing_item: &clean::Item) -> fmt::Result {
     for i in traits {
         let did = i.trait_did().unwrap();
         let assoc_link = AssocItemLink::GotoSource(did, &i.inner_impl().provided_trait_methods);
@@ -3299,7 +3340,7 @@ fn item_enum(w: &mut fmt::Formatter, cx: &Context, it: &clean::Item,
 }
 
 fn render_attribute(attr: &ast::MetaItem) -> Option<String> {
-    let name = attr.ident.name;
+    let name = attr.name();
 
     if attr.is_word() {
         Some(format!("{}", name))
@@ -3334,7 +3375,7 @@ fn render_attributes(w: &mut fmt::Formatter, it: &clean::Item) -> fmt::Result {
     let mut attrs = String::new();
 
     for attr in &it.attrs.other_attrs {
-        let name = attr.name().unwrap();
+        let name = attr.name();
         if !ATTRIBUTE_WHITELIST.contains(&&*name.as_str()) {
             continue;
         }

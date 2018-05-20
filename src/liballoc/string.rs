@@ -380,7 +380,8 @@ impl String {
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn new() -> String {
+    #[rustc_const_unstable(feature = "const_string_new")]
+    pub const fn new() -> String {
         String { vec: Vec::new() }
     }
 
@@ -2236,6 +2237,14 @@ impl<'a> From<String> for Cow<'a, str> {
     #[inline]
     fn from(s: String) -> Cow<'a, str> {
         Cow::Owned(s)
+    }
+}
+
+#[stable(feature = "cow_from_string_ref", since = "1.28.0")]
+impl<'a> From<&'a String> for Cow<'a, str> {
+    #[inline]
+    fn from(s: &'a String) -> Cow<'a, str> {
+        Cow::Borrowed(s.as_str())
     }
 }
 

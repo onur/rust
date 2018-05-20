@@ -252,7 +252,6 @@
 #![feature(collections_range)]
 #![feature(compiler_builtins_lib)]
 #![feature(const_fn)]
-#![cfg_attr(stage0, feature(core_float))]
 #![feature(core_intrinsics)]
 #![feature(dropck_eyepatch)]
 #![feature(exact_size_is_empty)]
@@ -260,10 +259,8 @@
 #![feature(fs_read_write)]
 #![feature(fixed_size_array)]
 #![feature(float_from_str_radix)]
-#![cfg_attr(stage0, feature(float_internals))]
 #![feature(fn_traits)]
 #![feature(fnbox)]
-#![cfg_attr(stage0, feature(generic_param_attrs))]
 #![feature(hashmap_internals)]
 #![feature(heap_api)]
 #![feature(int_error_internals)]
@@ -277,7 +274,6 @@
 #![feature(needs_panic_runtime)]
 #![feature(never_type)]
 #![feature(exhaustive_patterns)]
-#![feature(nonzero)]
 #![feature(num_bits_bytes)]
 #![feature(old_wrapping)]
 #![feature(on_unimplemented)]
@@ -320,6 +316,7 @@
 #![cfg_attr(test, feature(update_panic_count))]
 #![cfg_attr(windows, feature(used))]
 #![feature(doc_alias)]
+#![feature(float_internals)]
 
 #![default_lib_allocator]
 
@@ -330,10 +327,10 @@
 // with a rustc without jemalloc.
 // FIXME(#44236) shouldn't need MSVC logic
 #![cfg_attr(all(not(target_env = "msvc"),
-                any(stage0, feature = "force_alloc_system")),
+                any(all(stage0, not(test)), feature = "force_alloc_system")),
             feature(global_allocator))]
 #[cfg(all(not(target_env = "msvc"),
-          any(stage0, feature = "force_alloc_system")))]
+          any(all(stage0, not(test)), feature = "force_alloc_system")))]
 #[global_allocator]
 static ALLOC: alloc_system::System = alloc_system::System;
 
@@ -364,11 +361,6 @@ extern crate libc;
 #[doc(masked)]
 #[allow(unused_extern_crates)]
 extern crate unwind;
-
-// compiler-rt intrinsics
-#[doc(masked)]
-#[cfg(stage0)]
-extern crate compiler_builtins;
 
 // During testing, this crate is not actually the "real" std library, but rather
 // it links to the real std library, which was compiled from this same source

@@ -44,9 +44,9 @@ use ty::relate::TypeRelation;
 use middle::lang_items;
 use mir::interpret::{GlobalId};
 
+use rustc_data_structures::sync::Lock;
 use rustc_data_structures::bitvec::BitVector;
 use std::iter;
-use std::cell::RefCell;
 use std::cmp;
 use std::fmt;
 use std::mem;
@@ -148,7 +148,7 @@ struct TraitObligationStack<'prev, 'tcx: 'prev> {
 
 #[derive(Clone)]
 pub struct SelectionCache<'tcx> {
-    hashmap: RefCell<FxHashMap<ty::TraitRef<'tcx>,
+    hashmap: Lock<FxHashMap<ty::TraitRef<'tcx>,
                                WithDepNode<SelectionResult<'tcx, SelectionCandidate<'tcx>>>>>,
 }
 
@@ -305,9 +305,6 @@ enum BuiltinImplConditions<'tcx> {
     /// There is no built-in impl. There may be some other
     /// candidate (a where-clause or user-defined impl).
     None,
-    /// There is *no* impl for this, builtin or not. Ignore
-    /// all where-clauses.
-    Never,
     /// It is unknown whether there is an impl.
     Ambiguous
 }
@@ -435,7 +432,7 @@ impl<'tcx> From<OverflowError> for SelectionError<'tcx> {
 
 #[derive(Clone)]
 pub struct EvaluationCache<'tcx> {
-    hashmap: RefCell<FxHashMap<ty::PolyTraitRef<'tcx>, WithDepNode<EvaluationResult>>>
+    hashmap: Lock<FxHashMap<ty::PolyTraitRef<'tcx>, WithDepNode<EvaluationResult>>>
 }
 
 impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
@@ -781,13 +778,13 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                                                 mut obligation: TraitObligation<'tcx>)
                                                 -> Result<EvaluationResult, OverflowError>
     {
-        debug!("evaluate_trait_predicate_recursively({:?})",
-               obligation);
+        debug!("evaluate_trait_predicate_recursively({:?})", obligation);
 
-        if !self.intercrate.is_some() && obligation.is_global() {
-            // If a param env is consistent, global obligations do not depend on its particular
-            // value in order to work, so we can clear out the param env and get better
-            // caching. (If the current param env is inconsistent, we don't care what happens).
+        if self.intercrate.is_none() && obligation.is_global()
+            && obligation.param_env.caller_bounds.iter().all(|bound| bound.needs_subst()) {
+            // If a param env has no global bounds, global obligations do not
+            // depend on its particular value in order to work, so we can clear
+            // out the param env and get better caching.
             debug!("evaluate_trait_predicate_recursively({:?}) - in global", obligation);
             obligation.param_env = obligation.param_env.without_caller_bounds();
         }
@@ -1015,14 +1012,19 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         }
 
         if self.can_use_global_caches(param_env) {
-            let mut cache = self.tcx().evaluation_cache.hashmap.borrow_mut();
             if let Some(trait_ref) = self.tcx().lift_to_global(&trait_ref) {
                 debug!(
                     "insert_evaluation_cache(trait_ref={:?}, candidate={:?}) global",
                     trait_ref,
                     result,
                 );
-                cache.insert(trait_ref, WithDepNode::new(dep_node, result));
+                // This may overwrite the cache with the same value
+                // FIXME: Due to #50507 this overwrites the different values
+                // This should be changed to use HashMapExt::insert_same
+                // when that is fixed
+                self.tcx().evaluation_cache
+                          .hashmap.borrow_mut()
+                          .insert(trait_ref, WithDepNode::new(dep_node, result));
                 return;
             }
         }
@@ -1368,7 +1370,6 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         let tcx = self.tcx();
         let trait_ref = cache_fresh_trait_pred.skip_binder().trait_ref;
         if self.can_use_global_caches(param_env) {
-            let mut cache = tcx.selection_cache.hashmap.borrow_mut();
             if let Some(trait_ref) = tcx.lift_to_global(&trait_ref) {
                 if let Some(candidate) = tcx.lift_to_global(&candidate) {
                     debug!(
@@ -1376,7 +1377,10 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                         trait_ref,
                         candidate,
                     );
-                    cache.insert(trait_ref, WithDepNode::new(dep_node, candidate));
+                    // This may overwrite the cache with the same value
+                    tcx.selection_cache
+                       .hashmap.borrow_mut()
+                       .insert(trait_ref, WithDepNode::new(dep_node, candidate));
                     return;
                 }
             }
@@ -1444,22 +1448,22 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
             let sized_conditions = self.sized_conditions(obligation);
             self.assemble_builtin_bound_candidates(sized_conditions,
                                                    &mut candidates)?;
-         } else if lang_items.unsize_trait() == Some(def_id) {
-             self.assemble_candidates_for_unsizing(obligation, &mut candidates);
-         } else {
-             if lang_items.clone_trait() == Some(def_id) {
-                 // Same builtin conditions as `Copy`, i.e. every type which has builtin support
-                 // for `Copy` also has builtin support for `Clone`, + tuples and arrays of `Clone`
-                 // types have builtin support for `Clone`.
-                 let clone_conditions = self.copy_clone_conditions(obligation);
-                 self.assemble_builtin_bound_candidates(clone_conditions, &mut candidates)?;
-             }
+        } else if lang_items.unsize_trait() == Some(def_id) {
+            self.assemble_candidates_for_unsizing(obligation, &mut candidates);
+        } else {
+            if lang_items.clone_trait() == Some(def_id) {
+                // Same builtin conditions as `Copy`, i.e. every type which has builtin support
+                // for `Copy` also has builtin support for `Clone`, + tuples and arrays of `Clone`
+                // types have builtin support for `Clone`.
+                let clone_conditions = self.copy_clone_conditions(obligation);
+                self.assemble_builtin_bound_candidates(clone_conditions, &mut candidates)?;
+            }
 
-             self.assemble_generator_candidates(obligation, &mut candidates)?;
-             self.assemble_closure_candidates(obligation, &mut candidates)?;
-             self.assemble_fn_pointer_candidates(obligation, &mut candidates)?;
-             self.assemble_candidates_from_impls(obligation, &mut candidates)?;
-             self.assemble_candidates_from_object_ty(obligation, &mut candidates);
+            self.assemble_generator_candidates(obligation, &mut candidates)?;
+            self.assemble_closure_candidates(obligation, &mut candidates)?;
+            self.assemble_fn_pointer_candidates(obligation, &mut candidates)?;
+            self.assemble_candidates_from_impls(obligation, &mut candidates)?;
+            self.assemble_candidates_from_object_ty(obligation, &mut candidates);
         }
 
         self.assemble_candidates_from_projected_tys(obligation, &mut candidates);
@@ -1509,7 +1513,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         let poly_trait_predicate =
             self.infcx().resolve_type_vars_if_possible(&obligation.predicate);
         let (skol_trait_predicate, skol_map) =
-            self.infcx().skolemize_late_bound_regions(&poly_trait_predicate, snapshot);
+            self.infcx().skolemize_late_bound_regions(&poly_trait_predicate);
         debug!("match_projection_obligation_against_definition_bounds: \
                 skol_trait_predicate={:?} skol_map={:?}",
                skol_trait_predicate,
@@ -2074,13 +2078,8 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
     // BUILTIN BOUNDS
     //
     // These cover the traits that are built-in to the language
-    // itself.  This includes `Copy` and `Sized` for sure. For the
-    // moment, it also includes `Send` / `Sync` and a few others, but
-    // those will hopefully change to library-defined traits in the
-    // future.
+    // itself: `Copy`, `Clone` and `Sized`.
 
-    // HACK: if this returns an error, selection exits without considering
-    // other impls.
     fn assemble_builtin_bound_candidates<'o>(&mut self,
                                              conditions: BuiltinImplConditions<'tcx>,
                                              candidates: &mut SelectionCandidateSet<'tcx>)
@@ -2099,14 +2098,13 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                 debug!("assemble_builtin_bound_candidates: ambiguous builtin");
                 Ok(candidates.ambiguous = true)
             }
-            BuiltinImplConditions::Never => { Err(Unimplemented) }
         }
     }
 
     fn sized_conditions(&mut self, obligation: &TraitObligation<'tcx>)
                      -> BuiltinImplConditions<'tcx>
     {
-        use self::BuiltinImplConditions::{Ambiguous, None, Never, Where};
+        use self::BuiltinImplConditions::{Ambiguous, None, Where};
 
         // NOTE: binder moved to (*)
         let self_ty = self.infcx.shallow_resolve(
@@ -2123,7 +2121,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                 Where(ty::Binder::dummy(Vec::new()))
             }
 
-            ty::TyStr | ty::TySlice(_) | ty::TyDynamic(..) | ty::TyForeign(..) => Never,
+            ty::TyStr | ty::TySlice(_) | ty::TyDynamic(..) | ty::TyForeign(..) => None,
 
             ty::TyTuple(tys) => {
                 Where(ty::Binder::bind(tys.last().into_iter().cloned().collect()))
@@ -2157,7 +2155,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         let self_ty = self.infcx.shallow_resolve(
             obligation.predicate.skip_binder().self_ty());
 
-        use self::BuiltinImplConditions::{Ambiguous, None, Never, Where};
+        use self::BuiltinImplConditions::{Ambiguous, None, Where};
 
         match self_ty.sty {
             ty::TyInfer(ty::IntVar(_)) | ty::TyInfer(ty::FloatVar(_)) |
@@ -2167,15 +2165,15 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
 
             ty::TyUint(_) | ty::TyInt(_) | ty::TyBool | ty::TyFloat(_) |
             ty::TyChar | ty::TyRawPtr(..) | ty::TyNever |
-            ty::TyRef(_, ty::TypeAndMut { ty: _, mutbl: hir::MutImmutable }) => {
+            ty::TyRef(_, _, hir::MutImmutable) => {
                 // Implementations provided in libcore
                 None
             }
 
             ty::TyDynamic(..) | ty::TyStr | ty::TySlice(..) |
             ty::TyGenerator(..) | ty::TyGeneratorWitness(..) | ty::TyForeign(..) |
-            ty::TyRef(_, ty::TypeAndMut { ty: _, mutbl: hir::MutMutable }) => {
-                Never
+            ty::TyRef(_, _, hir::MutMutable) => {
+                None
             }
 
             ty::TyArray(element_ty, _) => {
@@ -2195,7 +2193,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                 if is_copy_trait || is_clone_trait {
                     Where(ty::Binder::bind(substs.upvar_tys(def_id, self.tcx()).collect()))
                 } else {
-                    Never
+                    None
                 }
             }
 
@@ -2263,7 +2261,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
             }
 
             ty::TyRawPtr(ty::TypeAndMut { ty: element_ty, ..}) |
-            ty::TyRef(_, ty::TypeAndMut { ty: element_ty, ..}) => {
+            ty::TyRef(_, element_ty, _) => {
                 vec![element_ty]
             },
 
@@ -2280,8 +2278,9 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                 substs.upvar_tys(def_id, self.tcx()).collect()
             }
 
-            ty::TyGenerator(def_id, ref substs, interior) => {
-                substs.upvar_tys(def_id, self.tcx()).chain(iter::once(interior.witness)).collect()
+            ty::TyGenerator(def_id, ref substs, _) => {
+                let witness = substs.witness(def_id, self.tcx());
+                substs.upvar_tys(def_id, self.tcx()).chain(iter::once(witness)).collect()
             }
 
             ty::TyGeneratorWitness(types) => {
@@ -2338,7 +2337,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
 
             self.in_snapshot(|this, snapshot| {
                 let (skol_ty, skol_map) =
-                    this.infcx().skolemize_late_bound_regions(&ty, snapshot);
+                    this.infcx().skolemize_late_bound_regions(&ty);
                 let Normalized { value: normalized_ty, mut obligations } =
                     project::normalize_with_depth(this,
                                                   param_env,
@@ -2559,7 +2558,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         let trait_obligations = self.in_snapshot(|this, snapshot| {
             let poly_trait_ref = obligation.predicate.to_poly_trait_ref();
             let (trait_ref, skol_map) =
-                this.infcx().skolemize_late_bound_regions(&poly_trait_ref, snapshot);
+                this.infcx().skolemize_late_bound_regions(&poly_trait_ref);
             let cause = obligation.derived_cause(ImplDerivedObligation);
             this.impl_or_trait_obligations(cause,
                                            obligation.recursion_depth + 1,
@@ -2755,18 +2754,18 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         // touch bound regions, they just capture the in-scope
         // type/region parameters
         let self_ty = self.infcx.shallow_resolve(obligation.self_ty().skip_binder());
-        let (closure_def_id, substs) = match self_ty.sty {
+        let (generator_def_id, substs) = match self_ty.sty {
             ty::TyGenerator(id, substs, _) => (id, substs),
             _ => bug!("closure candidate for non-closure {:?}", obligation)
         };
 
         debug!("confirm_generator_candidate({:?},{:?},{:?})",
                obligation,
-               closure_def_id,
+               generator_def_id,
                substs);
 
         let trait_ref =
-            self.generator_trait_ref_unnormalized(obligation, closure_def_id, substs);
+            self.generator_trait_ref_unnormalized(obligation, generator_def_id, substs);
         let Normalized {
             value: trait_ref,
             mut obligations
@@ -2776,8 +2775,9 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                                  obligation.recursion_depth+1,
                                  &trait_ref);
 
-        debug!("confirm_generator_candidate(closure_def_id={:?}, trait_ref={:?}, obligations={:?})",
-               closure_def_id,
+        debug!("confirm_generator_candidate(generator_def_id={:?}, \
+                trait_ref={:?}, obligations={:?})",
+               generator_def_id,
                trait_ref,
                obligations);
 
@@ -2788,7 +2788,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                                         trait_ref)?);
 
         Ok(VtableGeneratorData {
-            closure_def_id: closure_def_id,
+            generator_def_id: generator_def_id,
             substs: substs.clone(),
             nested: obligations
         })
@@ -3142,8 +3142,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         }
 
         let (skol_obligation, skol_map) = self.infcx().skolemize_late_bound_regions(
-            &obligation.predicate,
-            snapshot);
+            &obligation.predicate);
         let skol_obligation_trait_ref = skol_obligation.trait_ref;
 
         let impl_substs = self.infcx.fresh_substs_for_item(obligation.cause.span,
@@ -3295,10 +3294,10 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
     fn generator_trait_ref_unnormalized(&mut self,
                                       obligation: &TraitObligation<'tcx>,
                                       closure_def_id: DefId,
-                                      substs: ty::ClosureSubsts<'tcx>)
+                                      substs: ty::GeneratorSubsts<'tcx>)
                                       -> ty::PolyTraitRef<'tcx>
     {
-        let gen_sig = substs.generator_poly_sig(closure_def_id, self.tcx());
+        let gen_sig = substs.poly_sig(closure_def_id, self.tcx());
 
         // (1) Feels icky to skip the binder here, but OTOH we know
         // that the self-type is an generator type and hence is
@@ -3405,7 +3404,7 @@ impl<'tcx> TraitObligation<'tcx> {
 impl<'tcx> SelectionCache<'tcx> {
     pub fn new() -> SelectionCache<'tcx> {
         SelectionCache {
-            hashmap: RefCell::new(FxHashMap())
+            hashmap: Lock::new(FxHashMap())
         }
     }
 
@@ -3417,7 +3416,7 @@ impl<'tcx> SelectionCache<'tcx> {
 impl<'tcx> EvaluationCache<'tcx> {
     pub fn new() -> EvaluationCache<'tcx> {
         EvaluationCache {
-            hashmap: RefCell::new(FxHashMap())
+            hashmap: Lock::new(FxHashMap())
         }
     }
 
@@ -3471,7 +3470,7 @@ impl<'o,'tcx> fmt::Debug for TraitObligationStack<'o,'tcx> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct WithDepNode<T> {
     dep_node: DepNodeIndex,
     cached_value: T

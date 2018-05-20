@@ -1,9 +1,71 @@
 #![allow(unknown_lints)]
 
-use ty::layout::{Align, HasDataLayout};
+use ty::layout::{Align, HasDataLayout, Size};
 use ty;
 
-use super::{EvalResult, MemoryPointer, PointerArithmetic};
+use super::{EvalResult, MemoryPointer, PointerArithmetic, Allocation};
+
+/// Represents a constant value in Rust. ByVal and ByValPair are optimizations which
+/// matches Value's optimizations for easy conversions between these two types
+#[derive(Clone, Copy, Debug, Eq, PartialEq, RustcEncodable, RustcDecodable, Hash)]
+pub enum ConstValue<'tcx> {
+    /// Used only for types with layout::abi::Scalar ABI and ZSTs which use PrimVal::Undef
+    ByVal(PrimVal),
+    /// Used only for types with layout::abi::ScalarPair
+    ByValPair(PrimVal, PrimVal),
+    /// Used only for the remaining cases. An allocation + offset into the allocation
+    ByRef(&'tcx Allocation, Size),
+}
+
+impl<'tcx> ConstValue<'tcx> {
+    #[inline]
+    pub fn from_byval_value(val: Value) -> Self {
+        match val {
+            Value::ByRef(..) => bug!(),
+            Value::ByValPair(a, b) => ConstValue::ByValPair(a, b),
+            Value::ByVal(val) => ConstValue::ByVal(val),
+        }
+    }
+
+    #[inline]
+    pub fn to_byval_value(&self) -> Option<Value> {
+        match *self {
+            ConstValue::ByRef(..) => None,
+            ConstValue::ByValPair(a, b) => Some(Value::ByValPair(a, b)),
+            ConstValue::ByVal(val) => Some(Value::ByVal(val)),
+        }
+    }
+
+    #[inline]
+    pub fn from_primval(val: PrimVal) -> Self {
+        ConstValue::ByVal(val)
+    }
+
+    #[inline]
+    pub fn to_primval(&self) -> Option<PrimVal> {
+        match *self {
+            ConstValue::ByRef(..) => None,
+            ConstValue::ByValPair(..) => None,
+            ConstValue::ByVal(val) => Some(val),
+        }
+    }
+
+    #[inline]
+    pub fn to_bits(&self) -> Option<u128> {
+        match self.to_primval() {
+            Some(PrimVal::Bytes(val)) => Some(val),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn to_ptr(&self) -> Option<MemoryPointer> {
+        match self.to_primval() {
+            Some(PrimVal::Ptr(ptr)) => Some(ptr),
+            _ => None,
+        }
+    }
+}
 
 /// A `Value` represents a single self-contained Rust value.
 ///
@@ -13,7 +75,7 @@ use super::{EvalResult, MemoryPointer, PointerArithmetic};
 ///
 /// For optimization of a few very common cases, there is also a representation for a pair of
 /// primitive values (`ByValPair`). It allows Miri to avoid making allocations for checked binary
-/// operations and fat pointers. This idea was taken from rustc's trans.
+/// operations and fat pointers. This idea was taken from rustc's codegen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, RustcEncodable, RustcDecodable, Hash)]
 pub enum Value {
     ByRef(Pointer, Align),
@@ -67,13 +129,13 @@ impl<'tcx> Pointer {
         }
     }
 
-    pub fn offset<C: HasDataLayout>(self, i: u64, cx: C) -> EvalResult<'tcx, Self> {
+    pub fn offset<C: HasDataLayout>(self, i: Size, cx: C) -> EvalResult<'tcx, Self> {
         let layout = cx.data_layout();
         match self.primval {
             PrimVal::Bytes(b) => {
                 assert_eq!(b as u64 as u128, b);
                 Ok(Pointer::from(
-                    PrimVal::Bytes(layout.offset(b as u64, i)? as u128),
+                    PrimVal::Bytes(layout.offset(b as u64, i.bytes())? as u128),
                 ))
             }
             PrimVal::Ptr(ptr) => ptr.offset(i, layout).map(Pointer::from),
@@ -274,25 +336,25 @@ impl PrimValKind {
         }
     }
 
-    pub fn from_uint_size(size: u64) -> Self {
-        match size {
+    pub fn from_uint_size(size: Size) -> Self {
+        match size.bytes() {
             1 => PrimValKind::U8,
             2 => PrimValKind::U16,
             4 => PrimValKind::U32,
             8 => PrimValKind::U64,
             16 => PrimValKind::U128,
-            _ => bug!("can't make uint with size {}", size),
+            _ => bug!("can't make uint with size {}", size.bytes()),
         }
     }
 
-    pub fn from_int_size(size: u64) -> Self {
-        match size {
+    pub fn from_int_size(size: Size) -> Self {
+        match size.bytes() {
             1 => PrimValKind::I8,
             2 => PrimValKind::I16,
             4 => PrimValKind::I32,
             8 => PrimValKind::I64,
             16 => PrimValKind::I128,
-            _ => bug!("can't make int with size {}", size),
+            _ => bug!("can't make int with size {}", size.bytes()),
         }
     }
 

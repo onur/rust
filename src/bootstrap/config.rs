@@ -72,6 +72,7 @@ pub struct Config {
     pub dry_run: bool,
 
     pub deny_warnings: bool,
+    pub backtrace_on_ice: bool,
 
     // llvm codegen options
     pub llvm_enabled: bool,
@@ -81,6 +82,7 @@ pub struct Config {
     pub llvm_version_check: bool,
     pub llvm_static_stdcpp: bool,
     pub llvm_link_shared: bool,
+    pub llvm_clang_cl: Option<String>,
     pub llvm_targets: Option<String>,
     pub llvm_experimental_targets: String,
     pub llvm_link_jobs: Option<u32>,
@@ -249,6 +251,7 @@ struct Llvm {
     experimental_targets: Option<String>,
     link_jobs: Option<u32>,
     link_shared: Option<bool>,
+    clang_cl: Option<String>
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -306,6 +309,7 @@ struct Rust {
     wasm_syscall: Option<bool>,
     lld: Option<bool>,
     deny_warnings: Option<bool>,
+    backtrace_on_ice: Option<bool>,
 }
 
 /// TOML representation of how each build target is configured.
@@ -502,6 +506,7 @@ impl Config {
             config.llvm_experimental_targets = llvm.experimental_targets.clone()
                 .unwrap_or("WebAssembly".to_string());
             config.llvm_link_jobs = llvm.link_jobs;
+            config.llvm_clang_cl = llvm.clang_cl.clone();
         }
 
         if let Some(ref rust) = toml.rust {
@@ -531,6 +536,7 @@ impl Config {
             config.musl_root = rust.musl_root.clone().map(PathBuf::from);
             config.save_toolstates = rust.save_toolstates.clone().map(PathBuf::from);
             set(&mut config.deny_warnings, rust.deny_warnings.or(flags.warnings));
+            set(&mut config.backtrace_on_ice, rust.backtrace_on_ice);
 
             if let Some(ref backends) = rust.codegen_backends {
                 config.rust_codegen_backends = backends.iter()

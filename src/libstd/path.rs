@@ -87,7 +87,6 @@ use io;
 use iter::{self, FusedIterator};
 use ops::{self, Deref};
 use rc::Rc;
-use str::FromStr;
 use sync::Arc;
 
 use ffi::{OsStr, OsString};
@@ -1441,32 +1440,6 @@ impl From<String> for PathBuf {
     }
 }
 
-/// Error returned from [`PathBuf::from_str`][`from_str`].
-///
-/// Note that parsing a path will never fail. This error is just a placeholder
-/// for implementing `FromStr` for `PathBuf`.
-///
-/// [`from_str`]: struct.PathBuf.html#method.from_str
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[stable(feature = "path_from_str", since = "1.26.0")]
-pub enum ParsePathError {}
-
-#[stable(feature = "path_from_str", since = "1.26.0")]
-impl fmt::Display for ParsePathError {
-    fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result {
-        match *self {}
-    }
-}
-
-#[stable(feature = "path_from_str", since = "1.26.0")]
-impl FromStr for PathBuf {
-    type Err = ParsePathError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(PathBuf::from(s))
-    }
-}
-
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<P: AsRef<Path>> iter::FromIterator<P> for PathBuf {
     fn from_iter<I: IntoIterator<Item = P>>(iter: I) -> PathBuf {
@@ -1487,7 +1460,7 @@ impl<P: AsRef<Path>> iter::Extend<P> for PathBuf {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl fmt::Debug for PathBuf {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, formatter)
     }
 }
@@ -1528,6 +1501,22 @@ impl<'a> From<PathBuf> for Cow<'a, Path> {
     #[inline]
     fn from(s: PathBuf) -> Cow<'a, Path> {
         Cow::Owned(s)
+    }
+}
+
+#[stable(feature = "cow_from_pathbuf_ref", since = "1.28.0")]
+impl<'a> From<&'a PathBuf> for Cow<'a, Path> {
+    #[inline]
+    fn from(p: &'a PathBuf) -> Cow<'a, Path> {
+        Cow::Borrowed(p.as_path())
+    }
+}
+
+#[stable(feature = "pathbuf_from_cow_path", since = "1.28.0")]
+impl<'a> From<Cow<'a, Path>> for PathBuf {
+    #[inline]
+    fn from(p: Cow<'a, Path>) -> Self {
+        p.into_owned()
     }
 }
 
@@ -2311,8 +2300,8 @@ impl Path {
         fs::symlink_metadata(self)
     }
 
-    /// Returns the canonical form of the path with all intermediate components
-    /// normalized and symbolic links resolved.
+    /// Returns the canonical, absolute form of the path with all intermediate
+    /// components normalized and symbolic links resolved.
     ///
     /// This is an alias to [`fs::canonicalize`].
     ///

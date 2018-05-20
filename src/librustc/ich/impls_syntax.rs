@@ -132,6 +132,15 @@ impl_stable_hash_for!(struct ::syntax::attr::Stability {
 });
 
 impl<'a> HashStable<StableHashingContext<'a>>
+for ::syntax::edition::Edition {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        mem::discriminant(self).hash_stable(hcx, hasher);
+    }
+}
+
+impl<'a> HashStable<StableHashingContext<'a>>
 for ::syntax::attr::StabilityLevel {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
@@ -199,8 +208,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for [ast::Attribute] {
         let filtered: AccumulateVec<[&ast::Attribute; 8]> = self
             .iter()
             .filter(|attr| {
-                !attr.is_sugared_doc &&
-                attr.name().map(|name| !hcx.is_ignored_attr(name)).unwrap_or(true)
+                !attr.is_sugared_doc && !hcx.is_ignored_attr(attr.name())
             })
             .collect();
 
@@ -211,12 +219,23 @@ impl<'a> HashStable<StableHashingContext<'a>> for [ast::Attribute] {
     }
 }
 
+impl<'a> HashStable<StableHashingContext<'a>> for ast::Path {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        self.segments.len().hash_stable(hcx, hasher);
+        for segment in &self.segments {
+            segment.ident.name.hash_stable(hcx, hasher);
+        }
+    }
+}
+
 impl<'a> HashStable<StableHashingContext<'a>> for ast::Attribute {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
         // Make sure that these have been filtered out.
-        debug_assert!(self.name().map(|name| !hcx.is_ignored_attr(name)).unwrap_or(true));
+        debug_assert!(!hcx.is_ignored_attr(self.name()));
         debug_assert!(!self.is_sugared_doc);
 
         let ast::Attribute {
@@ -229,10 +248,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for ast::Attribute {
         } = *self;
 
         style.hash_stable(hcx, hasher);
-        path.segments.len().hash_stable(hcx, hasher);
-        for segment in &path.segments {
-            segment.ident.name.hash_stable(hcx, hasher);
-        }
+        path.hash_stable(hcx, hasher);
         for tt in tokens.trees() {
             tt.hash_stable(hcx, hasher);
         }
@@ -307,6 +323,7 @@ fn hash_token<'a, 'gcx, W: StableHasherResult>(
         token::Token::Pound |
         token::Token::Dollar |
         token::Token::Question |
+        token::Token::SingleQuote |
         token::Token::Whitespace |
         token::Token::Comment |
         token::Token::Eof => {}
@@ -381,6 +398,7 @@ impl_stable_hash_for!(struct ::syntax_pos::hygiene::NameAndSpan {
     format,
     allow_internal_unstable,
     allow_internal_unsafe,
+    edition,
     span
 });
 

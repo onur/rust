@@ -9,6 +9,8 @@
 // except according to those terms.
 
 use build::{BlockAnd, BlockAndExtension, Builder};
+use build::ForGuard::OutsideGuard;
+use build::matches::ArmHasGuard;
 use hair::*;
 use rustc::mir::*;
 use rustc::hir;
@@ -34,7 +36,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         self.in_opt_scope(opt_destruction_scope.map(|de|(de, source_info)), block, move |this| {
             this.in_scope((region_scope, source_info), LintLevel::Inherited, block, move |this| {
                 if targeted_by_break {
-                    // This is a `break`-able block (currently only `catch { ... }`)
+                    // This is a `break`-able block
                     let exit_block = this.cfg.start_new_block();
                     let block_exit = this.in_breakable_scope(
                         None, exit_block, destination.clone(), |this| {
@@ -113,7 +115,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                     // Declare the bindings, which may create a visibility scope.
                     let remainder_span = remainder_scope.span(this.hir.tcx(),
                                                               &this.hir.region_scope_tree);
-                    let scope = this.declare_bindings(None, remainder_span, lint_level, &pattern);
+                    let scope = this.declare_bindings(None, remainder_span, lint_level, &pattern,
+                                                      ArmHasGuard(false));
 
                     // Evaluate the initializer, if present.
                     if let Some(init) = initializer {
@@ -135,8 +138,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                         }
 
                         this.visit_bindings(&pattern, &mut |this, _, _, node, span, _| {
-                            this.storage_live_binding(block, node, span);
-                            this.schedule_drop_for_binding(node, span);
+                            this.storage_live_binding(block, node, span, OutsideGuard);
+                            this.schedule_drop_for_binding(node, span, OutsideGuard);
                         })
                     }
 

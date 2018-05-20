@@ -735,6 +735,7 @@ fn may_begin_with(name: &str, token: &Token) -> bool {
         "expr" => token.can_begin_expr(),
         "ty" => token.can_begin_type(),
         "ident" => get_macro_ident(token).is_some(),
+        "literal" => token.can_begin_literal_or_bool(),
         "vis" => match *token {
             // The follow-set of :vis + "priv" keyword + interpolated
             Token::Comma | Token::Ident(..) | Token::Interpolated(_) => true,
@@ -821,6 +822,7 @@ fn parse_nt<'a>(p: &mut Parser<'a>, sp: Span, name: &str) -> Nonterminal {
         },
         "pat" => token::NtPat(panictry!(p.parse_pat())),
         "expr" => token::NtExpr(panictry!(p.parse_expr())),
+        "literal" => token::NtLiteral(panictry!(p.parse_literal_maybe_minus())),
         "ty" => token::NtTy(panictry!(p.parse_ty())),
         // this could be handled like a token, since it is one
         "ident" => if let Some((ident, is_raw)) = get_macro_ident(&p.token) {
@@ -835,7 +837,13 @@ fn parse_nt<'a>(p: &mut Parser<'a>, sp: Span, name: &str) -> Nonterminal {
         "path" => token::NtPath(panictry!(p.parse_path_common(PathStyle::Type, false))),
         "meta" => token::NtMeta(panictry!(p.parse_meta_item())),
         "vis" => token::NtVis(panictry!(p.parse_visibility(true))),
-        "lifetime" => token::NtLifetime(p.expect_lifetime().ident),
+        "lifetime" => if p.check_lifetime() {
+            token::NtLifetime(p.expect_lifetime().ident)
+        } else {
+            let token_str = pprust::token_to_string(&p.token);
+            p.fatal(&format!("expected a lifetime, found `{}`", &token_str)).emit();
+            FatalError.raise();
+        }
         // this is not supposed to happen, since it has been checked
         // when compiling the macro.
         _ => p.span_bug(sp, "invalid fragment specifier"),

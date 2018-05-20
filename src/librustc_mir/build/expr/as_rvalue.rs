@@ -16,11 +16,10 @@ use rustc_data_structures::indexed_vec::Idx;
 use build::{BlockAnd, BlockAndExtension, Builder};
 use build::expr::category::{Category, RvalueFunc};
 use hair::*;
-use rustc::middle::const_val::ConstVal;
 use rustc::middle::region;
-use rustc::ty::{self, Ty};
+use rustc::ty::{self, Ty, UpvarSubsts};
 use rustc::mir::*;
-use rustc::mir::interpret::{Value, PrimVal, EvalErrorKind};
+use rustc::mir::interpret::EvalErrorKind;
 use syntax_pos::Span;
 
 impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
@@ -141,7 +140,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 block.and(Rvalue::Cast(CastKind::Unsize, source, expr.ty))
             }
             ExprKind::Array { fields } => {
-                // (*) We would (maybe) be closer to trans if we
+                // (*) We would (maybe) be closer to codegen if we
                 // handled this and other aggregate cases via
                 // `into()`, not `as_rvalue` -- in that case, instead
                 // of generating
@@ -185,27 +184,32 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
 
                 block.and(Rvalue::Aggregate(box AggregateKind::Tuple, fields))
             }
-            ExprKind::Closure { closure_id, substs, upvars, interior } => { // see (*) above
+            ExprKind::Closure { closure_id, substs, upvars, movability } => {
+                // see (*) above
                 let mut operands: Vec<_> =
                     upvars.into_iter()
                           .map(|upvar| unpack!(block = this.as_operand(block, scope, upvar)))
                           .collect();
-                let result = if let Some(interior) = interior {
-                    // Add the state operand since it follows the upvars in the generator
-                    // struct. See librustc_mir/transform/generator.rs for more details.
-                    operands.push(Operand::Constant(box Constant {
-                        span: expr_span,
-                        ty: this.hir.tcx().types.u32,
-                        literal: Literal::Value {
-                            value: this.hir.tcx().mk_const(ty::Const {
-                                val: ConstVal::Value(Value::ByVal(PrimVal::Bytes(0))),
-                                ty: this.hir.tcx().types.u32
-                            }),
-                        },
-                    }));
-                    box AggregateKind::Generator(closure_id, substs, interior)
-                } else {
-                    box AggregateKind::Closure(closure_id, substs)
+                let result = match substs {
+                    UpvarSubsts::Generator(substs) => {
+                        let movability = movability.unwrap();
+                        // Add the state operand since it follows the upvars in the generator
+                        // struct. See librustc_mir/transform/generator.rs for more details.
+                        operands.push(Operand::Constant(box Constant {
+                            span: expr_span,
+                            ty: this.hir.tcx().types.u32,
+                            literal: Literal::Value {
+                                value: ty::Const::from_bits(
+                                    this.hir.tcx(),
+                                    0,
+                                    this.hir.tcx().types.u32),
+                            },
+                        }));
+                        box AggregateKind::Generator(closure_id, substs, movability)
+                    }
+                    UpvarSubsts::Closure(substs) => {
+                        box AggregateKind::Closure(closure_id, substs)
+                    }
                 };
                 block.and(Rvalue::Aggregate(result, operands))
             }
@@ -373,10 +377,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         let bits = self.hir.integer_bit_width(ty);
         let n = (!0u128) >> (128 - bits);
         let literal = Literal::Value {
-            value: self.hir.tcx().mk_const(ty::Const {
-                val: ConstVal::Value(Value::ByVal(PrimVal::Bytes(n))),
-                ty
-            })
+            value: ty::Const::from_bits(self.hir.tcx(), n, ty)
         };
 
         self.literal_operand(span, ty, literal)
@@ -388,10 +389,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         let bits = self.hir.integer_bit_width(ty);
         let n = 1 << (bits - 1);
         let literal = Literal::Value {
-            value: self.hir.tcx().mk_const(ty::Const {
-                val: ConstVal::Value(Value::ByVal(PrimVal::Bytes(n))),
-                ty
-            })
+            value: ty::Const::from_bits(self.hir.tcx(), n, ty)
         };
 
         self.literal_operand(span, ty, literal)

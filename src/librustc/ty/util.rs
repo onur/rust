@@ -15,24 +15,18 @@ use hir::def_id::DefId;
 use hir::map::{DefPathData, Node};
 use hir;
 use ich::NodeIdHashingMode;
-use middle::const_val::ConstVal;
-use traits;
-use ty::{self, Ty, TyCtxt, TypeFoldable};
-use ty::fold::TypeVisitor;
-use ty::subst::UnpackedKind;
+use traits::{self, ObligationCause};
+use ty::{self, Ty, TyCtxt, GenericParamDefKind, TypeFoldable};
+use ty::subst::{Substs, UnpackedKind};
 use ty::maps::TyCtxtAt;
 use ty::TypeVariants::*;
 use ty::layout::{Integer, IntegerExt};
 use util::common::ErrorReported;
 use middle::lang_items;
-use mir::interpret::{Value, PrimVal};
 
-use rustc_data_structures::stable_hasher::{StableHasher, StableHasherResult,
-                                           HashStable};
+use rustc_data_structures::stable_hasher::{StableHasher, HashStable};
 use rustc_data_structures::fx::FxHashMap;
 use std::{cmp, fmt};
-use std::hash::Hash;
-use std::intrinsics;
 use syntax::ast;
 use syntax::attr::{self, SignedInt, UnsignedInt};
 use syntax_pos::{Span, DUMMY_SP};
@@ -167,9 +161,9 @@ impl IntTypeExt for attr::IntType {
 }
 
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub enum CopyImplementationError<'tcx> {
-    InfrigingField(&'tcx ty::FieldDef),
+    InfrigingFields(Vec<&'tcx ty::FieldDef>),
     NotAnAdt,
     HasDestructor,
 }
@@ -192,7 +186,7 @@ pub enum Representability {
 impl<'tcx> ty::ParamEnv<'tcx> {
     pub fn can_type_implement_copy<'a>(self,
                                        tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                       self_type: Ty<'tcx>, span: Span)
+                                       self_type: Ty<'tcx>)
                                        -> Result<(), CopyImplementationError<'tcx>> {
         // FIXME: (@jroesch) float this code up
         tcx.infer_ctxt().enter(|infcx| {
@@ -201,29 +195,36 @@ impl<'tcx> ty::ParamEnv<'tcx> {
                 // Now libcore provides that impl.
                 ty::TyUint(_) | ty::TyInt(_) | ty::TyBool | ty::TyFloat(_) |
                 ty::TyChar | ty::TyRawPtr(..) | ty::TyNever |
-                ty::TyRef(_, ty::TypeAndMut { ty: _, mutbl: hir::MutImmutable }) => return Ok(()),
+                ty::TyRef(_, _, hir::MutImmutable) => return Ok(()),
 
                 ty::TyAdt(adt, substs) => (adt, substs),
 
                 _ => return Err(CopyImplementationError::NotAnAdt),
             };
 
-            let field_implements_copy = |field: &ty::FieldDef| {
-                let cause = traits::ObligationCause::dummy();
-                match traits::fully_normalize(&infcx, cause, self, &field.ty(tcx, substs)) {
-                    Ok(ty) => !infcx.type_moves_by_default(self, ty, span),
-                    Err(..) => false,
-                }
-            };
-
+            let mut infringing = Vec::new();
             for variant in &adt.variants {
                 for field in &variant.fields {
-                    if !field_implements_copy(field) {
-                        return Err(CopyImplementationError::InfrigingField(field));
+                    let span = tcx.def_span(field.did);
+                    let ty = field.ty(tcx, substs);
+                    if ty.references_error() {
+                        continue;
                     }
+                    let cause = ObligationCause { span, ..ObligationCause::dummy() };
+                    let ctx = traits::FulfillmentContext::new();
+                    match traits::fully_normalize(&infcx, ctx, cause, self, &ty) {
+                        Ok(ty) => if infcx.type_moves_by_default(self, ty, span) {
+                            infringing.push(field);
+                        }
+                        Err(errors) => {
+                            infcx.report_fulfillment_errors(&errors, None, false);
+                        }
+                    };
                 }
             }
-
+            if !infringing.is_empty() {
+                return Err(CopyImplementationError::InfrigingFields(infringing));
+            }
             if adt.has_dtor(tcx) {
                 return Err(CopyImplementationError::HasDestructor);
             }
@@ -567,11 +568,14 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 
     /// Given the def-id of some item that has no type parameters, make
     /// a suitable "empty substs" for it.
-    pub fn empty_substs_for_def_id(self, item_def_id: DefId) -> &'tcx ty::Substs<'tcx> {
-        ty::Substs::for_item(self, item_def_id,
-                             |_, _| self.types.re_erased,
-                             |_, _| {
-            bug!("empty_substs_for_def_id: {:?} has type parameters", item_def_id)
+    pub fn empty_substs_for_def_id(self, item_def_id: DefId) -> &'tcx Substs<'tcx> {
+        Substs::for_item(self, item_def_id, |param, _| {
+            match param.kind {
+                GenericParamDefKind::Lifetime => self.types.re_erased.into(),
+                GenericParamDefKind::Type(_) => {
+                    bug!("empty_substs_for_def_id: {:?} has type parameters", item_def_id)
+                }
+            }
         })
     }
 
@@ -603,151 +607,6 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 _ => None
             }
         }
-    }
-}
-
-pub struct TypeIdHasher<'a, 'gcx: 'a+'tcx, 'tcx: 'a, W> {
-    tcx: TyCtxt<'a, 'gcx, 'tcx>,
-    state: StableHasher<W>,
-}
-
-impl<'a, 'gcx, 'tcx, W> TypeIdHasher<'a, 'gcx, 'tcx, W>
-    where W: StableHasherResult
-{
-    pub fn new(tcx: TyCtxt<'a, 'gcx, 'tcx>) -> Self {
-        TypeIdHasher { tcx: tcx, state: StableHasher::new() }
-    }
-
-    pub fn finish(self) -> W {
-        self.state.finish()
-    }
-
-    pub fn hash<T: Hash>(&mut self, x: T) {
-        x.hash(&mut self.state);
-    }
-
-    fn hash_discriminant_u8<T>(&mut self, x: &T) {
-        let v = unsafe {
-            intrinsics::discriminant_value(x)
-        };
-        let b = v as u8;
-        assert_eq!(v, b as u64);
-        self.hash(b)
-    }
-
-    fn def_id(&mut self, did: DefId) {
-        // Hash the DefPath corresponding to the DefId, which is independent
-        // of compiler internal state. We already have a stable hash value of
-        // all DefPaths available via tcx.def_path_hash(), so we just feed that
-        // into the hasher.
-        let hash = self.tcx.def_path_hash(did);
-        self.hash(hash);
-    }
-}
-
-impl<'a, 'gcx, 'tcx, W> TypeVisitor<'tcx> for TypeIdHasher<'a, 'gcx, 'tcx, W>
-    where W: StableHasherResult
-{
-    fn visit_ty(&mut self, ty: Ty<'tcx>) -> bool {
-        // Distinguish between the Ty variants uniformly.
-        self.hash_discriminant_u8(&ty.sty);
-
-        match ty.sty {
-            TyInt(i) => self.hash(i),
-            TyUint(u) => self.hash(u),
-            TyFloat(f) => self.hash(f),
-            TyArray(_, n) => {
-                self.hash_discriminant_u8(&n.val);
-                match n.val {
-                    ConstVal::Value(Value::ByVal(PrimVal::Bytes(b))) => self.hash(b),
-                    ConstVal::Unevaluated(def_id, _) => self.def_id(def_id),
-                    _ => bug!("arrays should not have {:?} as length", n)
-                }
-            }
-            TyRawPtr(m) |
-            TyRef(_, m) => self.hash(m.mutbl),
-            TyClosure(def_id, _) |
-            TyGenerator(def_id, _, _) |
-            TyAnon(def_id, _) |
-            TyFnDef(def_id, _) => self.def_id(def_id),
-            TyAdt(d, _) => self.def_id(d.did),
-            TyForeign(def_id) => self.def_id(def_id),
-            TyFnPtr(f) => {
-                self.hash(f.unsafety());
-                self.hash(f.abi());
-                self.hash(f.variadic());
-                self.hash(f.inputs().skip_binder().len());
-            }
-            TyDynamic(ref data, ..) => {
-                if let Some(p) = data.principal() {
-                    self.def_id(p.def_id());
-                }
-                for d in data.auto_traits() {
-                    self.def_id(d);
-                }
-            }
-            TyGeneratorWitness(tys) => {
-                self.hash(tys.skip_binder().len());
-            }
-            TyTuple(tys) => {
-                self.hash(tys.len());
-            }
-            TyParam(p) => {
-                self.hash(p.idx);
-                self.hash(p.name);
-            }
-            TyProjection(ref data) => {
-                self.def_id(data.item_def_id);
-            }
-            TyNever |
-            TyBool |
-            TyChar |
-            TyStr |
-            TySlice(_) => {}
-
-            TyError |
-            TyInfer(_) => bug!("TypeIdHasher: unexpected type {}", ty)
-        }
-
-        ty.super_visit_with(self)
-    }
-
-    fn visit_region(&mut self, r: ty::Region<'tcx>) -> bool {
-        self.hash_discriminant_u8(r);
-        match *r {
-            ty::ReErased |
-            ty::ReStatic |
-            ty::ReEmpty => {
-                // No variant fields to hash for these ...
-            }
-            ty::ReCanonical(c) => {
-                self.hash(c);
-            }
-            ty::ReLateBound(db, ty::BrAnon(i)) => {
-                self.hash(db.depth);
-                self.hash(i);
-            }
-            ty::ReEarlyBound(ty::EarlyBoundRegion { def_id, .. }) => {
-                self.def_id(def_id);
-            }
-
-            ty::ReClosureBound(..) |
-            ty::ReLateBound(..) |
-            ty::ReFree(..) |
-            ty::ReScope(..) |
-            ty::ReVar(..) |
-            ty::ReSkolemized(..) => {
-                bug!("TypeIdHasher: unexpected region {:?}", r)
-            }
-        }
-        false
-    }
-
-    fn visit_binder<T: TypeFoldable<'tcx>>(&mut self, x: &ty::Binder<T>) -> bool {
-        // Anonymize late-bound regions so that, for example:
-        // `for<'a, b> fn(&'a &'b T)` and `for<'a, b> fn(&'b &'a T)`
-        // result in the same TypeId (the two types are equivalent).
-        self.tcx.anonymize_late_bound_regions(x).super_visit_with(self)
     }
 }
 
@@ -1141,7 +1000,7 @@ impl<'tcx> ExplicitSelf<'tcx> {
 
         match self_arg_ty.sty {
             _ if is_self_ty(self_arg_ty) => ByValue,
-            ty::TyRef(region, ty::TypeAndMut { ty, mutbl }) if is_self_ty(ty) => {
+            ty::TyRef(region, ty, mutbl) if is_self_ty(ty) => {
                 ByReference(region, mutbl)
             }
             ty::TyRawPtr(ty::TypeAndMut { ty, mutbl }) if is_self_ty(ty) => {

@@ -205,7 +205,7 @@ impl<'a, 'tcx: 'a> Annotator<'a, 'tcx> {
         } else {
             // Emit errors for non-staged-api crates.
             for attr in attrs {
-                let tag = unwrap_or!(attr.name(), continue);
+                let tag = attr.name();
                 if tag == "unstable" || tag == "stable" || tag == "rustc_deprecated" {
                     attr::mark_used(attr);
                     self.tcx.sess.span_err(attr.span(), "stability attributes may not be used \
@@ -764,7 +764,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
                                      "unions with `Drop` implementations are unstable");
                 } else {
                     let param_env = self.tcx.param_env(def_id);
-                    if !param_env.can_type_implement_copy(self.tcx, ty, item.span).is_ok() {
+                    if !param_env.can_type_implement_copy(self.tcx, ty).is_ok() {
                         emit_feature_err(&self.tcx.sess.parse_sess,
                                         "untagged_unions", item.span, GateIssue::Language,
                                         "unions with non-`Copy` fields are unstable");

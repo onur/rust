@@ -79,7 +79,7 @@ impl FlagComputation {
             }
 
             &ty::TyParam(ref p) => {
-                self.add_flags(TypeFlags::HAS_LOCAL_NAMES);
+                self.add_flags(TypeFlags::HAS_FREE_LOCAL_NAMES);
                 if p.is_self() {
                     self.add_flags(TypeFlags::HAS_SELF);
                 } else {
@@ -87,11 +87,10 @@ impl FlagComputation {
                 }
             }
 
-            &ty::TyGenerator(_, ref substs, ref interior) => {
+            &ty::TyGenerator(_, ref substs, _) => {
                 self.add_flags(TypeFlags::HAS_TY_CLOSURE);
-                self.add_flags(TypeFlags::HAS_LOCAL_NAMES);
+                self.add_flags(TypeFlags::HAS_FREE_LOCAL_NAMES);
                 self.add_substs(&substs.substs);
-                self.add_ty(interior.witness);
             }
 
             &ty::TyGeneratorWitness(ref ts) => {
@@ -102,12 +101,12 @@ impl FlagComputation {
 
             &ty::TyClosure(_, ref substs) => {
                 self.add_flags(TypeFlags::HAS_TY_CLOSURE);
-                self.add_flags(TypeFlags::HAS_LOCAL_NAMES);
+                self.add_flags(TypeFlags::HAS_FREE_LOCAL_NAMES);
                 self.add_substs(&substs.substs);
             }
 
             &ty::TyInfer(infer) => {
-                self.add_flags(TypeFlags::HAS_LOCAL_NAMES); // it might, right?
+                self.add_flags(TypeFlags::HAS_FREE_LOCAL_NAMES); // it might, right?
                 self.add_flags(TypeFlags::HAS_TY_INFER);
                 match infer {
                     ty::FreshTy(_) |
@@ -174,9 +173,9 @@ impl FlagComputation {
                 self.add_ty(m.ty);
             }
 
-            &ty::TyRef(r, ref m) => {
+            &ty::TyRef(r, ty, _) => {
                 self.add_region(r);
-                self.add_ty(m.ty);
+                self.add_ty(ty);
             }
 
             &ty::TyTuple(ref ts) => {

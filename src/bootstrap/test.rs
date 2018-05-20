@@ -32,18 +32,29 @@ use dist;
 use native;
 use tool::{self, Tool};
 use util::{self, dylib_path, dylib_path_var};
-use Mode;
+use {Mode, DocTests};
 use toolstate::ToolState;
+use flags::Subcommand;
 
 const ADB_TEST_DIR: &str = "/data/tmp/work";
 
 /// The two modes of the test runner; tests or benchmarks.
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, PartialOrd, Ord)]
 pub enum TestKind {
     /// Run `cargo test`
     Test,
     /// Run `cargo bench`
     Bench,
+}
+
+impl From<Kind> for TestKind {
+    fn from(kind: Kind) -> Self {
+        match kind {
+            Kind::Test => TestKind::Test,
+            Kind::Bench => TestKind::Bench,
+            _ => panic!("unexpected kind in crate: {:?}", kind)
+        }
+    }
 }
 
 impl TestKind {
@@ -313,6 +324,9 @@ impl Step for Rustfmt {
 
         // Don't build tests dynamically, just a pain to work with
         cargo.env("RUSTC_NO_PREFER_DYNAMIC", "1");
+        let dir = testdir(builder, compiler.host);
+        t!(fs::create_dir_all(&dir));
+        cargo.env("RUSTFMT_TEST_DIR", dir);
 
         builder.add_rustc_lib_path(compiler, &mut cargo);
 
@@ -556,6 +570,7 @@ impl Step for RustdocUi {
             target: self.target,
             mode: "ui",
             suite: "rustdoc-ui",
+            path: None,
             compare_mode: None,
         })
     }
@@ -660,7 +675,7 @@ macro_rules! test_definitions {
             const ONLY_HOSTS: bool = $host;
 
             fn should_run(run: ShouldRun) -> ShouldRun {
-                run.path($path)
+                run.suite_path($path)
             }
 
             fn make_run(run: RunConfig) {
@@ -678,6 +693,7 @@ macro_rules! test_definitions {
                     target: self.target,
                     mode: $mode,
                     suite: $suite,
+                    path: Some($path),
                     compare_mode: $compare_mode,
                 })
             }
@@ -850,6 +866,7 @@ struct Compiletest {
     target: Interned<String>,
     mode: &'static str,
     suite: &'static str,
+    path: Option<&'static str>,
     compare_mode: Option<&'static str>,
 }
 
@@ -871,6 +888,9 @@ impl Step for Compiletest {
         let mode = self.mode;
         let suite = self.suite;
         let compare_mode = self.compare_mode;
+
+        // Path for test suite
+        let suite_path = self.path.unwrap_or("");
 
         // Skip codegen tests if they aren't enabled in configuration.
         if !builder.config.codegen_tests && suite == "codegen" {
@@ -941,6 +961,10 @@ impl Step for Compiletest {
         cmd.arg("--host").arg(&*compiler.host);
         cmd.arg("--llvm-filecheck").arg(builder.llvm_filecheck(builder.config.build));
 
+        if builder.config.cmd.bless() {
+            cmd.arg("--bless");
+        }
+
         if let Some(ref nodejs) = builder.config.nodejs {
             cmd.arg("--nodejs").arg(nodejs);
         }
@@ -994,7 +1018,19 @@ impl Step for Compiletest {
             cmd.arg("--lldb-python-dir").arg(dir);
         }
 
-        cmd.args(&builder.config.cmd.test_args());
+        // Get paths from cmd args
+        let paths = match &builder.config.cmd {
+            Subcommand::Test { ref paths, ..} => &paths[..],
+            _ => &[]
+        };
+
+        // Get test-args by striping suite path
+        let mut test_args: Vec<&str> = paths.iter().filter(|p| p.starts_with(suite_path) &&
+           p.is_file()).map(|p| p.strip_prefix(suite_path).unwrap().to_str().unwrap()).collect();
+
+        test_args.append(&mut builder.config.cmd.test_args());
+
+        cmd.args(&test_args);
 
         if builder.is_verbose() {
             cmd.arg("--verbose");
@@ -1320,13 +1356,7 @@ impl Step for CrateLibrustc {
 
         for krate in builder.in_tree_crates("rustc-main") {
             if run.path.ends_with(&krate.path) {
-                let test_kind = if builder.kind == Kind::Test {
-                    TestKind::Test
-                } else if builder.kind == Kind::Bench {
-                    TestKind::Bench
-                } else {
-                    panic!("unexpected builder.kind in crate: {:?}", builder.kind);
-                };
+                let test_kind = builder.kind.into();
 
                 builder.ensure(CrateLibrustc {
                     compiler,
@@ -1372,13 +1402,7 @@ impl Step for CrateNotDefault {
         let builder = run.builder;
         let compiler = builder.compiler(builder.top_stage, run.host);
 
-        let test_kind = if builder.kind == Kind::Test {
-            TestKind::Test
-        } else if builder.kind == Kind::Bench {
-            TestKind::Bench
-        } else {
-            panic!("unexpected builder.kind in crate: {:?}", builder.kind);
-        };
+        let test_kind = builder.kind.into();
 
         builder.ensure(CrateNotDefault {
             compiler,
@@ -1407,13 +1431,13 @@ impl Step for CrateNotDefault {
 }
 
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Crate {
-    compiler: Compiler,
-    target: Interned<String>,
-    mode: Mode,
-    test_kind: TestKind,
-    krate: Interned<String>,
+    pub compiler: Compiler,
+    pub target: Interned<String>,
+    pub mode: Mode,
+    pub test_kind: TestKind,
+    pub krate: Interned<String>,
 }
 
 impl Step for Crate {
@@ -1439,13 +1463,7 @@ impl Step for Crate {
         let compiler = builder.compiler(builder.top_stage, run.host);
 
         let make = |mode: Mode, krate: &CargoCrate| {
-            let test_kind = if builder.kind == Kind::Test {
-                TestKind::Test
-            } else if builder.kind == Kind::Bench {
-                TestKind::Bench
-            } else {
-                panic!("unexpected builder.kind in crate: {:?}", builder.kind);
-            };
+            let test_kind = builder.kind.into();
 
             builder.ensure(Crate {
                 compiler,
@@ -1519,8 +1537,14 @@ impl Step for Crate {
         if test_kind.subcommand() == "test" && !builder.fail_fast {
             cargo.arg("--no-fail-fast");
         }
-        if builder.doc_tests {
-            cargo.arg("--doc");
+        match builder.doc_tests {
+            DocTests::Only => {
+                cargo.arg("--doc");
+            }
+            DocTests::No => {
+                cargo.args(&["--lib", "--bins", "--examples", "--tests", "--benches"]);
+            }
+            DocTests::Yes => {}
         }
 
         cargo.arg("-p").arg(krate);
@@ -1597,13 +1621,7 @@ impl Step for CrateRustdoc {
     fn make_run(run: RunConfig) {
         let builder = run.builder;
 
-        let test_kind = if builder.kind == Kind::Test {
-            TestKind::Test
-        } else if builder.kind == Kind::Bench {
-            TestKind::Bench
-        } else {
-            panic!("unexpected builder.kind in crate: {:?}", builder.kind);
-        };
+        let test_kind = builder.kind.into();
 
         builder.ensure(CrateRustdoc {
             host: run.host,

@@ -283,6 +283,7 @@ supported_targets! {
     ("arm-unknown-linux-musleabihf", arm_unknown_linux_musleabihf),
     ("armv4t-unknown-linux-gnueabi", armv4t_unknown_linux_gnueabi),
     ("armv5te-unknown-linux-gnueabi", armv5te_unknown_linux_gnueabi),
+    ("armv5te-unknown-linux-musleabi", armv5te_unknown_linux_musleabi),
     ("armv7-unknown-linux-gnueabihf", armv7_unknown_linux_gnueabihf),
     ("armv7-unknown-linux-musleabihf", armv7_unknown_linux_musleabihf),
     ("aarch64-unknown-linux-gnu", aarch64_unknown_linux_gnu),
@@ -312,6 +313,7 @@ supported_targets! {
 
     ("x86_64-unknown-bitrig", x86_64_unknown_bitrig),
 
+    ("aarch64-unknown-openbsd", aarch64_unknown_openbsd),
     ("i686-unknown-openbsd", i686_unknown_openbsd),
     ("x86_64-unknown-openbsd", x86_64_unknown_openbsd),
 
@@ -339,6 +341,8 @@ supported_targets! {
     ("aarch64-apple-ios", aarch64_apple_ios),
     ("armv7-apple-ios", armv7_apple_ios),
     ("armv7s-apple-ios", armv7s_apple_ios),
+
+    ("armebv7r-none-eabihf", armebv7r_none_eabihf),
 
     ("x86_64-sun-solaris", x86_64_sun_solaris),
     ("sparcv9-sun-solaris", sparcv9_sun_solaris),

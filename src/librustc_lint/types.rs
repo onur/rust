@@ -432,7 +432,7 @@ enum FfiResult<'tcx> {
 /// "nullable pointer optimization". Currently restricted
 /// to function pointers and references, but could be
 /// expanded to cover NonZero raw pointers and newtypes.
-/// FIXME: This duplicates code in trans.
+/// FIXME: This duplicates code in codegen.
 fn is_repr_nullable_ptr<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                                   def: &'tcx ty::AdtDef,
                                   substs: &Substs<'tcx>)
@@ -662,8 +662,8 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                 help: Some("consider using a struct instead"),
             },
 
-            ty::TyRawPtr(ref m) |
-            ty::TyRef(_, ref m) => self.check_type_for_ffi(cache, m.ty),
+            ty::TyRawPtr(ty::TypeAndMut { ty, .. }) |
+            ty::TyRef(_, ty, _) => self.check_type_for_ffi(cache, ty),
 
             ty::TyArray(ty, _) => self.check_type_for_ffi(cache, ty),
 
@@ -820,8 +820,8 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for VariantSizeDifferences {
                     bug!("failed to get layout for `{}`: {}", t, e)
                 });
 
-                if let layout::Variants::Tagged { ref variants, ref discr, .. } = layout.variants {
-                    let discr_size = discr.value.size(cx.tcx).bytes();
+                if let layout::Variants::Tagged { ref variants, ref tag, .. } = layout.variants {
+                    let discr_size = tag.value.size(cx.tcx).bytes();
 
                     debug!("enum `{}` is {} bytes large with layout:\n{:#?}",
                       t, layout.size.bytes(), layout);

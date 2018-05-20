@@ -10,7 +10,7 @@
 
 //! This query borrow-checks the MIR to (further) ensure it is not broken.
 
-use borrow_check::nll::region_infer::{RegionCausalInfo, RegionInferenceContext};
+use borrow_check::nll::region_infer::RegionInferenceContext;
 use rustc::hir;
 use rustc::hir::def_id::DefId;
 use rustc::hir::map::definitions::DefPathData;
@@ -50,12 +50,14 @@ use std::iter;
 
 use self::borrow_set::{BorrowSet, BorrowData};
 use self::flows::Flows;
+use self::location::LocationTable;
 use self::prefixes::PrefixSet;
 use self::MutateMode::{JustWrite, WriteAndRead};
 
 crate mod borrow_set;
 mod error_reporting;
 mod flows;
+mod location;
 crate mod place_ext;
 mod prefixes;
 
@@ -110,6 +112,7 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
     let mut mir: Mir<'tcx> = input_mir.clone();
     let free_regions = nll::replace_regions_in_mir(infcx, def_id, param_env, &mut mir);
     let mir = &mir; // no further changes
+    let location_table = &LocationTable::new(mir);
 
     let move_data: MoveData<'tcx> = match MoveData::gather_moves(mir, tcx) {
         Ok(move_data) => move_data,
@@ -199,6 +202,7 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         def_id,
         free_regions,
         mir,
+        location_table,
         param_env,
         &mut flow_inits,
         &mdpe.move_data,
@@ -244,7 +248,6 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         nonlexical_regioncx: regioncx,
         used_mut: FxHashSet(),
         used_mut_upvars: SmallVec::new(),
-        nonlexical_cause_info: None,
         borrow_set,
         dominators,
     };
@@ -295,10 +298,10 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
                 continue;
             }
 
-            // Skip over locals that begin with an underscore
+            // Skip over locals that begin with an underscore or have no name
             match local_decl.name {
-                Some(name) if name.as_str().starts_with("_") => continue,
-                _ => {},
+                Some(name) => if name.as_str().starts_with("_") { continue; },
+                None => continue,
             }
 
             let source_info = local_decl.source_info;
@@ -363,7 +366,6 @@ pub struct MirBorrowckCtxt<'cx, 'gcx: 'tcx, 'tcx: 'cx> {
     /// contains the results from region inference and lets us e.g.
     /// find out which CFG points are contained in each borrow region.
     nonlexical_regioncx: Rc<RegionInferenceContext<'tcx>>,
-    nonlexical_cause_info: Option<RegionCausalInfo>,
 
     /// The set of borrows extracted from the MIR
     borrow_set: Rc<BorrowSet<'tcx>>,
@@ -831,10 +833,17 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 tys.iter().cloned().enumerate()
                     .for_each(|field| drop_field(self, field));
             }
-            // Closures and generators also have disjoint fields, but they are only
-            // directly accessed in the body of the closure/generator.
+            // Closures also have disjoint fields, but they are only
+            // directly accessed in the body of the closure.
             ty::TyClosure(def, substs)
-            | ty::TyGenerator(def, substs, ..)
+                if *drop_place == Place::Local(Local::new(1)) && !self.mir.upvar_decls.is_empty()
+            => {
+                substs.upvar_tys(def, self.tcx).enumerate()
+                    .for_each(|field| drop_field(self, field));
+            }
+            // Generators also have disjoint fields, but they are only
+            // directly accessed in the body of the generator.
+            ty::TyGenerator(def, substs, _)
                 if *drop_place == Place::Local(Local::new(1)) && !self.mir.upvar_decls.is_empty()
             => {
                 substs.upvar_tys(def, self.tcx).enumerate()
@@ -1799,9 +1808,9 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 }
             }
             Reservation(WriteKind::Move)
+            | Write(WriteKind::Move)
             | Reservation(WriteKind::StorageDeadOrDrop)
             | Reservation(WriteKind::MutableBorrow(BorrowKind::Shared))
-            | Write(WriteKind::Move)
             | Write(WriteKind::StorageDeadOrDrop)
             | Write(WriteKind::MutableBorrow(BorrowKind::Shared)) => {
                 if let Err(_place_err) = self.is_mutable(place, is_local_mutation_allowed) {
@@ -1840,8 +1849,11 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     // mutated, then it is justified to be annotated with the `mut`
                     // keyword, since the mutation may be a possible reassignment.
                     let mpi = self.move_data.rev_lookup.find_local(*local);
-                    if flow_state.inits.contains(&mpi) {
-                        self.used_mut.insert(*local);
+                    let ii = &self.move_data.init_path_map[mpi];
+                    for index in ii {
+                        if flow_state.ever_inits.contains(index) {
+                            self.used_mut.insert(*local);
+                        }
                     }
                 }
             }
@@ -1902,8 +1914,8 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
 
                         // Check the kind of deref to decide
                         match base_ty.sty {
-                            ty::TyRef(_, tnm) => {
-                                match tnm.mutbl {
+                            ty::TyRef(_, _, mutbl) => {
+                                match mutbl {
                                     // Shared borrowed data is never mutable
                                     hir::MutImmutable => Err(place),
                                     // Mutably borrowed data is mutable, but only if we have a
@@ -2337,13 +2349,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                         }
                         (
                             ProjectionElem::Deref,
-                            ty::TyRef(
-                                _,
-                                ty::TypeAndMut {
-                                    ty: _,
-                                    mutbl: hir::MutImmutable,
-                                },
-                            ),
+                            ty::TyRef( _, _, hir::MutImmutable),
                             _,
                         ) => {
                             // the borrow goes through a dereference of a shared reference.

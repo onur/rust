@@ -26,7 +26,6 @@
 #![feature(iterator_step_by)]
 #![feature(iterator_flatten)]
 #![feature(iterator_repeat_with)]
-#![feature(nonzero)]
 #![feature(pattern)]
 #![feature(range_is_empty)]
 #![feature(raw)]
@@ -42,10 +41,11 @@
 #![feature(try_from)]
 #![feature(try_trait)]
 #![feature(exact_chunks)]
-#![cfg_attr(stage0, feature(atomic_nand))]
+#![feature(slice_align_to)]
+#![feature(align_offset)]
 #![feature(reverse_bits)]
-#![feature(inclusive_range_methods)]
 #![feature(iterator_find_map)]
+#![feature(slice_internals)]
 
 extern crate core;
 extern crate test;
@@ -74,4 +74,5 @@ mod result;
 mod slice;
 mod str;
 mod str_lossy;
+mod time;
 mod tuple;

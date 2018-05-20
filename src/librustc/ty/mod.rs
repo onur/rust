@@ -22,12 +22,11 @@ use hir::svh::Svh;
 use ich::Fingerprint;
 use ich::StableHashingContext;
 use infer::canonical::{Canonical, Canonicalize};
-use middle::const_val::ConstVal;
 use middle::lang_items::{FnTraitLangItem, FnMutTraitLangItem, FnOnceTraitLangItem};
 use middle::privacy::AccessLevels;
 use middle::resolve_lifetime::ObjectLifetimeDefault;
 use mir::Mir;
-use mir::interpret::{GlobalId, Value, PrimVal};
+use mir::interpret::GlobalId;
 use mir::GeneratorLayout;
 use session::CrateDisambiguator;
 use traits::{self, Reveal};
@@ -63,13 +62,13 @@ use hir;
 pub use self::sty::{Binder, CanonicalVar, DebruijnIndex};
 pub use self::sty::{FnSig, GenSig, PolyFnSig, PolyGenSig};
 pub use self::sty::{InferTy, ParamTy, ProjectionTy, ExistentialPredicate};
-pub use self::sty::{ClosureSubsts, GeneratorInterior, TypeAndMut};
+pub use self::sty::{ClosureSubsts, GeneratorSubsts, UpvarSubsts, TypeAndMut};
 pub use self::sty::{TraitRef, TypeVariants, PolyTraitRef};
 pub use self::sty::{ExistentialTraitRef, PolyExistentialTraitRef};
 pub use self::sty::{ExistentialProjection, PolyExistentialProjection, Const};
 pub use self::sty::{BoundRegion, EarlyBoundRegion, FreeRegion, Region};
 pub use self::sty::RegionKind;
-pub use self::sty::{TyVid, IntVid, FloatVid, RegionVid, SkolemizedRegionVid};
+pub use self::sty::{TyVid, IntVid, FloatVid, RegionVid};
 pub use self::sty::BoundRegion::*;
 pub use self::sty::InferTy::*;
 pub use self::sty::RegionKind::*;
@@ -119,7 +118,7 @@ mod sty;
 // Data types
 
 /// The complete set of all analyses described in this module. This is
-/// produced by the driver and fed to trans and later passes.
+/// produced by the driver and fed to codegen and later passes.
 ///
 /// NB: These contents are being migrated into queries using the
 /// *on-demand* infrastructure.
@@ -442,7 +441,7 @@ bitflags! {
 
         // true if there are "names" of types and regions and so forth
         // that are local to a particular fn
-        const HAS_LOCAL_NAMES    = 1 << 10;
+        const HAS_FREE_LOCAL_NAMES    = 1 << 10;
 
         // Present if the type belongs in a local type context.
         // Only set for TyInfer other than Fresh.
@@ -455,6 +454,10 @@ bitflags! {
         // Set if this includes a "canonical" type or region var --
         // ought to be true only for the results of canonicalization.
         const HAS_CANONICAL_VARS = 1 << 13;
+
+        /// Does this have any `ReLateBound` regions? Used to check
+        /// if a global bound is safe to evaluate.
+        const HAS_RE_LATE_BOUND = 1 << 14;
 
         const NEEDS_SUBST        = TypeFlags::HAS_PARAMS.bits |
                                    TypeFlags::HAS_SELF.bits |
@@ -473,9 +476,10 @@ bitflags! {
                                   TypeFlags::HAS_TY_ERR.bits |
                                   TypeFlags::HAS_PROJECTION.bits |
                                   TypeFlags::HAS_TY_CLOSURE.bits |
-                                  TypeFlags::HAS_LOCAL_NAMES.bits |
+                                  TypeFlags::HAS_FREE_LOCAL_NAMES.bits |
                                   TypeFlags::KEEP_IN_LOCAL_TCX.bits |
-                                  TypeFlags::HAS_CANONICAL_VARS.bits;
+                                  TypeFlags::HAS_CANONICAL_VARS.bits |
+                                  TypeFlags::HAS_RE_LATE_BOUND.bits;
     }
 }
 
@@ -514,7 +518,7 @@ impl<'tcx> TyS<'tcx> {
                 TypeVariants::TyInfer(InferTy::FloatVar(_)) |
                 TypeVariants::TyInfer(InferTy::FreshIntTy(_)) |
                 TypeVariants::TyInfer(InferTy::FreshFloatTy(_)) => true,
-            TypeVariants::TyRef(_, x) => x.ty.is_primitive_ty(),
+            TypeVariants::TyRef(_, x, _) => x.is_primitive_ty(),
             _ => false,
         }
     }
@@ -710,46 +714,11 @@ pub enum IntVarValue {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FloatVarValue(pub ast::FloatTy);
 
-#[derive(Copy, Clone, RustcEncodable, RustcDecodable)]
-pub struct TypeParameterDef {
-    pub name: InternedString,
-    pub def_id: DefId,
-    pub index: u32,
+#[derive(Copy, Clone, Debug, RustcEncodable, RustcDecodable)]
+pub struct TypeParamDef {
     pub has_default: bool,
     pub object_lifetime_default: ObjectLifetimeDefault,
-
-    /// `pure_wrt_drop`, set by the (unsafe) `#[may_dangle]` attribute
-    /// on generic parameter `T`, asserts data behind the parameter
-    /// `T` won't be accessed during the parent type's `Drop` impl.
-    pub pure_wrt_drop: bool,
-
     pub synthetic: Option<hir::SyntheticTyParamKind>,
-}
-
-#[derive(Copy, Clone, RustcEncodable, RustcDecodable)]
-pub struct RegionParameterDef {
-    pub name: InternedString,
-    pub def_id: DefId,
-    pub index: u32,
-
-    /// `pure_wrt_drop`, set by the (unsafe) `#[may_dangle]` attribute
-    /// on generic parameter `'a`, asserts data of lifetime `'a`
-    /// won't be accessed during the parent type's `Drop` impl.
-    pub pure_wrt_drop: bool,
-}
-
-impl RegionParameterDef {
-    pub fn to_early_bound_region_data(&self) -> ty::EarlyBoundRegion {
-        ty::EarlyBoundRegion {
-            def_id: self.def_id,
-            index: self.index,
-            name: self.name,
-        }
-    }
-
-    pub fn to_bound_region(&self) -> ty::BoundRegion {
-        self.to_early_bound_region_data().to_bound_region()
-    }
 }
 
 impl ty::EarlyBoundRegion {
@@ -758,100 +727,139 @@ impl ty::EarlyBoundRegion {
     }
 }
 
+#[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
+pub enum GenericParamDefKind {
+    Lifetime,
+    Type(TypeParamDef),
+}
+
+#[derive(Clone, RustcEncodable, RustcDecodable)]
+pub struct GenericParamDef {
+    pub name: InternedString,
+    pub def_id: DefId,
+    pub index: u32,
+
+    /// `pure_wrt_drop`, set by the (unsafe) `#[may_dangle]` attribute
+    /// on generic parameter `'a`/`T`, asserts data behind the parameter
+    /// `'a`/`T` won't be accessed during the parent type's `Drop` impl.
+    pub pure_wrt_drop: bool,
+
+    pub kind: GenericParamDefKind,
+}
+
+impl GenericParamDef {
+    pub fn to_early_bound_region_data(&self) -> ty::EarlyBoundRegion {
+        match self.kind {
+            GenericParamDefKind::Lifetime => {
+                ty::EarlyBoundRegion {
+                    def_id: self.def_id,
+                    index: self.index,
+                    name: self.name,
+                }
+            }
+            _ => bug!("cannot convert a non-lifetime parameter def to an early bound region")
+        }
+    }
+
+    pub fn to_bound_region(&self) -> ty::BoundRegion {
+        match self.kind {
+            GenericParamDefKind::Lifetime => {
+                self.to_early_bound_region_data().to_bound_region()
+            }
+            _ => bug!("cannot convert a non-lifetime parameter def to an early bound region")
+        }
+    }
+}
+
+pub struct GenericParamCount {
+    pub lifetimes: usize,
+    pub types: usize,
+}
+
 /// Information about the formal type/lifetime parameters associated
 /// with an item or method. Analogous to hir::Generics.
 ///
-/// Note that in the presence of a `Self` parameter, the ordering here
-/// is different from the ordering in a Substs. Substs are ordered as
-///     Self, *Regions, *Other Type Params, (...child generics)
-/// while this struct is ordered as
-///     regions = Regions
-///     types = [Self, *Other Type Params]
+/// The ordering of parameters is the same as in Subst (excluding child generics):
+/// Self (optionally), Lifetime params..., Type params...
 #[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
 pub struct Generics {
     pub parent: Option<DefId>,
-    pub parent_regions: u32,
-    pub parent_types: u32,
-    pub regions: Vec<RegionParameterDef>,
-    pub types: Vec<TypeParameterDef>,
+    pub parent_count: usize,
+    pub params: Vec<GenericParamDef>,
 
-    /// Reverse map to each `TypeParameterDef`'s `index` field
-    pub type_param_to_index: FxHashMap<DefId, u32>,
+    /// Reverse map to the `index` field of each `GenericParamDef`
+    pub param_def_id_to_index: FxHashMap<DefId, u32>,
 
     pub has_self: bool,
     pub has_late_bound_regions: Option<Span>,
 }
 
 impl<'a, 'gcx, 'tcx> Generics {
-    pub fn parent_count(&self) -> usize {
-        self.parent_regions as usize + self.parent_types as usize
-    }
-
-    pub fn own_count(&self) -> usize {
-        self.regions.len() + self.types.len()
-    }
-
     pub fn count(&self) -> usize {
-        self.parent_count() + self.own_count()
+        self.parent_count + self.params.len()
+    }
+
+    pub fn own_counts(&self) -> GenericParamCount {
+        // We could cache this as a property of `GenericParamCount`, but
+        // the aim is to refactor this away entirely eventually and the
+        // presence of this method will be a constant reminder.
+        let mut own_counts = GenericParamCount {
+            lifetimes: 0,
+            types: 0,
+        };
+
+        for param in &self.params {
+            match param.kind {
+                GenericParamDefKind::Lifetime => own_counts.lifetimes += 1,
+                GenericParamDefKind::Type(_) => own_counts.types += 1,
+            };
+        }
+
+        own_counts
+    }
+
+    pub fn requires_monomorphization(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> bool {
+        for param in &self.params {
+            match param.kind {
+                GenericParamDefKind::Type(_) => return true,
+                GenericParamDefKind::Lifetime => {}
+            }
+        }
+        if let Some(parent_def_id) = self.parent {
+            let parent = tcx.generics_of(parent_def_id);
+            parent.requires_monomorphization(tcx)
+        } else {
+            false
+        }
     }
 
     pub fn region_param(&'tcx self,
                         param: &EarlyBoundRegion,
                         tcx: TyCtxt<'a, 'gcx, 'tcx>)
-                        -> &'tcx RegionParameterDef
+                        -> &'tcx GenericParamDef
     {
-        if let Some(index) = param.index.checked_sub(self.parent_count() as u32) {
-            &self.regions[index as usize - self.has_self as usize]
+        if let Some(index) = param.index.checked_sub(self.parent_count as u32) {
+            let param = &self.params[index as usize];
+            match param.kind {
+                ty::GenericParamDefKind::Lifetime => param,
+                _ => bug!("expected lifetime parameter, but found another generic parameter")
+            }
         } else {
             tcx.generics_of(self.parent.expect("parent_count>0 but no parent?"))
                 .region_param(param, tcx)
         }
     }
 
-    /// Returns the `TypeParameterDef` associated with this `ParamTy`.
+    /// Returns the `TypeParamDef` associated with this `ParamTy`.
     pub fn type_param(&'tcx self,
                       param: &ParamTy,
                       tcx: TyCtxt<'a, 'gcx, 'tcx>)
-                      -> &TypeParameterDef {
-        if let Some(idx) = param.idx.checked_sub(self.parent_count() as u32) {
-            // non-Self type parameters are always offset by exactly
-            // `self.regions.len()`. In the absence of a Self, this is obvious,
-            // but even in the presence of a `Self` we just have to "compensate"
-            // for the regions:
-            //
-            // Without a `Self` (or in a nested generics that doesn't have
-            // a `Self` in itself, even through it parent does), for example
-            // for `fn foo<'a, T1, T2>()`, the situation is:
-            //     Substs:
-            //         0  1  2
-            //         'a T1 T2
-            //     generics.types:
-            //         0  1
-            //         T1 T2
-            //
-            // And with a `Self`, for example for `trait Foo<'a, 'b, T1, T2>`, the
-            // situation is:
-            //     Substs:
-            //         0   1  2  3  4
-            //       Self 'a 'b  T1 T2
-            //     generics.types:
-            //         0  1  2
-            //       Self T1 T2
-            //
-            // And it can be seen that in both cases, to move from a substs
-            // offset to a generics offset you just have to offset by the
-            // number of regions.
-            let type_param_offset = self.regions.len();
-
-            let has_self = self.has_self && self.parent.is_none();
-            let is_separated_self = type_param_offset != 0 && idx == 0 && has_self;
-
-            if let Some(idx) = (idx as usize).checked_sub(type_param_offset) {
-                assert!(!is_separated_self, "found a Self after type_param_offset");
-                &self.types[idx]
-            } else {
-                assert!(is_separated_self, "non-Self param before type_param_offset");
-                &self.types[0]
+                      -> &'tcx GenericParamDef {
+        if let Some(index) = param.idx.checked_sub(self.parent_count as u32) {
+            let param = &self.params[index as usize];
+            match param.kind {
+                ty::GenericParamDefKind::Type(_) => param,
+                _ => bug!("expected type parameter, but found another generic parameter")
             }
         } else {
             tcx.generics_of(self.parent.expect("parent_count>0 but no parent?"))
@@ -1370,15 +1378,13 @@ impl<'tcx> InstantiatedPredicates<'tcx> {
 /// type name in a non-zero universe is a skolemized type -- an
 /// idealized representative of "types in general" that we use for
 /// checking generic functions.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, RustcEncodable, RustcDecodable)]
 pub struct UniverseIndex(u32);
 
 impl UniverseIndex {
     /// The root universe, where things that the user defined are
     /// visible.
-    pub fn root() -> UniverseIndex {
-        UniverseIndex(0)
-    }
+    pub const ROOT: Self = UniverseIndex(0);
 
     /// A "subuniverse" corresponds to being inside a `forall` quantifier.
     /// So, for example, suppose we have this type in universe `U`:
@@ -1392,7 +1398,21 @@ impl UniverseIndex {
     /// region `'a`, but that region was not nameable from `U` because
     /// it was not in scope there.
     pub fn subuniverse(self) -> UniverseIndex {
-        UniverseIndex(self.0 + 1)
+        UniverseIndex(self.0.checked_add(1).unwrap())
+    }
+
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+
+    pub fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl From<u32> for UniverseIndex {
+    fn from(index: u32) -> Self {
+        UniverseIndex(index)
     }
 }
 
@@ -1406,7 +1426,7 @@ pub struct ParamEnv<'tcx> {
     /// into Obligations, and elaborated and normalized.
     pub caller_bounds: &'tcx Slice<ty::Predicate<'tcx>>,
 
-    /// Typically, this is `Reveal::UserFacing`, but during trans we
+    /// Typically, this is `Reveal::UserFacing`, but during codegen we
     /// want `Reveal::All` -- note that this is always paired with an
     /// empty environment. To get that, use `ParamEnv::reveal()`.
     pub reveal: traits::Reveal,
@@ -1424,7 +1444,7 @@ impl<'tcx> ParamEnv<'tcx> {
     /// Construct a trait environment with no where clauses in scope
     /// where the values of all `impl Trait` and other hidden types
     /// are revealed. This is suitable for monomorphized, post-typeck
-    /// environments like trans or doing optimizations.
+    /// environments like codegen or doing optimizations.
     ///
     /// NB. If you want to have predicates in scope, use `ParamEnv::new`,
     /// or invoke `param_env.with_reveal_all()`.
@@ -1442,7 +1462,7 @@ impl<'tcx> ParamEnv<'tcx> {
     /// Returns a new parameter environment with the same clauses, but
     /// which "reveals" the true results of projections in all cases
     /// (even for associated types that are specializable).  This is
-    /// the desired behavior during trans and certain other special
+    /// the desired behavior during codegen and certain other special
     /// contexts; normally though we want to use `Reveal::UserFacing`,
     /// which is the default.
     pub fn with_reveal_all(self) -> Self {
@@ -1921,27 +1941,23 @@ impl<'a, 'gcx, 'tcx> AdtDef {
             promoted: None
         };
         match tcx.const_eval(param_env.and(cid)) {
-            Ok(&ty::Const {
-                val: ConstVal::Value(Value::ByVal(PrimVal::Bytes(b))),
-                ty,
-            }) => {
-                trace!("discriminants: {} ({:?})", b, repr_type);
-                Some(Discr {
-                    val: b,
-                    ty,
-                })
-            },
-            Ok(&ty::Const {
-                val: ConstVal::Value(other),
-                ..
-            }) => {
-                info!("invalid enum discriminant: {:#?}", other);
-                ::middle::const_val::struct_error(
-                    tcx,
-                    tcx.def_span(expr_did),
-                    "constant evaluation of enum discriminant resulted in non-integer",
-                ).emit();
-                None
+            Ok(val) => {
+                // FIXME: Find the right type and use it instead of `val.ty` here
+                if let Some(b) = val.assert_bits(val.ty) {
+                    trace!("discriminants: {} ({:?})", b, repr_type);
+                    Some(Discr {
+                        val: b,
+                        ty: val.ty,
+                    })
+                } else {
+                    info!("invalid enum discriminant: {:#?}", val);
+                    ::middle::const_val::struct_error(
+                        tcx,
+                        tcx.def_span(expr_did),
+                        "constant evaluation of enum discriminant resulted in non-integer",
+                    ).emit();
+                    None
+                }
             }
             Err(err) => {
                 err.report(tcx, tcx.def_span(expr_did), "enum discriminant");
@@ -1952,7 +1968,6 @@ impl<'a, 'gcx, 'tcx> AdtDef {
                 }
                 None
             }
-            _ => span_bug!(tcx.def_span(expr_did), "const eval "),
         }
     }
 

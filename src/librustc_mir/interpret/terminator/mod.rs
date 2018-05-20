@@ -199,7 +199,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                 // mutability of raw pointers.
                 // TODO: Should not be allowed when fat pointers are involved.
                 (&ty::TyRawPtr(_), &ty::TyRawPtr(_)) => true,
-                (&ty::TyRef(_, _), &ty::TyRef(_, _)) => {
+                (&ty::TyRef(_, _, _), &ty::TyRef(_, _, _)) => {
                     ty.is_mutable_pointer() == real_ty.is_mutable_pointer()
                 }
                 // rule out everything else
@@ -341,7 +341,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                                     Value::ByRef(ptr, align) => {
                                         for (i, arg_local) in arg_locals.enumerate() {
                                             let field = layout.field(&self, i)?;
-                                            let offset = layout.fields.offset(i).bytes();
+                                            let offset = layout.fields.offset(i);
                                             let arg = Value::ByRef(ptr.offset(offset, &self)?,
                                                                    align.min(field.align));
                                             let dest =

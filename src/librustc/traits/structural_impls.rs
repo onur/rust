@@ -83,8 +83,8 @@ impl<'tcx, N: fmt::Debug> fmt::Debug for traits::VtableImplData<'tcx, N> {
 
 impl<'tcx, N: fmt::Debug> fmt::Debug for traits::VtableGeneratorData<'tcx, N> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "VtableGenerator(closure_def_id={:?}, substs={:?}, nested={:?})",
-               self.closure_def_id,
+        write!(f, "VtableGenerator(generator_def_id={:?}, substs={:?}, nested={:?})",
+               self.generator_def_id,
                self.substs,
                self.nested)
     }
@@ -243,6 +243,7 @@ impl<'a, 'tcx> Lift<'tcx> for traits::ObligationCauseCode<'a> {
             super::IntrinsicType => Some(super::IntrinsicType),
             super::MethodReceiver => Some(super::MethodReceiver),
             super::BlockTailExpression(id) => Some(super::BlockTailExpression(id)),
+            super::TrivialBound => Some(super::TrivialBound),
         }
     }
 }
@@ -274,7 +275,7 @@ impl<'a, 'tcx> Lift<'tcx> for traits::ObligationCause<'a> {
     }
 }
 
-// For trans only.
+// For codegen only.
 impl<'a, 'tcx> Lift<'tcx> for traits::Vtable<'a, ()> {
     type Lifted = traits::Vtable<'tcx, ()>;
     fn lift_to_tcx<'b, 'gcx>(&self, tcx: TyCtxt<'b, 'gcx, 'tcx>) -> Option<Self::Lifted> {
@@ -294,13 +295,13 @@ impl<'a, 'tcx> Lift<'tcx> for traits::Vtable<'a, ()> {
             }
             traits::VtableAutoImpl(t) => Some(traits::VtableAutoImpl(t)),
             traits::VtableGenerator(traits::VtableGeneratorData {
-                closure_def_id,
+                generator_def_id,
                 substs,
                 nested
             }) => {
                 tcx.lift(&substs).map(|substs| {
                     traits::VtableGenerator(traits::VtableGeneratorData {
-                        closure_def_id: closure_def_id,
+                        generator_def_id: generator_def_id,
                         substs: substs,
                         nested: nested
                     })
@@ -373,7 +374,7 @@ BraceStructTypeFoldableImpl! {
 
 BraceStructTypeFoldableImpl! {
     impl<'tcx, N> TypeFoldable<'tcx> for traits::VtableGeneratorData<'tcx, N> {
-        closure_def_id, substs, nested
+        generator_def_id, substs, nested
     } where N: TypeFoldable<'tcx>
 }
 

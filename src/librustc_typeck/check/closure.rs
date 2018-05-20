@@ -18,7 +18,7 @@ use rustc::infer::{InferOk, InferResult};
 use rustc::infer::LateBoundRegionConversionTime;
 use rustc::infer::type_variable::TypeVariableOrigin;
 use rustc::traits::error_reporting::ArgKind;
-use rustc::ty::{self, ToPolyTraitRef, Ty};
+use rustc::ty::{self, ToPolyTraitRef, Ty, GenericParamDefKind};
 use rustc::ty::subst::Substs;
 use rustc::ty::TypeFoldable;
 use std::cmp;
@@ -104,31 +104,39 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // inference phase (`upvar.rs`).
         let base_substs =
             Substs::identity_for_item(self.tcx, self.tcx.closure_base_def_id(expr_def_id));
-        let substs = base_substs.extend_to(
-            self.tcx,
-            expr_def_id,
-            |_, _| span_bug!(expr.span, "closure has region param"),
-            |_, _| {
-                self.infcx
-                    .next_ty_var(TypeVariableOrigin::ClosureSynthetic(expr.span))
-            },
-        );
-        let substs = ty::ClosureSubsts { substs };
-        let closure_type = self.tcx.mk_closure(expr_def_id, substs);
-
-        if let Some(GeneratorTypes { yield_ty, interior }) = generator_types {
+        let substs = base_substs.extend_to(self.tcx,expr_def_id, |param, _| {
+            match param.kind {
+                GenericParamDefKind::Lifetime => {
+                    span_bug!(expr.span, "closure has region param")
+                }
+                GenericParamDefKind::Type(_) => {
+                    self.infcx
+                        .next_ty_var(TypeVariableOrigin::ClosureSynthetic(expr.span)).into()
+                }
+            }
+        });
+        if let Some(GeneratorTypes { yield_ty, interior, movability }) = generator_types {
+            let substs = ty::GeneratorSubsts { substs };
             self.demand_eqtype(
                 expr.span,
                 yield_ty,
-                substs.generator_yield_ty(expr_def_id, self.tcx),
+                substs.yield_ty(expr_def_id, self.tcx),
             );
             self.demand_eqtype(
                 expr.span,
                 liberated_sig.output(),
-                substs.generator_return_ty(expr_def_id, self.tcx),
+                substs.return_ty(expr_def_id, self.tcx),
             );
-            return self.tcx.mk_generator(expr_def_id, substs, interior);
+            self.demand_eqtype(
+                expr.span,
+                interior,
+                substs.witness(expr_def_id, self.tcx),
+            );
+            return self.tcx.mk_generator(expr_def_id, substs, movability);
         }
+
+        let substs = ty::ClosureSubsts { substs };
+        let closure_type = self.tcx.mk_closure(expr_def_id, substs);
 
         debug!(
             "check_closure: expr.id={:?} closure_type={:?}",

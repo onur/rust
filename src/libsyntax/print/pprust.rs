@@ -224,6 +224,7 @@ pub fn token_to_string(tok: &Token) -> String {
         token::Pound                => "#".to_string(),
         token::Dollar               => "$".to_string(),
         token::Question             => "?".to_string(),
+        token::SingleQuote          => "'".to_string(),
 
         /* Literals */
         token::Literal(lit, suf) => {
@@ -273,6 +274,7 @@ pub fn token_to_string(tok: &Token) -> String {
             token::NtIdent(e, false)    => ident_to_string(e),
             token::NtIdent(e, true)     => format!("r#{}", ident_to_string(e)),
             token::NtLifetime(e)        => ident_to_string(e),
+            token::NtLiteral(ref e)     => expr_to_string(e),
             token::NtTT(ref tree)       => tt_to_string(tree.clone()),
             token::NtArm(ref e)         => arm_to_string(e),
             token::NtImplItem(ref e)    => impl_item_to_string(e),
@@ -656,7 +658,7 @@ pub trait PrintState<'a> {
                     style: ast::StrStyle) -> io::Result<()> {
         let st = match style {
             ast::StrStyle::Cooked => {
-                (format!("\"{}\"", parse::escape_default(st)))
+                (format!("\"{}\"", st.escape_debug()))
             }
             ast::StrStyle::Raw(n) => {
                 (format!("r{delim}\"{string}\"{delim}",
@@ -714,6 +716,22 @@ pub trait PrintState<'a> {
         Ok(())
     }
 
+    fn print_attribute_path(&mut self, path: &ast::Path) -> io::Result<()> {
+        for (i, segment) in path.segments.iter().enumerate() {
+            if i > 0 {
+                self.writer().word("::")?
+            }
+            if segment.ident.name != keywords::CrateRoot.name() &&
+               segment.ident.name != keywords::DollarCrate.name()
+            {
+                self.writer().word(&segment.ident.name.as_str())?;
+            } else if segment.ident.name == keywords::DollarCrate.name() {
+                self.print_dollar_crate(segment.ident.span.ctxt())?;
+            }
+        }
+        Ok(())
+    }
+
     fn print_attribute(&mut self, attr: &ast::Attribute) -> io::Result<()> {
         self.print_attribute_inline(attr, false)
     }
@@ -735,17 +753,7 @@ pub trait PrintState<'a> {
             if let Some(mi) = attr.meta() {
                 self.print_meta_item(&mi)?
             } else {
-                for (i, segment) in attr.path.segments.iter().enumerate() {
-                    if i > 0 {
-                        self.writer().word("::")?
-                    }
-                    if segment.ident.name != keywords::CrateRoot.name() &&
-                       segment.ident.name != keywords::DollarCrate.name() {
-                        self.writer().word(&segment.ident.name.as_str())?;
-                    } else if segment.ident.name == keywords::DollarCrate.name() {
-                        self.print_dollar_crate(segment.ident.span.ctxt())?;
-                    }
-                }
+                self.print_attribute_path(&attr.path)?;
                 self.writer().space()?;
                 self.print_tts(attr.tokens.clone())?;
             }
@@ -767,16 +775,15 @@ pub trait PrintState<'a> {
     fn print_meta_item(&mut self, item: &ast::MetaItem) -> io::Result<()> {
         self.ibox(INDENT_UNIT)?;
         match item.node {
-            ast::MetaItemKind::Word => {
-                self.writer().word(&item.ident.name.as_str())?;
-            }
+            ast::MetaItemKind::Word => self.print_attribute_path(&item.ident)?,
             ast::MetaItemKind::NameValue(ref value) => {
-                self.word_space(&item.ident.name.as_str())?;
+                self.print_attribute_path(&item.ident)?;
+                self.writer().space()?;
                 self.word_space("=")?;
                 self.print_literal(value)?;
             }
             ast::MetaItemKind::List(ref items) => {
-                self.writer().word(&item.ident.name.as_str())?;
+                self.print_attribute_path(&item.ident)?;
                 self.popen()?;
                 self.commasep(Consistent,
                               &items[..],
@@ -1785,7 +1792,7 @@ impl<'a> State<'a> {
                         self.print_else(e.as_ref().map(|e| &**e))
                     }
                     // "final else"
-                    ast::ExprKind::Block(ref b) => {
+                    ast::ExprKind::Block(ref b, _) => {
                         self.cbox(INDENT_UNIT - 1)?;
                         self.ibox(0)?;
                         self.s.word(" else ")?;
@@ -2175,7 +2182,11 @@ impl<'a> State<'a> {
                 // empty box to satisfy the close.
                 self.ibox(0)?;
             }
-            ast::ExprKind::Block(ref blk) => {
+            ast::ExprKind::Block(ref blk, opt_label) => {
+                if let Some(label) = opt_label {
+                    self.print_ident(label.ident)?;
+                    self.word_space(":")?;
+                }
                 // containing cbox, will be closed by print-block at }
                 self.cbox(INDENT_UNIT)?;
                 // head-box, will be closed by print-block after {
@@ -2363,7 +2374,7 @@ impl<'a> State<'a> {
     }
 
     pub fn print_ident(&mut self, ident: ast::Ident) -> io::Result<()> {
-        if token::is_raw_guess(ident) {
+        if ident.is_raw_guess() {
             self.s.word(&format!("r#{}", ident))?;
         } else {
             self.s.word(&ident.name.as_str())?;
@@ -2688,7 +2699,12 @@ impl<'a> State<'a> {
         self.word_space("=>")?;
 
         match arm.body.node {
-            ast::ExprKind::Block(ref blk) => {
+            ast::ExprKind::Block(ref blk, opt_label) => {
+                if let Some(label) = opt_label {
+                    self.print_ident(label.ident)?;
+                    self.word_space(":")?;
+                }
+
                 // the block will close the pattern's ibox
                 self.print_block_unclosed_indent(blk, INDENT_UNIT)?;
 

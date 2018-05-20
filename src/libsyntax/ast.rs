@@ -107,8 +107,7 @@ impl Path {
     // or starts with something like `self`/`super`/`$crate`/etc.
     pub fn make_root(&self) -> Option<PathSegment> {
         if let Some(ident) = self.segments.get(0).map(|seg| seg.ident) {
-            if ::parse::token::is_path_segment_keyword(ident) &&
-               ident.name != keywords::Crate.name() {
+            if ident.is_path_segment_keyword() && ident.name != keywords::Crate.name() {
                 return None;
             }
         }
@@ -474,10 +473,10 @@ pub enum NestedMetaItemKind {
 
 /// A spanned compile-time attribute item.
 ///
-/// E.g. `#[test]`, `#[derive(..)]` or `#[feature = "foo"]`
+/// E.g. `#[test]`, `#[derive(..)]`, `#[rustfmt::skip]` or `#[feature = "foo"]`
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct MetaItem {
-    pub ident: Ident,
+    pub ident: Path,
     pub node: MetaItemKind,
     pub span: Span,
 }
@@ -934,7 +933,7 @@ impl Expr {
     /// Whether this expression would be valid somewhere that expects a value, for example, an `if`
     /// condition.
     pub fn returns(&self) -> bool {
-        if let ExprKind::Block(ref block) = self.node {
+        if let ExprKind::Block(ref block, _) = self.node {
             match block.stmts.last().map(|last_stmt| &last_stmt.node) {
                 // implicit return
                 Some(&StmtKind::Expr(_)) => true,
@@ -1121,8 +1120,8 @@ pub enum ExprKind {
     ///
     /// The final span is the span of the argument block `|...|`
     Closure(CaptureBy, Movability, P<FnDecl>, P<Expr>, Span),
-    /// A block (`{ ... }`)
-    Block(P<Block>),
+    /// A block (`'label: { ... }`)
+    Block(P<Block>, Option<Label>),
     /// A catch block (`catch { ... }`)
     Catch(P<Block>),
 

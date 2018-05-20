@@ -132,7 +132,7 @@ for ty::RegionKind {
             ty::ReLateBound(..) |
             ty::ReVar(..) |
             ty::ReSkolemized(..) => {
-                bug!("TypeIdHasher: unexpected region {:?}", *self)
+                bug!("StableHasher: unexpected region {:?}", *self)
             }
         }
     }
@@ -384,6 +384,31 @@ for ::middle::const_val::ConstVal<'gcx> {
     }
 }
 
+impl<'a, 'gcx> HashStable<StableHashingContext<'a>>
+for ::mir::interpret::ConstValue<'gcx> {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        use mir::interpret::ConstValue::*;
+
+        mem::discriminant(self).hash_stable(hcx, hasher);
+
+        match *self {
+            ByVal(val) => {
+                val.hash_stable(hcx, hasher);
+            }
+            ByValPair(a, b) => {
+                a.hash_stable(hcx, hasher);
+                b.hash_stable(hcx, hasher);
+            }
+            ByRef(alloc, offset) => {
+                alloc.hash_stable(hcx, hasher);
+                offset.hash_stable(hcx, hasher);
+            }
+        }
+    }
+}
+
 impl_stable_hash_for!(enum mir::interpret::Value {
     ByVal(v),
     ByValPair(a, b),
@@ -517,8 +542,7 @@ for ::middle::const_val::ErrKind<'gcx> {
 }
 
 impl_stable_hash_for!(struct ty::ClosureSubsts<'tcx> { substs });
-
-impl_stable_hash_for!(struct ty::GeneratorInterior<'tcx> { witness, movable });
+impl_stable_hash_for!(struct ty::GeneratorSubsts<'tcx> { substs });
 
 impl_stable_hash_for!(struct ty::GenericPredicates<'tcx> {
     parent,
@@ -712,54 +736,40 @@ impl<'a> HashStable<StableHashingContext<'a>> for ty::Generics {
                                           hasher: &mut StableHasher<W>) {
         let ty::Generics {
             parent,
-            parent_regions,
-            parent_types,
-            ref regions,
-            ref types,
+            ref parent_count,
+            ref params,
 
-            // Reverse map to each `TypeParameterDef`'s `index` field, from
+            // Reverse map to each `TypeParamDef`'s `index` field, from
             // `def_id.index` (`def_id.krate` is the same as the item's).
-            type_param_to_index: _, // Don't hash this
+            param_def_id_to_index: _, // Don't hash this
             has_self,
             has_late_bound_regions,
         } = *self;
 
         parent.hash_stable(hcx, hasher);
-        parent_regions.hash_stable(hcx, hasher);
-        parent_types.hash_stable(hcx, hasher);
-        regions.hash_stable(hcx, hasher);
-        types.hash_stable(hcx, hasher);
+        parent_count.hash_stable(hcx, hasher);
+        params.hash_stable(hcx, hasher);
         has_self.hash_stable(hcx, hasher);
         has_late_bound_regions.hash_stable(hcx, hasher);
     }
 }
 
-impl<'a> HashStable<StableHashingContext<'a>>
-for ty::RegionParameterDef {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        let ty::RegionParameterDef {
-            name,
-            def_id,
-            index,
-            pure_wrt_drop
-        } = *self;
+impl_stable_hash_for!(enum ty::GenericParamDefKind {
+    Lifetime,
+    Type(ty)
+});
 
-        name.hash_stable(hcx, hasher);
-        def_id.hash_stable(hcx, hasher);
-        index.hash_stable(hcx, hasher);
-        pure_wrt_drop.hash_stable(hcx, hasher);
-    }
-}
-
-impl_stable_hash_for!(struct ty::TypeParameterDef {
+impl_stable_hash_for!(struct ty::GenericParamDef {
     name,
     def_id,
     index,
+    pure_wrt_drop,
+    kind
+});
+
+impl_stable_hash_for!(struct ty::TypeParamDef {
     has_default,
     object_lifetime_default,
-    pure_wrt_drop,
     synthetic
 });
 
@@ -889,9 +899,10 @@ for ty::TypeVariants<'gcx>
             TyRawPtr(pointee_ty) => {
                 pointee_ty.hash_stable(hcx, hasher);
             }
-            TyRef(region, pointee_ty) => {
+            TyRef(region, pointee_ty, mutbl) => {
                 region.hash_stable(hcx, hasher);
                 pointee_ty.hash_stable(hcx, hasher);
+                mutbl.hash_stable(hcx, hasher);
             }
             TyFnDef(def_id, substs) => {
                 def_id.hash_stable(hcx, hasher);
@@ -908,10 +919,10 @@ for ty::TypeVariants<'gcx>
                 def_id.hash_stable(hcx, hasher);
                 closure_substs.hash_stable(hcx, hasher);
             }
-            TyGenerator(def_id, closure_substs, interior) => {
+            TyGenerator(def_id, generator_substs, movability) => {
                 def_id.hash_stable(hcx, hasher);
-                closure_substs.hash_stable(hcx, hasher);
-                interior.hash_stable(hcx, hasher);
+                generator_substs.hash_stable(hcx, hasher);
+                movability.hash_stable(hcx, hasher);
             }
             TyGeneratorWitness(types) => {
                 types.hash_stable(hcx, hasher)
@@ -1315,11 +1326,11 @@ for traits::VtableGeneratorData<'gcx, N> where N: HashStable<StableHashingContex
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
         let traits::VtableGeneratorData {
-            closure_def_id,
+            generator_def_id,
             substs,
             ref nested,
         } = *self;
-        closure_def_id.hash_stable(hcx, hasher);
+        generator_def_id.hash_stable(hcx, hasher);
         substs.hash_stable(hcx, hasher);
         nested.hash_stable(hcx, hasher);
     }

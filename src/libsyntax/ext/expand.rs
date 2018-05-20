@@ -16,12 +16,12 @@ use config::{is_test_or_bench, StripUnconfigured};
 use errors::FatalError;
 use ext::base::*;
 use ext::derive::{add_derived_markers, collect_derives};
-use ext::hygiene::{Mark, SyntaxContext};
+use ext::hygiene::{self, Mark, SyntaxContext};
 use ext::placeholders::{placeholder, PlaceholderExpander};
 use feature_gate::{self, Features, GateIssue, is_builtin_attr, emit_feature_err};
 use fold;
 use fold::*;
-use parse::{DirectoryOwnership, PResult};
+use parse::{DirectoryOwnership, PResult, ParseSess};
 use parse::token::{self, Token};
 use parse::parser::Parser;
 use ptr::P;
@@ -31,7 +31,7 @@ use syntax_pos::{Span, DUMMY_SP, FileName};
 use syntax_pos::hygiene::ExpnFormat;
 use tokenstream::{TokenStream, TokenTree};
 use util::small_vector::SmallVector;
-use visit::Visitor;
+use visit::{self, Visitor};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -502,6 +502,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 span: None,
                 allow_internal_unstable: false,
                 allow_internal_unsafe: false,
+                edition: ext.edition(),
             }
         });
 
@@ -520,7 +521,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 items.push(item);
                 Some(kind.expect_from_annotatables(items))
             }
-            AttrProcMacro(ref mac) => {
+            AttrProcMacro(ref mac, ..) => {
                 self.gate_proc_macro_attr_item(attr.span, &item);
                 let item_tok = TokenTree::Token(DUMMY_SP, Token::interpolated(match item {
                     Annotatable::Item(item) => token::NtItem(item),
@@ -532,7 +533,9 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 })).into();
                 let input = self.extract_proc_macro_attr_input(attr.tokens, attr.span);
                 let tok_result = mac.expand(self.cx, attr.span, input, item_tok);
-                self.parse_expansion(tok_result, kind, &attr.path, attr.span)
+                let res = self.parse_expansion(tok_result, kind, &attr.path, attr.span);
+                self.gate_proc_macro_expansion(attr.span, &res);
+                res
             }
             ProcMacroDerive(..) | BuiltinDerive(..) => {
                 self.cx.span_err(attr.span, &format!("`{}` is a derive mode", attr.path));
@@ -591,6 +594,50 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
         );
     }
 
+    fn gate_proc_macro_expansion(&self, span: Span, expansion: &Option<Expansion>) {
+        if self.cx.ecfg.proc_macro_gen() {
+            return
+        }
+        let expansion = match expansion {
+            Some(expansion) => expansion,
+            None => return,
+        };
+
+        expansion.visit_with(&mut DisallowModules {
+            span,
+            parse_sess: self.cx.parse_sess,
+        });
+
+        struct DisallowModules<'a> {
+            span: Span,
+            parse_sess: &'a ParseSess,
+        }
+
+        impl<'ast, 'a> Visitor<'ast> for DisallowModules<'a> {
+            fn visit_item(&mut self, i: &'ast ast::Item) {
+                let name = match i.node {
+                    ast::ItemKind::Mod(_) => Some("modules"),
+                    ast::ItemKind::MacroDef(_) => Some("macro definitions"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    emit_feature_err(
+                        self.parse_sess,
+                        "proc_macro_gen",
+                        self.span,
+                        GateIssue::Language,
+                        &format!("procedural macros cannot expand to {}", name),
+                    );
+                }
+                visit::walk_item(self, i);
+            }
+
+            fn visit_mac(&mut self, _mac: &'ast ast::Mac) {
+                // ...
+            }
+        }
+    }
+
     /// Expand a macro invocation. Returns the result of expansion.
     fn expand_bang_invoc(&mut self,
                          invoc: Invocation,
@@ -609,7 +656,8 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                                           allow_internal_unstable,
                                           allow_internal_unsafe,
                                           // can't infer this type
-                                          unstable_feature: Option<(Symbol, u32)>| {
+                                          unstable_feature: Option<(Symbol, u32)>,
+                                          edition| {
 
             // feature-gate the macro invocation
             if let Some((feature, issue)) = unstable_feature {
@@ -642,15 +690,17 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                     span: def_site_span,
                     allow_internal_unstable,
                     allow_internal_unsafe,
+                    edition,
                 },
             });
             Ok(())
         };
 
         let opt_expanded = match *ext {
-            DeclMacro(ref expand, def_span) => {
+            DeclMacro(ref expand, def_span, edition) => {
                 if let Err(dummy_span) = validate_and_set_expn_info(self, def_span.map(|(_, s)| s),
-                                                                    false, false, None) {
+                                                                    false, false, None,
+                                                                    edition) {
                     dummy_span
                 } else {
                     kind.make_from(expand.expand(self.cx, span, mac.node.stream()))
@@ -663,11 +713,13 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 allow_internal_unstable,
                 allow_internal_unsafe,
                 unstable_feature,
+                edition,
             } => {
                 if let Err(dummy_span) = validate_and_set_expn_info(self, def_info.map(|(_, s)| s),
                                                                     allow_internal_unstable,
                                                                     allow_internal_unsafe,
-                                                                    unstable_feature) {
+                                                                    unstable_feature,
+                                                                    edition) {
                     dummy_span
                 } else {
                     kind.make_from(expander.expand(self.cx, span, mac.node.stream()))
@@ -688,6 +740,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                             span: tt_span,
                             allow_internal_unstable,
                             allow_internal_unsafe: false,
+                            edition: hygiene::default_edition(),
                         }
                     });
 
@@ -709,7 +762,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 kind.dummy(span)
             }
 
-            ProcMacro(ref expandfun) => {
+            ProcMacro(ref expandfun, edition) => {
                 if ident.name != keywords::Invalid.name() {
                     let msg =
                         format!("macro {}! expects no ident argument, given '{}'", path, ident);
@@ -728,11 +781,14 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                             // FIXME probably want to follow macro_rules macros here.
                             allow_internal_unstable: false,
                             allow_internal_unsafe: false,
+                            edition,
                         },
                     });
 
                     let tok_result = expandfun.expand(self.cx, span, mac.node.stream());
-                    self.parse_expansion(tok_result, kind, path, span)
+                    let result = self.parse_expansion(tok_result, kind, path, span);
+                    self.gate_proc_macro_expansion(span, &result);
+                    result
                 }
             }
         };
@@ -802,19 +858,21 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 span: None,
                 allow_internal_unstable: false,
                 allow_internal_unsafe: false,
+                edition: ext.edition(),
             }
         };
 
         match *ext {
-            ProcMacroDerive(ref ext, _) => {
+            ProcMacroDerive(ref ext, ..) => {
                 invoc.expansion_data.mark.set_expn_info(expn_info);
                 let span = span.with_ctxt(self.cx.backtrace());
                 let dummy = ast::MetaItem { // FIXME(jseyfried) avoid this
-                    ident: keywords::Invalid.ident(),
+                    ident: Path::from_ident(keywords::Invalid.ident()),
                     span: DUMMY_SP,
                     node: ast::MetaItemKind::Word,
                 };
-                Some(kind.expect_from_annotatables(ext.expand(self.cx, span, &dummy, item)))
+                let items = ext.expand(self.cx, span, &dummy, item);
+                Some(kind.expect_from_annotatables(items))
             }
             BuiltinDerive(func) => {
                 expn_info.callee.allow_internal_unstable = true;
@@ -1017,7 +1075,7 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
     fn check_attributes(&mut self, attrs: &[ast::Attribute]) {
         let features = self.cx.ecfg.features.unwrap();
         for attr in attrs.iter() {
-            feature_gate::check_attribute(attr, self.cx.parse_sess, features);
+            self.check_attribute_inner(attr, features);
 
             // macros are expanded before any lint passes so this warning has to be hardcoded
             if attr.path == "derive" {
@@ -1030,6 +1088,10 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
 
     fn check_attribute(&mut self, at: &ast::Attribute) {
         let features = self.cx.ecfg.features.unwrap();
+        self.check_attribute_inner(at, features);
+    }
+
+    fn check_attribute_inner(&mut self, at: &ast::Attribute, features: &Features) {
         feature_gate::check_attribute(at, self.cx.parse_sess, features);
     }
 }
@@ -1487,6 +1549,7 @@ impl<'feat> ExpansionConfig<'feat> {
         fn proc_macro_enabled = proc_macro,
         fn macros_in_extern_enabled = macros_in_extern,
         fn proc_macro_mod = proc_macro_mod,
+        fn proc_macro_gen = proc_macro_gen,
         fn proc_macro_expr = proc_macro_expr,
         fn proc_macro_non_items = proc_macro_non_items,
     }

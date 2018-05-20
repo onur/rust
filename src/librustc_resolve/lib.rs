@@ -58,7 +58,6 @@ use syntax::ast::{Item, ItemKind, ImplItem, ImplItemKind};
 use syntax::ast::{Label, Local, Mutability, Pat, PatKind, Path};
 use syntax::ast::{QSelf, TraitItemKind, TraitRef, Ty, TyKind};
 use syntax::feature_gate::{feature_err, GateIssue};
-use syntax::parse::token;
 use syntax::ptr::P;
 
 use syntax_pos::{Span, DUMMY_SP, MultiSpan};
@@ -700,7 +699,7 @@ pub enum Namespace {
 pub struct PerNS<T> {
     value_ns: T,
     type_ns: T,
-    macro_ns: Option<T>,
+    macro_ns: T,
 }
 
 impl<T> ::std::ops::Index<Namespace> for PerNS<T> {
@@ -709,7 +708,7 @@ impl<T> ::std::ops::Index<Namespace> for PerNS<T> {
         match ns {
             ValueNS => &self.value_ns,
             TypeNS => &self.type_ns,
-            MacroNS => self.macro_ns.as_ref().unwrap(),
+            MacroNS => &self.macro_ns,
         }
     }
 }
@@ -719,7 +718,7 @@ impl<T> ::std::ops::IndexMut<Namespace> for PerNS<T> {
         match ns {
             ValueNS => &mut self.value_ns,
             TypeNS => &mut self.type_ns,
-            MacroNS => self.macro_ns.as_mut().unwrap(),
+            MacroNS => &mut self.macro_ns,
         }
     }
 }
@@ -1225,12 +1224,10 @@ enum NameBindingKind<'a> {
         binding: &'a NameBinding<'a>,
         directive: &'a ImportDirective<'a>,
         used: Cell<bool>,
-        legacy_self_import: bool,
     },
     Ambiguity {
         b1: &'a NameBinding<'a>,
         b2: &'a NameBinding<'a>,
-        legacy: bool,
     }
 }
 
@@ -1252,7 +1249,6 @@ struct AmbiguityError<'a> {
     lexical: bool,
     b1: &'a NameBinding<'a>,
     b2: &'a NameBinding<'a>,
-    legacy: bool,
 }
 
 impl<'a> NameBinding<'a> {
@@ -1260,7 +1256,6 @@ impl<'a> NameBinding<'a> {
         match self.kind {
             NameBindingKind::Module(module) => Some(module),
             NameBindingKind::Import { binding, .. } => binding.module(),
-            NameBindingKind::Ambiguity { legacy: true, b1, .. } => b1.module(),
             _ => None,
         }
     }
@@ -1270,7 +1265,6 @@ impl<'a> NameBinding<'a> {
             NameBindingKind::Def(def) => def,
             NameBindingKind::Module(module) => module.def().unwrap(),
             NameBindingKind::Import { binding, .. } => binding.def(),
-            NameBindingKind::Ambiguity { legacy: true, b1, .. } => b1.def(),
             NameBindingKind::Ambiguity { .. } => Def::Err,
         }
     }
@@ -1473,6 +1467,10 @@ pub struct Resolver<'a> {
     used_imports: FxHashSet<(NodeId, Namespace)>,
     pub maybe_unused_trait_imports: NodeSet,
     pub maybe_unused_extern_crates: Vec<(NodeId, Span)>,
+
+    /// A list of labels as of yet unused. Labels will be removed from this map when
+    /// they are used (in a `break` or `continue` statement)
+    pub unused_labels: FxHashMap<NodeId, Span>,
 
     /// privacy errors are delayed until the end in order to deduplicate them
     privacy_errors: Vec<PrivacyError<'a>>,
@@ -1728,7 +1726,7 @@ impl<'a> Resolver<'a> {
             ribs: PerNS {
                 value_ns: vec![Rib::new(ModuleRibKind(graph_root))],
                 type_ns: vec![Rib::new(ModuleRibKind(graph_root))],
-                macro_ns: Some(vec![Rib::new(ModuleRibKind(graph_root))]),
+                macro_ns: vec![Rib::new(ModuleRibKind(graph_root))],
             },
             label_ribs: Vec::new(),
 
@@ -1752,6 +1750,8 @@ impl<'a> Resolver<'a> {
             used_imports: FxHashSet(),
             maybe_unused_trait_imports: NodeSet(),
             maybe_unused_extern_crates: Vec::new(),
+
+            unused_labels: FxHashMap(),
 
             privacy_errors: Vec::new(),
             ambiguity_errors: Vec::new(),
@@ -1808,14 +1808,11 @@ impl<'a> Resolver<'a> {
     }
 
     /// Runs the function on each namespace.
-    fn per_ns<T, F: FnMut(&mut Self, Namespace) -> T>(&mut self, mut f: F) -> PerNS<T> {
-        PerNS {
-            type_ns: f(self, TypeNS),
-            value_ns: f(self, ValueNS),
-            macro_ns: match self.use_extern_macros {
-                true => Some(f(self, MacroNS)),
-                false => None,
-            },
+    fn per_ns<F: FnMut(&mut Self, Namespace)>(&mut self, mut f: F) {
+        f(self, TypeNS);
+        f(self, ValueNS);
+        if self.use_extern_macros {
+            f(self, MacroNS);
         }
     }
 
@@ -1856,27 +1853,20 @@ impl<'a> Resolver<'a> {
     fn record_use(&mut self, ident: Ident, ns: Namespace, binding: &'a NameBinding<'a>, span: Span)
                   -> bool /* true if an error was reported */ {
         match binding.kind {
-            NameBindingKind::Import { directive, binding, ref used, legacy_self_import }
+            NameBindingKind::Import { directive, binding, ref used }
                     if !used.get() => {
                 used.set(true);
                 directive.used.set(true);
-                if legacy_self_import {
-                    self.warn_legacy_self_import(directive);
-                    return false;
-                }
                 self.used_imports.insert((directive.id, ns));
                 self.add_to_glob_map(directive.id, ident);
                 self.record_use(ident, ns, binding, span)
             }
             NameBindingKind::Import { .. } => false,
-            NameBindingKind::Ambiguity { b1, b2, legacy } => {
+            NameBindingKind::Ambiguity { b1, b2 } => {
                 self.ambiguity_errors.push(AmbiguityError {
-                    span: span, name: ident.name, lexical: false, b1: b1, b2: b2, legacy,
+                    span, name: ident.name, lexical: false, b1, b2,
                 });
-                if legacy {
-                    self.record_use(ident, ns, b1, span);
-                }
-                !legacy
+                true
             }
             _ => false
         }
@@ -3235,6 +3225,7 @@ impl<'a> Resolver<'a> {
                     -> PathResult<'a> {
         let mut module = None;
         let mut allow_super = true;
+        let mut second_binding = None;
 
         for (i, &ident) in path.iter().enumerate() {
             debug!("resolve_path ident {} {:?}", i, ident);
@@ -3276,13 +3267,12 @@ impl<'a> Resolver<'a> {
                     // `$crate::a::b`
                     module = Some(self.resolve_crate_root(ident.span.ctxt(), true));
                     continue
-                } else if i == 1 && !token::is_path_segment_keyword(ident) {
+                } else if i == 1 && !ident.is_path_segment_keyword() {
                     let prev_name = path[0].name;
                     if prev_name == keywords::Extern.name() ||
                        prev_name == keywords::CrateRoot.name() &&
-                       // Note: When this feature stabilizes, this should
-                       // be gated on sess.rust_2018()
-                       self.session.features_untracked().extern_absolute_paths {
+                       self.session.features_untracked().extern_absolute_paths &&
+                       self.session.rust_2018() {
                         // `::extern_crate::a::b`
                         let crate_id = self.crate_loader.process_path_extern(name, ident.span);
                         let crate_root =
@@ -3325,7 +3315,9 @@ impl<'a> Resolver<'a> {
                     .map(MacroBinding::binding)
             } else {
                 match self.resolve_ident_in_lexical_scope(ident, ns, record_used, path_span) {
+                    // we found a locally-imported or available item/module
                     Some(LexicalScopeBinding::Item(binding)) => Ok(binding),
+                    // we found a local variable or type param
                     Some(LexicalScopeBinding::Def(def))
                             if opt_ns == Some(TypeNS) || opt_ns == Some(ValueNS) => {
                         return PathResult::NonModule(PathResolution::with_unresolved_segments(
@@ -3338,6 +3330,9 @@ impl<'a> Resolver<'a> {
 
             match binding {
                 Ok(binding) => {
+                    if i == 1 {
+                        second_binding = Some(binding);
+                    }
                     let def = binding.def();
                     let maybe_assoc = opt_ns != Some(MacroNS) && PathSource::Type.is_expected(def);
                     if let Some(next_module) = binding.module() {
@@ -3345,6 +3340,12 @@ impl<'a> Resolver<'a> {
                     } else if def == Def::Err {
                         return PathResult::NonModule(err_path_resolution());
                     } else if opt_ns.is_some() && (is_last || maybe_assoc) {
+                        self.lint_if_path_starts_with_module(
+                            node_id,
+                            path,
+                            path_span,
+                            second_binding,
+                        );
                         return PathResult::NonModule(PathResolution::with_unresolved_segments(
                             def, path.len() - i - 1
                         ));
@@ -3352,33 +3353,6 @@ impl<'a> Resolver<'a> {
                         return PathResult::Failed(ident.span,
                                                   format!("Not a module `{}`", ident),
                                                   is_last);
-                    }
-
-                    if let Some(id) = node_id {
-                        if i == 1 && self.session.features_untracked().crate_in_paths
-                                  && !self.session.rust_2018() {
-                            let prev_name = path[0].name;
-                            if prev_name == keywords::Extern.name() ||
-                               prev_name == keywords::CrateRoot.name() {
-                                let mut is_crate = false;
-                                if let NameBindingKind::Import { directive: d, .. } = binding.kind {
-                                    if let ImportDirectiveSubclass::ExternCrate(..) = d.subclass {
-                                        is_crate = true;
-                                    }
-                                }
-
-                                if !is_crate {
-                                    let diag = lint::builtin::BuiltinLintDiagnostics
-                                                   ::AbsPathWithModule(path_span);
-                                    self.session.buffer_lint_with_diagnostic(
-                                        lint::builtin::ABSOLUTE_PATH_STARTING_WITH_MODULE,
-                                        id, path_span,
-                                        "Absolute paths must start with `self`, `super`, \
-                                        `crate`, or an external crate name in the 2018 edition",
-                                        diag);
-                                }
-                            }
-                        }
                     }
                 }
                 Err(Undetermined) => return PathResult::Indeterminate,
@@ -3412,7 +3386,75 @@ impl<'a> Resolver<'a> {
             }
         }
 
+        self.lint_if_path_starts_with_module(node_id, path, path_span, second_binding);
+
         PathResult::Module(module.unwrap_or(self.graph_root))
+    }
+
+    fn lint_if_path_starts_with_module(&self,
+                                       id: Option<NodeId>,
+                                       path: &[Ident],
+                                       path_span: Span,
+                                       second_binding: Option<&NameBinding>) {
+        let id = match id {
+            Some(id) => id,
+            None => return,
+        };
+
+        let first_name = match path.get(0) {
+            Some(ident) => ident.name,
+            None => return,
+        };
+
+        // We're only interested in `use` paths which should start with
+        // `{{root}}` or `extern` currently.
+        if first_name != keywords::Extern.name() && first_name != keywords::CrateRoot.name() {
+            return
+        }
+
+        match path.get(1) {
+            // If this import looks like `crate::...` it's already good
+            Some(name) if name.name == keywords::Crate.name() => return,
+            // Otherwise go below to see if it's an extern crate
+            Some(_) => {}
+            // If the path has length one (and it's `CrateRoot` most likely)
+            // then we don't know whether we're gonna be importing a crate or an
+            // item in our crate. Defer this lint to elsewhere
+            None => return,
+        }
+
+        // If the first element of our path was actually resolved to an
+        // `ExternCrate` (also used for `crate::...`) then no need to issue a
+        // warning, this looks all good!
+        if let Some(binding) = second_binding {
+            if let NameBindingKind::Import { directive: d, .. } = binding.kind {
+                if let ImportDirectiveSubclass::ExternCrate(..) = d.subclass {
+                    return
+                }
+            }
+        }
+
+        self.lint_path_starts_with_module(id, path_span);
+    }
+
+    fn lint_path_starts_with_module(&self, id: NodeId, span: Span) {
+        // In the 2018 edition this lint is a hard error, so nothing to do
+        if self.session.rust_2018() {
+            return
+        }
+        // In the 2015 edition there's no use in emitting lints unless the
+        // crate's already enabled the feature that we're going to suggest
+        if !self.session.features_untracked().crate_in_paths {
+            return
+        }
+        let diag = lint::builtin::BuiltinLintDiagnostics
+            ::AbsPathWithModule(span);
+        self.session.buffer_lint_with_diagnostic(
+            lint::builtin::ABSOLUTE_PATH_NOT_STARTING_WITH_CRATE,
+            id, span,
+            "absolute paths must start with `self`, `super`, \
+            `crate`, or an external crate name in the 2018 edition",
+            diag);
     }
 
     // Resolve a local definition, potentially adjusting for closures.
@@ -3646,6 +3688,7 @@ impl<'a> Resolver<'a> {
         where F: FnOnce(&mut Resolver)
     {
         if let Some(label) = label {
+            self.unused_labels.insert(id, label.ident.span);
             let def = Def::Label(id);
             self.with_label_rib(|this| {
                 this.label_ribs.last_mut().unwrap().bindings.insert(label.ident, def);
@@ -3694,9 +3737,10 @@ impl<'a> Resolver<'a> {
                                       ResolutionError::UndeclaredLabel(&label.ident.name.as_str(),
                                                                        close_match));
                     }
-                    Some(def @ Def::Label(_)) => {
+                    Some(Def::Label(id)) => {
                         // Since this def is a label, it is never read.
-                        self.record_def(expr.id, PathResolution::new(def));
+                        self.record_def(expr.id, PathResolution::new(Def::Label(id)));
+                        self.unused_labels.remove(&id);
                     }
                     Some(_) => {
                         span_bug!(expr.span, "label wasn't mapped to a label def!");
@@ -3756,6 +3800,8 @@ impl<'a> Resolver<'a> {
 
                 self.ribs[ValueNS].pop();
             }
+
+            ExprKind::Block(ref block, label) => self.resolve_labeled_block(label, block.id, block),
 
             // Equivalent to `visit::walk_expr` + passing some context to children.
             ExprKind::Field(ref subexpression, _) => {
@@ -4078,7 +4124,7 @@ impl<'a> Resolver<'a> {
         self.report_proc_macro_import(krate);
         let mut reported_spans = FxHashSet();
 
-        for &AmbiguityError { span, name, b1, b2, lexical, legacy } in &self.ambiguity_errors {
+        for &AmbiguityError { span, name, b1, b2, lexical } in &self.ambiguity_errors {
             if !reported_spans.insert(span) { continue }
             let participle = |binding: &NameBinding| {
                 if binding.is_import() { "imported" } else { "defined" }
@@ -4094,27 +4140,15 @@ impl<'a> Resolver<'a> {
                 format!("macro-expanded {} do not shadow when used in a macro invocation path",
                         if b1.is_import() { "imports" } else { "items" })
             };
-            if legacy {
-                let id = match b2.kind {
-                    NameBindingKind::Import { directive, .. } => directive.id,
-                    _ => unreachable!(),
-                };
-                let mut span = MultiSpan::from_span(span);
-                span.push_span_label(b1.span, msg1);
-                span.push_span_label(b2.span, msg2);
-                let msg = format!("`{}` is ambiguous", name);
-                self.session.buffer_lint(lint::builtin::LEGACY_IMPORTS, id, span, &msg);
-            } else {
-                let mut err =
-                    struct_span_err!(self.session, span, E0659, "`{}` is ambiguous", name);
-                err.span_note(b1.span, &msg1);
-                match b2.def() {
-                    Def::Macro(..) if b2.span == DUMMY_SP =>
-                        err.note(&format!("`{}` is also a builtin macro", name)),
-                    _ => err.span_note(b2.span, &msg2),
-                };
-                err.note(&note).emit();
-            }
+
+            let mut err = struct_span_err!(self.session, span, E0659, "`{}` is ambiguous", name);
+            err.span_note(b1.span, &msg1);
+            match b2.def() {
+                Def::Macro(..) if b2.span == DUMMY_SP =>
+                    err.note(&format!("`{}` is also a builtin macro", name)),
+                _ => err.span_note(b2.span, &msg2),
+            };
+            err.note(&note).emit();
         }
 
         for &PrivacyError(span, name, binding) in &self.privacy_errors {
@@ -4263,12 +4297,6 @@ impl<'a> Resolver<'a> {
 
         err.emit();
         self.name_already_seen.insert(name, span);
-    }
-
-    fn warn_legacy_self_import(&self, directive: &'a ImportDirective<'a>) {
-        let (id, span) = (directive.id, directive.span);
-        let msg = "`self` no longer imports values";
-        self.session.buffer_lint(lint::builtin::LEGACY_IMPORTS, id, span, msg);
     }
 
     fn check_proc_macro_attrs(&mut self, attrs: &[ast::Attribute]) {

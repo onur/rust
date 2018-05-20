@@ -36,6 +36,7 @@ use std::fmt;
 use syntax::ast;
 use session::DiagnosticMessageId;
 use ty::{self, AdtKind, ToPredicate, ToPolyTraitRef, Ty, TyCtxt, TypeFoldable};
+use ty::GenericParamDefKind;
 use ty::error::ExpectedFound;
 use ty::fast_reject;
 use ty::fold::TypeFolder;
@@ -202,17 +203,19 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                     obligation.cause.span,
                     infer::LateBoundRegionConversionTime::HigherRankedType,
                     data);
-                let normalized = super::normalize_projection_type(
+                let mut obligations = vec![];
+                let normalized_ty = super::normalize_projection_type(
                     &mut selcx,
                     obligation.param_env,
                     data.projection_ty,
                     obligation.cause.clone(),
-                    0
+                    0,
+                    &mut obligations
                 );
                 if let Err(error) = self.at(&obligation.cause, obligation.param_env)
-                                        .eq(normalized.value, data.ty) {
+                                        .eq(normalized_ty, data.ty) {
                     values = Some(infer::ValuePairs::Types(ExpectedFound {
-                        expected: normalized.value,
+                        expected: normalized_ty,
                         found: data.ty,
                     }));
                     err_buf = error;
@@ -378,12 +381,15 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             flags.push(("_Self".to_string(), Some(self.tcx.type_of(def.did).to_string())));
         }
 
-        for param in generics.types.iter() {
+        for param in generics.params.iter() {
+            let value = match param.kind {
+                GenericParamDefKind::Type(_) => {
+                    trait_ref.substs[param.index as usize].to_string()
+                },
+                GenericParamDefKind::Lifetime => continue,
+            };
             let name = param.name.to_string();
-            let ty = trait_ref.substs.type_for_def(param);
-            let ty_str = ty.to_string();
-            flags.push((name.clone(),
-                        Some(ty_str.clone())));
+            flags.push((name, Some(value)));
         }
 
         if let Some(true) = self_ty.ty_to_def_id().map(|def_id| def_id.is_local()) {
@@ -878,9 +884,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             let mut trait_type = trait_ref.self_ty();
 
             for refs_remaining in 0..refs_number {
-                if let ty::TypeVariants::TyRef(_, ty::TypeAndMut{ ty: t_type, mutbl: _ }) =
-                    trait_type.sty {
-
+                if let ty::TypeVariants::TyRef(_, t_type, _) = trait_type.sty {
                     trait_type = t_type;
 
                     let substs = self.tcx.mk_substs_trait(trait_type, &[]);
@@ -1236,7 +1240,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                         self.tcx.lang_items().sized_trait()
                         .map_or(false, |sized_id| sized_id == trait_ref.def_id())
                     {
-                        self.need_type_info(body_id, span, self_ty);
+                        self.need_type_info_err(body_id, span, self_ty).emit();
                     } else {
                         let mut err = struct_span_err!(self.tcx.sess,
                                                         span, E0283,
@@ -1253,7 +1257,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 // Same hacky approach as above to avoid deluging user
                 // with error messages.
                 if !ty.references_error() && !self.tcx.sess.has_errors() {
-                    self.need_type_info(body_id, span, ty);
+                    self.need_type_info_err(body_id, span, ty).emit();
                 }
             }
 
@@ -1264,9 +1268,9 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                     let &SubtypePredicate { a_is_expected: _, a, b } = data.skip_binder();
                     // both must be type variables, or the other would've been instantiated
                     assert!(a.is_ty_var() && b.is_ty_var());
-                    self.need_type_info(body_id,
-                                        obligation.cause.span,
-                                        a);
+                    self.need_type_info_err(body_id,
+                                            obligation.cause.span,
+                                            a).emit();
                 }
             }
 
@@ -1477,6 +1481,14 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             }
             ObligationCauseCode::ReturnType(_) |
             ObligationCauseCode::BlockTailExpression(_) => (),
+            ObligationCauseCode::TrivialBound => {
+                err.help("see issue #48214");
+                if tcx.sess.opts.unstable_features.is_nightly_build() {
+                    err.help("add #![feature(trivial_bounds)] to the \
+                              crate attributes to enable",
+                    );
+                }
+            }
         }
     }
 

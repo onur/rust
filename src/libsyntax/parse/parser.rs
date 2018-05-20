@@ -115,7 +115,7 @@ macro_rules! maybe_whole_expr {
     ($p:expr) => {
         if let token::Interpolated(nt) = $p.token.clone() {
             match nt.0 {
-                token::NtExpr(ref e) => {
+                token::NtExpr(ref e) | token::NtLiteral(ref e) => {
                     $p.bump();
                     return Ok((*e).clone());
                 }
@@ -128,7 +128,7 @@ macro_rules! maybe_whole_expr {
                 token::NtBlock(ref block) => {
                     $p.bump();
                     let span = $p.span;
-                    let kind = ExprKind::Block((*block).clone());
+                    let kind = ExprKind::Block((*block).clone(), None);
                     return Ok($p.mk_expr(span, kind, ThinVec::new()));
                 }
                 _ => {},
@@ -1823,7 +1823,7 @@ impl<'a> Parser<'a> {
     pub fn parse_lit_token(&mut self) -> PResult<'a, LitKind> {
         let out = match self.token {
             token::Interpolated(ref nt) => match nt.0 {
-                token::NtExpr(ref v) => match v.node {
+                token::NtExpr(ref v) | token::NtLiteral(ref v) => match v.node {
                     ExprKind::Lit(ref lit) => { lit.node.clone() }
                     _ => { return self.unexpected_last(&self.token); }
                 },
@@ -1862,7 +1862,7 @@ impl<'a> Parser<'a> {
     }
 
     /// matches '-' lit | lit (cf. ast_validation::AstValidator::check_expr_within_pat)
-    pub fn parse_pat_literal_maybe_minus(&mut self) -> PResult<'a, P<Expr>> {
+    pub fn parse_literal_maybe_minus(&mut self) -> PResult<'a, P<Expr>> {
         maybe_whole_expr!(self);
 
         let minus_lo = self.span;
@@ -1958,16 +1958,16 @@ impl<'a> Parser<'a> {
         let meta_ident = match self.token {
             token::Interpolated(ref nt) => match nt.0 {
                 token::NtMeta(ref meta) => match meta.node {
-                    ast::MetaItemKind::Word => Some(meta.ident),
+                    ast::MetaItemKind::Word => Some(meta.ident.clone()),
                     _ => None,
                 },
                 _ => None,
             },
             _ => None,
         };
-        if let Some(ident) = meta_ident {
+        if let Some(path) = meta_ident {
             self.bump();
-            return Ok(ast::Path::from_ident(ident));
+            return Ok(path);
         }
         self.parse_path(style)
     }
@@ -2042,7 +2042,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn check_lifetime(&mut self) -> bool {
+    pub fn check_lifetime(&mut self) -> bool {
         self.expected_tokens.push(TokenType::Lifetime);
         self.token.is_lifetime()
     }
@@ -2244,7 +2244,7 @@ impl<'a> Parser<'a> {
                 };
             }
             token::OpenDelim(token::Brace) => {
-                return self.parse_block_expr(lo, BlockCheckMode::Default, attrs);
+                return self.parse_block_expr(None, lo, BlockCheckMode::Default, attrs);
             }
             token::BinOp(token::Or) | token::OrOr => {
                 return self.parse_lambda_expr(attrs);
@@ -2318,7 +2318,13 @@ impl<'a> Parser<'a> {
                     if self.eat_keyword(keywords::Loop) {
                         return self.parse_loop_expr(Some(label), lo, attrs)
                     }
-                    let msg = "expected `while`, `for`, or `loop` after a label";
+                    if self.token == token::OpenDelim(token::Brace) {
+                        return self.parse_block_expr(Some(label),
+                                                     lo,
+                                                     BlockCheckMode::Default,
+                                                     attrs);
+                    }
+                    let msg = "expected `while`, `for`, `loop` or `{` after a label";
                     let mut err = self.fatal(msg);
                     err.span_label(self.span, msg);
                     return Err(err);
@@ -2338,6 +2344,7 @@ impl<'a> Parser<'a> {
                 }
                 if self.eat_keyword(keywords::Unsafe) {
                     return self.parse_block_expr(
+                        None,
                         lo,
                         BlockCheckMode::Unsafe(ast::UserProvided),
                         attrs);
@@ -2407,10 +2414,10 @@ impl<'a> Parser<'a> {
                     hi = pth.span;
                     ex = ExprKind::Path(None, pth);
                 } else {
-                    match self.parse_lit() {
-                        Ok(lit) => {
-                            hi = lit.span;
-                            ex = ExprKind::Lit(P(lit));
+                    match self.parse_literal_maybe_minus() {
+                        Ok(expr) => {
+                            hi = expr.span;
+                            ex = expr.node.clone();
                         }
                         Err(mut err) => {
                             self.cancel(&mut err);
@@ -2502,7 +2509,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a block or unsafe block
-    pub fn parse_block_expr(&mut self, lo: Span, blk_mode: BlockCheckMode,
+    pub fn parse_block_expr(&mut self, opt_label: Option<Label>,
+                            lo: Span, blk_mode: BlockCheckMode,
                             outer_attrs: ThinVec<Attribute>)
                             -> PResult<'a, P<Expr>> {
         self.expect(&token::OpenDelim(token::Brace))?;
@@ -2511,7 +2519,7 @@ impl<'a> Parser<'a> {
         attrs.extend(self.parse_inner_attributes()?);
 
         let blk = self.parse_block_tail(lo, blk_mode)?;
-        return Ok(self.mk_expr(blk.span, ExprKind::Block(blk), attrs));
+        return Ok(self.mk_expr(blk.span, ExprKind::Block(blk, opt_label), attrs));
     }
 
     /// parse a.b or a(13) or a[4] or just a
@@ -3261,7 +3269,7 @@ impl<'a> Parser<'a> {
                 // If an explicit return type is given, require a
                 // block to appear (RFC 968).
                 let body_lo = self.span;
-                self.parse_block_expr(body_lo, BlockCheckMode::Default, ThinVec::new())?
+                self.parse_block_expr(None, body_lo, BlockCheckMode::Default, ThinVec::new())?
             }
         };
 
@@ -3277,7 +3285,7 @@ impl<'a> Parser<'a> {
             return self.parse_if_expr(ThinVec::new());
         } else {
             let blk = self.parse_block()?;
-            return Ok(self.mk_expr(blk.span, ExprKind::Block(blk), ThinVec::new()));
+            return Ok(self.mk_expr(blk.span, ExprKind::Block(blk, None), ThinVec::new()));
         }
     }
 
@@ -3724,7 +3732,7 @@ impl<'a> Parser<'a> {
             let hi = self.prev_span;
             Ok(self.mk_expr(lo.to(hi), ExprKind::Path(qself, path), ThinVec::new()))
         } else {
-            self.parse_pat_literal_maybe_minus()
+            self.parse_literal_maybe_minus()
         }
     }
 
@@ -3914,7 +3922,7 @@ impl<'a> Parser<'a> {
                 }
             } else {
                 // Try to parse everything else as literal with optional minus
-                match self.parse_pat_literal_maybe_minus() {
+                match self.parse_literal_maybe_minus() {
                     Ok(begin) => {
                         if self.eat(&token::DotDotDot) {
                             let end = self.parse_pat_range_end()?;
@@ -5741,7 +5749,7 @@ impl<'a> Parser<'a> {
                 let vis = p.parse_visibility(true)?;
                 let ty = p.parse_ty()?;
                 Ok(StructField {
-                    span: lo.to(p.span),
+                    span: lo.to(ty.span),
                     vis,
                     ident: None,
                     id: ast::DUMMY_NODE_ID,

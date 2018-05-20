@@ -11,15 +11,15 @@
 //! This module provides constants which are specific to the implementation
 //! of the `f64` floating point data type.
 //!
-//! Mathematically significant numbers are provided in the `consts` sub-module.
-//!
 //! *[See also the `f64` primitive type](../../std/primitive.f64.html).*
+//!
+//! Mathematically significant numbers are provided in the `consts` sub-module.
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use mem;
 use num::Float;
-#[cfg(not(stage0))] use num::FpCategory;
+use num::FpCategory;
 use num::FpCategory as Fp;
 
 /// The radix or base of the internal representation of `f64`.
@@ -124,9 +124,17 @@ pub mod consts {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const E: f64 = 2.71828182845904523536028747135266250_f64;
 
+    /// log<sub>2</sub>(10)
+    #[unstable(feature = "extra_log_consts", issue = "50540")]
+    pub const LOG2_10: f64 = 3.32192809488736234787031942948939018_f64;
+
     /// log<sub>2</sub>(e)
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const LOG2_E: f64 = 1.44269504088896340735992468100189214_f64;
+
+    /// log<sub>10</sub>(2)
+    #[unstable(feature = "extra_log_consts", issue = "50540")]
+    pub const LOG10_2: f64 = 0.301029995663981195213738894724493027_f64;
 
     /// log<sub>10</sub>(e)
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -268,7 +276,6 @@ impl Float for f64 {
 
 // FIXME: remove (inline) this macro and the Float trait
 // when updating to a bootstrap compiler that has the new lang items.
-#[cfg_attr(stage0, macro_export)]
 #[unstable(feature = "core_float", issue = "32110")]
 macro_rules! f64_core_methods { () => {
     /// Returns `true` if this value is `NaN` and false otherwise.
@@ -554,7 +561,6 @@ macro_rules! f64_core_methods { () => {
 
 #[lang = "f64"]
 #[cfg(not(test))]
-#[cfg(not(stage0))]
 impl f64 {
     f64_core_methods!();
 }

@@ -48,7 +48,7 @@ use syntax::symbol::{Symbol, keywords};
 use syntax::feature_gate;
 use syntax_pos::{Span, DUMMY_SP};
 
-use rustc::hir::{self, map as hir_map, TransFnAttrs, TransFnAttrFlags, Unsafety};
+use rustc::hir::{self, map as hir_map, CodegenFnAttrs, CodegenFnAttrFlags, Unsafety};
 use rustc::hir::intravisit::{self, Visitor, NestedVisitorMap};
 use rustc::hir::def::{Def, CtorKind};
 use rustc::hir::def_id::{DefId, LOCAL_CRATE};
@@ -75,7 +75,7 @@ pub fn provide(providers: &mut Providers) {
         impl_trait_ref,
         impl_polarity,
         is_foreign_item,
-        trans_fn_attrs,
+        codegen_fn_attrs,
         ..*providers
     };
 }
@@ -181,7 +181,7 @@ impl<'a, 'tcx> AstConv<'tcx, 'tcx> for ItemCtxt<'a, 'tcx> {
         self.tcx.at(span).type_param_predicates((self.item_def_id, def_id))
     }
 
-    fn re_infer(&self, _span: Span, _def: Option<&ty::RegionParameterDef>)
+    fn re_infer(&self, _span: Span, _def: Option<&ty::GenericParamDef>)
                 -> Option<ty::Region<'tcx>> {
         None
     }
@@ -243,8 +243,8 @@ fn type_param_predicates<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let param_owner = tcx.hir.ty_param_owner(param_id);
     let param_owner_def_id = tcx.hir.local_def_id(param_owner);
     let generics = tcx.generics_of(param_owner_def_id);
-    let index = generics.type_param_to_index[&def_id];
-    let ty = tcx.mk_param(index, tcx.hir.ty_param_name(param_id).as_interned_str());
+    let index = generics.param_def_id_to_index[&def_id];
+    let ty = tcx.mk_ty_param(index, tcx.hir.ty_param_name(param_id).as_interned_str());
 
     // Don't look for bounds where the type parameter isn't in scope.
     let parent = if item_def_id == param_owner_def_id {
@@ -840,14 +840,16 @@ fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                     // the node id for the Self type parameter.
                     let param_id = item.id;
 
-                    opt_self = Some(ty::TypeParameterDef {
+                    opt_self = Some(ty::GenericParamDef {
                         index: 0,
                         name: keywords::SelfType.name().as_interned_str(),
                         def_id: tcx.hir.local_def_id(param_id),
-                        has_default: false,
-                        object_lifetime_default: rl::Set1::Empty,
                         pure_wrt_drop: false,
-                        synthetic: None,
+                        kind: ty::GenericParamDefKind::Type(ty::TypeParamDef {
+                            has_default: false,
+                            object_lifetime_default: rl::Set1::Empty,
+                            synthetic: None,
+                        }),
                     });
 
                     allow_defaults = true;
@@ -876,31 +878,33 @@ fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let has_self = opt_self.is_some();
     let mut parent_has_self = false;
     let mut own_start = has_self as u32;
-    let (parent_regions, parent_types) = parent_def_id.map_or((0, 0), |def_id| {
+    let parent_count = parent_def_id.map_or(0, |def_id| {
         let generics = tcx.generics_of(def_id);
         assert_eq!(has_self, false);
         parent_has_self = generics.has_self;
         own_start = generics.count() as u32;
-        (generics.parent_regions + generics.regions.len() as u32,
-            generics.parent_types + generics.types.len() as u32)
+        generics.parent_count + generics.params.len()
     });
 
+    let mut params: Vec<_> = opt_self.into_iter().collect();
+
     let early_lifetimes = early_bound_lifetimes_from_generics(tcx, ast_generics);
-    let regions = early_lifetimes.enumerate().map(|(i, l)| {
-        ty::RegionParameterDef {
+    params.extend(early_lifetimes.enumerate().map(|(i, l)| {
+        ty::GenericParamDef {
             name: l.lifetime.name.name().as_interned_str(),
             index: own_start + i as u32,
             def_id: tcx.hir.local_def_id(l.lifetime.id),
             pure_wrt_drop: l.pure_wrt_drop,
+            kind: ty::GenericParamDefKind::Lifetime,
         }
-    }).collect::<Vec<_>>();
+    }));
 
     let hir_id = tcx.hir.node_to_hir_id(node_id);
     let object_lifetime_defaults = tcx.object_lifetime_defaults(hir_id);
 
     // Now create the real type parameters.
-    let type_start = own_start + regions.len() as u32;
-    let types = ast_generics.ty_params().enumerate().map(|(i, p)| {
+    let type_start = own_start - has_self as u32 + params.len() as u32;
+    params.extend(ast_generics.ty_params().enumerate().map(|(i, p)| {
         if p.name == keywords::SelfType.name() {
             span_bug!(p.span, "`Self` should not be the name of a regular parameter");
         }
@@ -916,70 +920,70 @@ fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             }
         }
 
-        ty::TypeParameterDef {
+        ty::GenericParamDef {
             index: type_start + i as u32,
             name: p.name.as_interned_str(),
             def_id: tcx.hir.local_def_id(p.id),
-            has_default: p.default.is_some(),
-            object_lifetime_default:
-                object_lifetime_defaults.as_ref().map_or(rl::Set1::Empty, |o| o[i]),
             pure_wrt_drop: p.pure_wrt_drop,
-            synthetic: p.synthetic,
+            kind: ty::GenericParamDefKind::Type(ty::TypeParamDef {
+                has_default: p.default.is_some(),
+                object_lifetime_default:
+                    object_lifetime_defaults.as_ref().map_or(rl::Set1::Empty, |o| o[i]),
+                synthetic: p.synthetic,
+            }),
         }
-    });
-
-    let mut types: Vec<_> = opt_self.into_iter().chain(types).collect();
+    }));
 
     // provide junk type parameter defs - the only place that
     // cares about anything but the length is instantiation,
     // and we don't do that for closures.
-    if let NodeExpr(&hir::Expr { node: hir::ExprClosure(..), .. }) = node {
-        // add a dummy parameter for the closure kind
-        types.push(ty::TypeParameterDef {
-            index: type_start,
-            name: Symbol::intern("<closure_kind>").as_interned_str(),
-            def_id,
-            has_default: false,
-            object_lifetime_default: rl::Set1::Empty,
-            pure_wrt_drop: false,
-            synthetic: None,
-        });
+    if let NodeExpr(&hir::Expr { node: hir::ExprClosure(.., gen), .. }) = node {
+        let dummy_args = if gen.is_some() {
+            &["<yield_ty>", "<return_ty>", "<witness>"][..]
+        } else {
+            &["<closure_kind>", "<closure_signature>"][..]
+        };
 
-        // add a dummy parameter for the closure signature
-        types.push(ty::TypeParameterDef {
-            index: type_start + 1,
-            name: Symbol::intern("<closure_signature>").as_interned_str(),
-            def_id,
-            has_default: false,
-            object_lifetime_default: rl::Set1::Empty,
-            pure_wrt_drop: false,
-            synthetic: None,
-        });
+        for (i, &arg) in dummy_args.iter().enumerate() {
+            params.push(ty::GenericParamDef {
+                index: type_start + i as u32,
+                name: Symbol::intern(arg).as_interned_str(),
+                def_id,
+                pure_wrt_drop: false,
+                kind: ty::GenericParamDefKind::Type(ty::TypeParamDef {
+                    has_default: false,
+                    object_lifetime_default: rl::Set1::Empty,
+                    synthetic: None,
+                }),
+            });
+        }
 
         tcx.with_freevars(node_id, |fv| {
-            types.extend(fv.iter().zip(2..).map(|(_, i)| ty::TypeParameterDef {
-                index: type_start + i,
-                name: Symbol::intern("<upvar>").as_interned_str(),
-                def_id,
-                has_default: false,
-                object_lifetime_default: rl::Set1::Empty,
-                pure_wrt_drop: false,
-                synthetic: None,
+            params.extend(fv.iter().zip((dummy_args.len() as u32)..).map(|(_, i)| {
+                ty::GenericParamDef {
+                    index: type_start + i,
+                    name: Symbol::intern("<upvar>").as_interned_str(),
+                    def_id,
+                    pure_wrt_drop: false,
+                    kind: ty::GenericParamDefKind::Type(ty::TypeParamDef {
+                        has_default: false,
+                        object_lifetime_default: rl::Set1::Empty,
+                        synthetic: None,
+                    }),
+                }
             }));
         });
     }
 
-    let type_param_to_index = types.iter()
-                                   .map(|param| (param.def_id, param.index))
-                                   .collect();
+    let param_def_id_to_index = params.iter()
+                                      .map(|param| (param.def_id, param.index))
+                                      .collect();
 
     tcx.alloc_generics(ty::Generics {
         parent: parent_def_id,
-        parent_regions,
-        parent_types,
-        regions,
-        types,
-        type_param_to_index,
+        parent_count,
+        params,
+        param_def_id_to_index,
         has_self: has_self || parent_has_self,
         has_late_bound_regions: has_late_bound_regions(tcx, node),
     })
@@ -1092,15 +1096,7 @@ fn type_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             }
 
             let substs = ty::ClosureSubsts {
-                substs: Substs::for_item(
-                    tcx,
-                    def_id,
-                    |def, _| {
-                        let region = def.to_early_bound_region_data();
-                        tcx.mk_region(ty::ReEarlyBound(region))
-                    },
-                    |def, _| tcx.mk_param_from_def(def)
-                )
+                substs: Substs::identity_for_item(tcx, def_id),
             };
 
             tcx.mk_closure(def_id, substs)
@@ -1392,7 +1388,7 @@ pub fn explicit_predicates_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     };
 
     let generics = tcx.generics_of(def_id);
-    let parent_count = generics.parent_count() as u32;
+    let parent_count = generics.parent_count as u32;
     let has_own_self = generics.has_self && parent_count == 0;
 
     let mut predicates = vec![];
@@ -1804,33 +1800,33 @@ fn linkage_by_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId, name: &
     }
 }
 
-fn trans_fn_attrs<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: DefId) -> TransFnAttrs {
+fn codegen_fn_attrs<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: DefId) -> CodegenFnAttrs {
     let attrs = tcx.get_attrs(id);
 
-    let mut trans_fn_attrs = TransFnAttrs::new();
+    let mut codegen_fn_attrs = CodegenFnAttrs::new();
 
     let whitelist = tcx.target_features_whitelist(LOCAL_CRATE);
 
     let mut inline_span = None;
     for attr in attrs.iter() {
         if attr.check_name("cold") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::COLD;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::COLD;
         } else if attr.check_name("allocator") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::ALLOCATOR;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::ALLOCATOR;
         } else if attr.check_name("unwind") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::UNWIND;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::UNWIND;
         } else if attr.check_name("rustc_allocator_nounwind") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::RUSTC_ALLOCATOR_NOUNWIND;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_ALLOCATOR_NOUNWIND;
         } else if attr.check_name("naked") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::NAKED;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::NAKED;
         } else if attr.check_name("no_mangle") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::NO_MANGLE;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_MANGLE;
         } else if attr.check_name("rustc_std_internal_symbol") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL;
         } else if attr.check_name("no_debug") {
-            trans_fn_attrs.flags |= TransFnAttrFlags::NO_DEBUG;
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_DEBUG;
         } else if attr.check_name("inline") {
-            trans_fn_attrs.inline = attrs.iter().fold(InlineAttr::None, |ia, attr| {
+            codegen_fn_attrs.inline = attrs.iter().fold(InlineAttr::None, |ia, attr| {
                 if attr.path != "inline" {
                     return ia;
                 }
@@ -1866,7 +1862,7 @@ fn trans_fn_attrs<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: DefId) -> TransFnAt
             });
         } else if attr.check_name("export_name") {
             if let s @ Some(_) = attr.value_str() {
-                trans_fn_attrs.export_name = s;
+                codegen_fn_attrs.export_name = s;
             } else {
                 struct_span_err!(tcx.sess, attr.span, E0558,
                                     "export_name attribute has invalid format")
@@ -1879,10 +1875,10 @@ fn trans_fn_attrs<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: DefId) -> TransFnAt
                            `unsafe` function";
                 tcx.sess.span_err(attr.span, msg);
             }
-            from_target_feature(tcx, id, attr, &whitelist, &mut trans_fn_attrs.target_features);
+            from_target_feature(tcx, id, attr, &whitelist, &mut codegen_fn_attrs.target_features);
         } else if attr.check_name("linkage") {
             if let Some(val) = attr.value_str() {
-                trans_fn_attrs.linkage = Some(linkage_by_name(tcx, id, &val.as_str()));
+                codegen_fn_attrs.linkage = Some(linkage_by_name(tcx, id, &val.as_str()));
             }
         }
     }
@@ -1891,8 +1887,8 @@ fn trans_fn_attrs<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: DefId) -> TransFnAt
     // purpose functions as they wouldn't have the right target features
     // enabled. For that reason we also forbid #[inline(always)] as it can't be
     // respected.
-    if trans_fn_attrs.target_features.len() > 0 {
-        if trans_fn_attrs.inline == InlineAttr::Always {
+    if codegen_fn_attrs.target_features.len() > 0 {
+        if codegen_fn_attrs.inline == InlineAttr::Always {
             if let Some(span) = inline_span {
                 tcx.sess.span_err(span, "cannot use #[inline(always)] with \
                                          #[target_feature]");
@@ -1900,5 +1896,5 @@ fn trans_fn_attrs<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: DefId) -> TransFnAt
         }
     }
 
-    trans_fn_attrs
+    codegen_fn_attrs
 }

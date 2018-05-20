@@ -22,9 +22,9 @@
 #![feature(unicode_internals)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_sort_by_cached_key)]
-#![feature(non_exhaustive)]
 #![feature(const_atomic_usize_new)]
 #![feature(rustc_attrs)]
+#![feature(str_escape)]
 
 #![recursion_limit="256"]
 
@@ -72,7 +72,7 @@ macro_rules! unwrap_or {
     }
 }
 
-struct Globals {
+pub struct Globals {
     used_attrs: Lock<Vec<u64>>,
     known_attrs: Lock<Vec<u64>>,
     syntax_pos_globals: syntax_pos::Globals,
@@ -97,7 +97,7 @@ pub fn with_globals<F, R>(f: F) -> R
     })
 }
 
-scoped_thread_local!(static GLOBALS: Globals);
+scoped_thread_local!(pub static GLOBALS: Globals);
 
 #[macro_use]
 pub mod diagnostics {
@@ -141,7 +141,6 @@ pub mod codemap;
 #[macro_use]
 pub mod config;
 pub mod entry;
-pub mod edition;
 pub mod feature_gate;
 pub mod fold;
 pub mod parse;
@@ -149,6 +148,7 @@ pub mod ptr;
 pub mod show_span;
 pub mod std_inject;
 pub mod str;
+pub use syntax_pos::edition;
 pub use syntax_pos::symbol;
 pub mod test;
 pub mod tokenstream;

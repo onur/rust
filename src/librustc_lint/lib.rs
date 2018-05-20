@@ -30,7 +30,6 @@
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
 
-#[macro_use]
 extern crate syntax;
 #[macro_use]
 extern crate rustc;
@@ -41,7 +40,7 @@ extern crate rustc_target;
 extern crate syntax_pos;
 
 use rustc::lint;
-use rustc::lint::builtin::{BARE_TRAIT_OBJECT, ABSOLUTE_PATH_STARTING_WITH_MODULE};
+use rustc::lint::builtin::{BARE_TRAIT_OBJECT, ABSOLUTE_PATH_NOT_STARTING_WITH_CRATE};
 use rustc::session;
 use rustc::util;
 
@@ -138,12 +137,14 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                  UnreachablePub,
                  TypeAliasBounds,
                  UnusedBrokenConst,
+                 TrivialConstraints,
                  );
 
     add_builtin_with_new!(sess,
                           TypeLimits,
                           MissingDoc,
                           MissingDebugImplementations,
+                          ExternCrate,
                           );
 
     add_lint_group!(sess,
@@ -176,12 +177,14 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                     UNUSED_DOC_COMMENT,
                     UNUSED_EXTERN_CRATES,
                     UNUSED_FEATURES,
+                    UNUSED_LABELS,
                     UNUSED_PARENS);
 
     add_lint_group!(sess,
                     "rust_2018_idioms",
                     BARE_TRAIT_OBJECT,
-                    UNREACHABLE_PUB);
+                    UNREACHABLE_PUB,
+                    UNNECESSARY_EXTERN_CRATE);
 
     // Guidelines for creating a future incompatibility lint:
     //
@@ -221,11 +224,6 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
         FutureIncompatibleInfo {
             id: LintId::of(LEGACY_DIRECTORY_OWNERSHIP),
             reference: "issue #37872 <https://github.com/rust-lang/rust/issues/37872>",
-            edition: None,
-        },
-        FutureIncompatibleInfo {
-            id: LintId::of(LEGACY_IMPORTS),
-            reference: "issue #38260 <https://github.com/rust-lang/rust/issues/38260>",
             edition: None,
         },
         FutureIncompatibleInfo {
@@ -281,7 +279,7 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
             //       standard library, and thus should never be removed or changed to an error.
         },
         FutureIncompatibleInfo {
-            id: LintId::of(ABSOLUTE_PATH_STARTING_WITH_MODULE),
+            id: LintId::of(ABSOLUTE_PATH_NOT_STARTING_WITH_CRATE),
             reference: "issue TBD",
             edition: Some(Edition::Edition2018),
         },
@@ -316,8 +314,12 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
         "converted into hard error, see https://github.com/rust-lang/rust/issues/36892");
     store.register_removed("extra_requirement_in_impl",
         "converted into hard error, see https://github.com/rust-lang/rust/issues/37166");
+    store.register_removed("legacy_imports",
+        "converted into hard error, see https://github.com/rust-lang/rust/issues/38260");
     store.register_removed("coerce_never",
         "converted into hard error, see https://github.com/rust-lang/rust/issues/48950");
     store.register_removed("resolve_trait_on_defaulted_unit",
         "converted into hard error, see https://github.com/rust-lang/rust/issues/48950");
+    store.register_removed("absolute_path_starting_with_module",
+        "renamed to `absolute_path_not_starting_with_crate`");
 }

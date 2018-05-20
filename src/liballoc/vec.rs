@@ -73,9 +73,6 @@ use core::intrinsics::{arith_offset, assume};
 use core::iter::{FromIterator, FusedIterator, TrustedLen};
 use core::marker::PhantomData;
 use core::mem;
-#[cfg(not(test))]
-#[cfg(stage0)]
-use core::num::Float;
 use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::ops::{Index, IndexMut, RangeBounds};
 use core::ops;
@@ -2286,6 +2283,13 @@ impl<'a, T: Clone> From<Vec<T>> for Cow<'a, [T]> {
     }
 }
 
+#[stable(feature = "cow_from_vec_ref", since = "1.28.0")]
+impl<'a, T: Clone> From<&'a Vec<T>> for Cow<'a, [T]> {
+    fn from(v: &'a Vec<T>) -> Cow<'a, [T]> {
+        Cow::Borrowed(v.as_slice())
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> FromIterator<T> for Cow<'a, [T]> where T: Clone {
     fn from_iter<I: IntoIterator<Item = T>>(it: I) -> Cow<'a, [T]> {
@@ -2533,9 +2537,11 @@ impl<'a, T> Drop for Drain<'a, T> {
                 // memmove back untouched tail, update to new length
                 let start = source_vec.len();
                 let tail = self.tail_start;
-                let src = source_vec.as_ptr().offset(tail as isize);
-                let dst = source_vec.as_mut_ptr().offset(start as isize);
-                ptr::copy(src, dst, self.tail_len);
+                if tail != start {
+                    let src = source_vec.as_ptr().offset(tail as isize);
+                    let dst = source_vec.as_mut_ptr().offset(start as isize);
+                    ptr::copy(src, dst, self.tail_len);
+                }
                 source_vec.set_len(start + self.tail_len);
             }
         }

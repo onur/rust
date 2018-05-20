@@ -19,6 +19,7 @@ use ty::subst::{Substs, Subst, Kind, UnpackedKind};
 use ty::{self, AdtDef, TypeFlags, Ty, TyCtxt, TypeFoldable};
 use ty::{Slice, TyS};
 use util::captures::Captures;
+use mir::interpret::{PrimVal, MemoryPointer, Value, ConstValue};
 
 use std::iter;
 use std::cmp::Ordering;
@@ -121,7 +122,7 @@ pub enum TypeVariants<'tcx> {
 
     /// A reference; a pointer with an associated lifetime. Written as
     /// `&'a mut T` or `&'a T`.
-    TyRef(Region<'tcx>, TypeAndMut<'tcx>),
+    TyRef(Region<'tcx>, Ty<'tcx>, hir::Mutability),
 
     /// The anonymous type of a function declaration/definition. Each
     /// function has a unique type.
@@ -139,7 +140,7 @@ pub enum TypeVariants<'tcx> {
 
     /// The anonymous type of a generator. Used to represent the type of
     /// `|a| yield a`.
-    TyGenerator(DefId, ClosureSubsts<'tcx>, GeneratorInterior<'tcx>),
+    TyGenerator(DefId, GeneratorSubsts<'tcx>, hir::GeneratorMovability),
 
     /// A type representin the types stored inside a generator.
     /// This should only appear in GeneratorInteriors.
@@ -242,7 +243,7 @@ pub enum TypeVariants<'tcx> {
 /// out later.
 ///
 /// All right, you say, but why include the type parameters from the
-/// original function then? The answer is that trans may need them
+/// original function then? The answer is that codegen may need them
 /// when monomorphizing, and they may not appear in the upvars.  A
 /// closure could capture no variables but still make use of some
 /// in-scope type parameter with a bound (e.g., if our example above
@@ -272,7 +273,7 @@ pub struct ClosureSubsts<'tcx> {
     /// Lifetime and type parameters from the enclosing function,
     /// concatenated with the types of the upvars.
     ///
-    /// These are separated out because trans wants to pass them around
+    /// These are separated out because codegen wants to pass them around
     /// when monomorphizing.
     pub substs: &'tcx Substs<'tcx>,
 }
@@ -291,7 +292,7 @@ impl<'tcx> ClosureSubsts<'tcx> {
     /// ordering.
     fn split(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> SplitClosureSubsts<'tcx> {
         let generics = tcx.generics_of(def_id);
-        let parent_len = generics.parent_count();
+        let parent_len = generics.parent_count;
         SplitClosureSubsts {
             closure_kind_ty: self.substs.type_at(parent_len),
             closure_sig_ty: self.substs.type_at(parent_len + 1),
@@ -328,37 +329,6 @@ impl<'tcx> ClosureSubsts<'tcx> {
         self.split(def_id, tcx).closure_sig_ty
     }
 
-    /// Returns the type representing the yield type of the generator.
-    pub fn generator_yield_ty(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> Ty<'tcx> {
-        self.closure_kind_ty(def_id, tcx)
-    }
-
-    /// Returns the type representing the return type of the generator.
-    pub fn generator_return_ty(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> Ty<'tcx> {
-        self.closure_sig_ty(def_id, tcx)
-    }
-
-    /// Return the "generator signature", which consists of its yield
-    /// and return types.
-    ///
-    /// NB. Some bits of the code prefers to see this wrapped in a
-    /// binder, but it never contains bound regions. Probably this
-    /// function should be removed.
-    pub fn generator_poly_sig(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> PolyGenSig<'tcx> {
-        ty::Binder::dummy(self.generator_sig(def_id, tcx))
-    }
-
-    /// Return the "generator signature", which consists of its yield
-    /// and return types.
-    pub fn generator_sig(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> GenSig<'tcx> {
-        ty::GenSig {
-            yield_ty: self.generator_yield_ty(def_id, tcx),
-            return_ty: self.generator_return_ty(def_id, tcx),
-        }
-    }
-}
-
-impl<'tcx> ClosureSubsts<'tcx> {
     /// Returns the closure kind for this closure; only usable outside
     /// of an inference context, because in that context we know that
     /// there are no type variables.
@@ -381,7 +351,84 @@ impl<'tcx> ClosureSubsts<'tcx> {
     }
 }
 
-impl<'a, 'gcx, 'tcx> ClosureSubsts<'tcx> {
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
+pub struct GeneratorSubsts<'tcx> {
+    pub substs: &'tcx Substs<'tcx>,
+}
+
+struct SplitGeneratorSubsts<'tcx> {
+    yield_ty: Ty<'tcx>,
+    return_ty: Ty<'tcx>,
+    witness: Ty<'tcx>,
+    upvar_kinds: &'tcx [Kind<'tcx>],
+}
+
+impl<'tcx> GeneratorSubsts<'tcx> {
+    fn split(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> SplitGeneratorSubsts<'tcx> {
+        let generics = tcx.generics_of(def_id);
+        let parent_len = generics.parent_count;
+        SplitGeneratorSubsts {
+            yield_ty: self.substs.type_at(parent_len),
+            return_ty: self.substs.type_at(parent_len + 1),
+            witness: self.substs.type_at(parent_len + 2),
+            upvar_kinds: &self.substs[parent_len + 3..],
+        }
+    }
+
+    /// This describes the types that can be contained in a generator.
+    /// It will be a type variable initially and unified in the last stages of typeck of a body.
+    /// It contains a tuple of all the types that could end up on a generator frame.
+    /// The state transformation MIR pass may only produce layouts which mention types
+    /// in this tuple. Upvars are not counted here.
+    pub fn witness(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> Ty<'tcx> {
+        self.split(def_id, tcx).witness
+    }
+
+    #[inline]
+    pub fn upvar_tys(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) ->
+        impl Iterator<Item=Ty<'tcx>> + 'tcx
+    {
+        let SplitGeneratorSubsts { upvar_kinds, .. } = self.split(def_id, tcx);
+        upvar_kinds.iter().map(|t| {
+            if let UnpackedKind::Type(ty) = t.unpack() {
+                ty
+            } else {
+                bug!("upvar should be type")
+            }
+        })
+    }
+
+    /// Returns the type representing the yield type of the generator.
+    pub fn yield_ty(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> Ty<'tcx> {
+        self.split(def_id, tcx).yield_ty
+    }
+
+    /// Returns the type representing the return type of the generator.
+    pub fn return_ty(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> Ty<'tcx> {
+        self.split(def_id, tcx).return_ty
+    }
+
+    /// Return the "generator signature", which consists of its yield
+    /// and return types.
+    ///
+    /// NB. Some bits of the code prefers to see this wrapped in a
+    /// binder, but it never contains bound regions. Probably this
+    /// function should be removed.
+    pub fn poly_sig(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> PolyGenSig<'tcx> {
+        ty::Binder::dummy(self.sig(def_id, tcx))
+    }
+
+    /// Return the "generator signature", which consists of its yield
+    /// and return types.
+    pub fn sig(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) -> GenSig<'tcx> {
+        ty::GenSig {
+            yield_ty: self.yield_ty(def_id, tcx),
+            return_ty: self.return_ty(def_id, tcx),
+        }
+    }
+}
+
+impl<'a, 'gcx, 'tcx> GeneratorSubsts<'tcx> {
     /// This returns the types of the MIR locals which had to be stored across suspension points.
     /// It is calculated in rustc_mir::transform::generator::StateTransform.
     /// All the types here must be in the tuple in GeneratorInterior.
@@ -412,15 +459,29 @@ impl<'a, 'gcx, 'tcx> ClosureSubsts<'tcx> {
     }
 }
 
-/// This describes the types that can be contained in a generator.
-/// It will be a type variable initially and unified in the last stages of typeck of a body.
-/// It contains a tuple of all the types that could end up on a generator frame.
-/// The state transformation MIR pass may only produce layouts which mention types in this tuple.
-/// Upvars are not counted here.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
-pub struct GeneratorInterior<'tcx> {
-    pub witness: Ty<'tcx>,
-    pub movable: bool,
+#[derive(Debug, Copy, Clone)]
+pub enum UpvarSubsts<'tcx> {
+    Closure(ClosureSubsts<'tcx>),
+    Generator(GeneratorSubsts<'tcx>),
+}
+
+impl<'tcx> UpvarSubsts<'tcx> {
+    #[inline]
+    pub fn upvar_tys(self, def_id: DefId, tcx: TyCtxt<'_, '_, '_>) ->
+        impl Iterator<Item=Ty<'tcx>> + 'tcx
+    {
+        let upvar_kinds = match self {
+            UpvarSubsts::Closure(substs) => substs.split(def_id, tcx).upvar_kinds,
+            UpvarSubsts::Generator(substs) => substs.split(def_id, tcx).upvar_kinds,
+        };
+        upvar_kinds.iter().map(|t| {
+            if let UnpackedKind::Type(ty) = t.unpack() {
+                ty
+            } else {
+                bug!("upvar should be type")
+            }
+        })
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
@@ -867,12 +928,12 @@ impl<'a, 'gcx, 'tcx> ParamTy {
         ParamTy::new(0, keywords::SelfType.name().as_interned_str())
     }
 
-    pub fn for_def(def: &ty::TypeParameterDef) -> ParamTy {
+    pub fn for_def(def: &ty::GenericParamDef) -> ParamTy {
         ParamTy::new(def.index, def.name)
     }
 
     pub fn to_ty(self, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> Ty<'tcx> {
-        tcx.mk_param(self.idx, self.name)
+        tcx.mk_ty_param(self.idx, self.name)
     }
 
     pub fn is_self(&self) -> bool {
@@ -1021,7 +1082,7 @@ pub enum RegionKind {
 
     /// A skolemized region - basically the higher-ranked version of ReFree.
     /// Should not exist after typeck.
-    ReSkolemized(SkolemizedRegionVid, BoundRegion),
+    ReSkolemized(ty::UniverseIndex, BoundRegion),
 
     /// Empty lifetime is for data that is never accessed.
     /// Bottom in the region lattice. We treat ReEmpty somewhat
@@ -1032,7 +1093,7 @@ pub enum RegionKind {
     /// variable with no constraints.
     ReEmpty,
 
-    /// Erased region, used by trait selection, in MIR and during trans.
+    /// Erased region, used by trait selection, in MIR and during codegen.
     ReErased,
 
     /// These are regions bound in the "defining type" for a
@@ -1074,11 +1135,6 @@ newtype_index!(RegionVid
         pub idx
         DEBUG_FORMAT = custom,
     });
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable, PartialOrd, Ord)]
-pub struct SkolemizedRegionVid {
-    pub index: u32,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
 pub enum InferTy {
@@ -1212,7 +1268,9 @@ impl RegionKind {
                 flags = flags | TypeFlags::HAS_FREE_REGIONS;
                 flags = flags | TypeFlags::HAS_RE_SKOL;
             }
-            ty::ReLateBound(..) => { }
+            ty::ReLateBound(..) => {
+                flags = flags | TypeFlags::HAS_RE_LATE_BOUND;
+            }
             ty::ReEarlyBound(..) => {
                 flags = flags | TypeFlags::HAS_FREE_REGIONS;
                 flags = flags | TypeFlags::HAS_RE_EARLY_BOUND;
@@ -1235,8 +1293,8 @@ impl RegionKind {
         }
 
         match *self {
-            ty::ReStatic | ty::ReEmpty | ty::ReErased => (),
-            _ => flags = flags | TypeFlags::HAS_LOCAL_NAMES,
+            ty::ReStatic | ty::ReEmpty | ty::ReErased | ty::ReLateBound(..) => (),
+            _ => flags = flags | TypeFlags::HAS_FREE_LOCAL_NAMES,
         }
 
         debug!("type_flags({:?}) = {:?}", self, flags);
@@ -1337,7 +1395,7 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
 
     pub fn is_slice(&self) -> bool {
         match self.sty {
-            TyRawPtr(mt) | TyRef(_, mt) => match mt.ty.sty {
+            TyRawPtr(TypeAndMut { ty, .. }) | TyRef(_, ty, _) => match ty.sty {
                 TySlice(_) | TyStr => true,
                 _ => false,
             },
@@ -1386,11 +1444,8 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
 
     pub fn is_mutable_pointer(&self) -> bool {
         match self.sty {
-            TyRawPtr(tnm) | TyRef(_, tnm) => if let hir::Mutability::MutMutable = tnm.mutbl {
-                true
-            } else {
-                false
-            },
+            TyRawPtr(TypeAndMut { mutbl: hir::Mutability::MutMutable, .. }) |
+            TyRef(_, _, hir::Mutability::MutMutable) => true,
             _ => false
         }
     }
@@ -1543,7 +1598,7 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
                     mutbl: hir::MutImmutable,
                 })
             },
-            TyRef(_, mt) => Some(mt),
+            TyRef(_, ty, mutbl) => Some(TypeAndMut { ty, mutbl }),
             TyRawPtr(mt) if explicit => Some(mt),
             _ => None,
         }
@@ -1597,7 +1652,7 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
     /// ignores late-bound regions binders.
     pub fn regions(&self) -> Vec<ty::Region<'tcx>> {
         match self.sty {
-            TyRef(region, _) => {
+            TyRef(region, _, _) => {
                 vec![region]
             }
             TyDynamic(ref obj, region) => {
@@ -1610,8 +1665,9 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
             TyAdt(_, substs) | TyAnon(_, substs) => {
                 substs.regions().collect()
             }
-            TyClosure(_, ref substs) | TyGenerator(_, ref substs, _) => {
-                substs.substs.regions().collect()
+            TyClosure(_, ClosureSubsts { ref substs }) |
+            TyGenerator(_, GeneratorSubsts { ref substs }, _) => {
+                substs.regions().collect()
             }
             TyProjection(ref data) => {
                 data.substs.regions().collect()
@@ -1675,6 +1731,149 @@ pub struct Const<'tcx> {
     pub ty: Ty<'tcx>,
 
     pub val: ConstVal<'tcx>,
+}
+
+impl<'tcx> Const<'tcx> {
+    pub fn unevaluated(
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        def_id: DefId,
+        substs: &'tcx Substs<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> &'tcx Self {
+        tcx.mk_const(Const {
+            val: ConstVal::Unevaluated(def_id, substs),
+            ty,
+        })
+    }
+
+    #[inline]
+    pub fn from_const_val(
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        val: ConstVal<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> &'tcx Self {
+        tcx.mk_const(Const {
+            val,
+            ty,
+        })
+    }
+
+    #[inline]
+    pub fn from_const_value(
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        val: ConstValue<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> &'tcx Self {
+        Self::from_const_val(tcx, ConstVal::Value(val), ty)
+    }
+
+    #[inline]
+    pub fn from_byval_value(
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        val: Value,
+        ty: Ty<'tcx>,
+    ) -> &'tcx Self {
+        Self::from_const_value(tcx, ConstValue::from_byval_value(val), ty)
+    }
+
+    #[inline]
+    pub fn from_primval(
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        val: PrimVal,
+        ty: Ty<'tcx>,
+    ) -> &'tcx Self {
+        Self::from_const_value(tcx, ConstValue::from_primval(val), ty)
+    }
+
+    #[inline]
+    pub fn from_bits(
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        val: u128,
+        ty: Ty<'tcx>,
+    ) -> &'tcx Self {
+        Self::from_primval(tcx, PrimVal::Bytes(val), ty)
+    }
+
+    #[inline]
+    pub fn zero_sized(tcx: TyCtxt<'_, '_, 'tcx>, ty: Ty<'tcx>) -> &'tcx Self {
+        Self::from_primval(tcx, PrimVal::Undef, ty)
+    }
+
+    #[inline]
+    pub fn from_bool(tcx: TyCtxt<'_, '_, 'tcx>, v: bool) -> &'tcx Self {
+        Self::from_bits(tcx, v as u128, tcx.types.bool)
+    }
+
+    #[inline]
+    pub fn from_usize(tcx: TyCtxt<'_, '_, 'tcx>, n: u64) -> &'tcx Self {
+        Self::from_bits(tcx, n as u128, tcx.types.usize)
+    }
+
+    #[inline]
+    pub fn to_bits(&self, ty: Ty<'_>) -> Option<u128> {
+        if self.ty != ty {
+            return None;
+        }
+        match self.val {
+            ConstVal::Value(val) => val.to_bits(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn to_ptr(&self) -> Option<MemoryPointer> {
+        match self.val {
+            ConstVal::Value(val) => val.to_ptr(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn to_primval(&self) -> Option<PrimVal> {
+        match self.val {
+            ConstVal::Value(val) => val.to_primval(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn assert_bits(&self, ty: Ty<'_>) -> Option<u128> {
+        assert_eq!(self.ty, ty);
+        match self.val {
+            ConstVal::Value(val) => val.to_bits(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn assert_bool(&self, tcx: TyCtxt<'_, '_, '_>) -> Option<bool> {
+        self.assert_bits(tcx.types.bool).and_then(|v| match v {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        })
+    }
+
+    #[inline]
+    pub fn assert_usize(&self, tcx: TyCtxt<'_, '_, '_>) -> Option<u64> {
+        self.assert_bits(tcx.types.usize).map(|v| v as u64)
+    }
+
+    #[inline]
+    pub fn unwrap_bits(&self, ty: Ty<'_>) -> u128 {
+        match self.assert_bits(ty) {
+            Some(val) => val,
+            None => bug!("expected bits of {}, got {:#?}", ty, self),
+        }
+    }
+
+    #[inline]
+    pub fn unwrap_usize(&self, tcx: TyCtxt<'_, '_, '_>) -> u64 {
+        match self.assert_usize(tcx) {
+            Some(val) => val,
+            None => bug!("expected constant usize, got {:#?}", self),
+        }
+    }
 }
 
 impl<'tcx> serialize::UseSpecializedDecodable for &'tcx Const<'tcx> {}

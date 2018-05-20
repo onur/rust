@@ -221,7 +221,7 @@ pub enum Endian {
 }
 
 /// Size of a type in bytes.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub struct Size {
     raw: u64
 }
@@ -326,9 +326,9 @@ impl AddAssign for Size {
 }
 
 /// Alignment of a type in bytes, both ABI-mandated and preferred.
-/// Each field is a power of two, giving the alignment a maximum value of
-/// 2<sup>(2<sup>8</sup> - 1)</sup>, which is limited by LLVM to a i32,
-/// with a maximum capacity of 2<sup>31</sup> - 1 or 2147483647.
+/// Each field is a power of two, giving the alignment a maximum value
+/// of 2<sup>(2<sup>8</sup> - 1)</sup>, which is limited by LLVM to a
+/// maximum capacity of 2<sup>29</sup> or 536870912.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub struct Align {
     abi_pow2: u8,
@@ -356,7 +356,7 @@ impl Align {
             }
             if bytes != 1 {
                 Err(format!("`{}` is not a power of 2", align))
-            } else if pow > 30 {
+            } else if pow > 29 {
                 Err(format!("`{}` is too large", align))
             } else {
                 Ok(pow)
@@ -716,10 +716,10 @@ pub enum Variants {
     },
 
     /// General-case enums: for each case there is a struct, and they all have
-    /// all space reserved for the discriminant, and their first field starts
-    /// at a non-0 offset, after where the discriminant would go.
+    /// all space reserved for the tag, and their first field starts
+    /// at a non-0 offset, after where the tag would go.
     Tagged {
-        discr: Scalar,
+        tag: Scalar,
         variants: Vec<LayoutDetails>,
     },
 
@@ -759,17 +759,6 @@ impl LayoutDetails {
             abi: Abi::Scalar(scalar),
             size,
             align,
-        }
-    }
-
-    pub fn uninhabited(field_count: usize) -> Self {
-        let align = Align::from_bytes(1, 1).unwrap();
-        LayoutDetails {
-            variants: Variants::Single { index: 0 },
-            fields: FieldPlacement::Union(field_count),
-            abi: Abi::Uninhabited,
-            align,
-            size: Size::from_bytes(0)
         }
     }
 }
@@ -826,10 +815,10 @@ impl<'a, Ty> TyLayout<'a, Ty> {
     /// Returns true if the type is a ZST and not unsized.
     pub fn is_zst(&self) -> bool {
         match self.abi {
-            Abi::Uninhabited => true,
             Abi::Scalar(_) |
             Abi::ScalarPair(..) |
             Abi::Vector { .. } => false,
+            Abi::Uninhabited => self.size.bytes() == 0,
             Abi::Aggregate { sized } => sized && self.size.bytes() == 0
         }
     }

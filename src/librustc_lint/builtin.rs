@@ -46,7 +46,7 @@ use syntax::attr;
 use syntax::feature_gate::{AttributeGate, AttributeType, Stability, deprecated_attributes};
 use syntax_pos::{BytePos, Span, SyntaxContext};
 use syntax::symbol::keywords;
-use syntax::errors::DiagnosticBuilder;
+use syntax::errors::{Applicability, DiagnosticBuilder};
 
 use rustc::hir::{self, PatKind};
 use rustc::hir::intravisit::FnKind;
@@ -228,7 +228,7 @@ impl UnsafeCode {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnsafeCode {
     fn check_expr(&mut self, cx: &LateContext, e: &hir::Expr) {
-        if let hir::ExprBlock(ref blk) = e.node {
+        if let hir::ExprBlock(ref blk, _) = e.node {
             // Don't warn about generated blocks, that'll just pollute the output.
             if blk.rules == hir::UnsafeBlock(hir::UserProvided) {
                 self.report_unsafe(cx, blk.span, "usage of an `unsafe` block");
@@ -541,7 +541,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MissingCopyImplementations {
         if !ty.moves_by_default(cx.tcx, param_env, item.span) {
             return;
         }
-        if param_env.can_type_implement_copy(cx.tcx, ty, item.span).is_ok() {
+        if param_env.can_type_implement_copy(cx.tcx, ty).is_ok() {
             cx.span_lint(MISSING_COPY_IMPLEMENTATIONS,
                          item.span,
                          "type could implement `Copy`; consider adding `impl \
@@ -675,9 +675,8 @@ impl LintPass for DeprecatedAttr {
 
 impl EarlyLintPass for DeprecatedAttr {
     fn check_attribute(&mut self, cx: &EarlyContext, attr: &ast::Attribute) {
-        let name = unwrap_or!(attr.name(), return);
         for &&(n, _, ref g) in &self.depr_attrs {
-            if name == n {
+            if attr.name() == n {
                 if let &AttributeGate::Gated(Stability::Deprecated(link),
                                              ref name,
                                              ref reason,
@@ -1174,9 +1173,9 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MutableTransmutes {
         let msg = "mutating transmuted &mut T from &T may cause undefined behavior, \
                    consider instead using an UnsafeCell";
         match get_transmute_from_to(cx, expr) {
-            Some((&ty::TyRef(_, from_mt), &ty::TyRef(_, to_mt))) => {
-                if to_mt.mutbl == hir::Mutability::MutMutable &&
-                   from_mt.mutbl == hir::Mutability::MutImmutable {
+            Some((&ty::TyRef(_, _, from_mt), &ty::TyRef(_, _, to_mt))) => {
+                if to_mt == hir::Mutability::MutMutable &&
+                   from_mt == hir::Mutability::MutImmutable {
                     cx.span_lint(MUTABLE_TRANSMUTES, expr.span, msg);
                 }
             }
@@ -1288,20 +1287,27 @@ impl LintPass for UnreachablePub {
 
 impl UnreachablePub {
     fn perform_lint(&self, cx: &LateContext, what: &str, id: ast::NodeId,
-                    vis: &hir::Visibility, span: Span, exportable: bool) {
+                    vis: &hir::Visibility, span: Span, exportable: bool,
+                    mut applicability: Applicability) {
         if !cx.access_levels.is_reachable(id) && *vis == hir::Visibility::Public {
+            if span.ctxt().outer().expn_info().is_some() {
+                applicability = Applicability::MaybeIncorrect;
+            }
             let def_span = cx.tcx.sess.codemap().def_span(span);
             let mut err = cx.struct_span_lint(UNREACHABLE_PUB, def_span,
                                               &format!("unreachable `pub` {}", what));
-            // visibility is token at start of declaration (can be macro
-            // variable rather than literal `pub`)
+            // We are presuming that visibility is token at start of
+            // declaration (can be macro variable rather than literal `pub`)
             let pub_span = cx.tcx.sess.codemap().span_until_char(def_span, ' ');
             let replacement = if cx.tcx.features().crate_visibility_modifier {
                 "crate"
             } else {
                 "pub(crate)"
             }.to_owned();
-            err.span_suggestion(pub_span, "consider restricting its visibility", replacement);
+            err.span_suggestion_with_applicability(pub_span,
+                                                   "consider restricting its visibility",
+                                                   replacement,
+                                                   applicability);
             if exportable {
                 err.help("or consider exporting it for use by other crates");
             }
@@ -1310,21 +1316,31 @@ impl UnreachablePub {
     }
 }
 
+
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnreachablePub {
     fn check_item(&mut self, cx: &LateContext, item: &hir::Item) {
-        self.perform_lint(cx, "item", item.id, &item.vis, item.span, true);
+        let applicability = match item.node {
+            // suggestion span-manipulation is inadequate for `pub use
+            // module::{item}` (Issue #50455)
+            hir::ItemUse(..) => Applicability::MaybeIncorrect,
+            _ => Applicability::MachineApplicable,
+        };
+        self.perform_lint(cx, "item", item.id, &item.vis, item.span, true, applicability);
     }
 
     fn check_foreign_item(&mut self, cx: &LateContext, foreign_item: &hir::ForeignItem) {
-        self.perform_lint(cx, "item", foreign_item.id, &foreign_item.vis, foreign_item.span, true);
+        self.perform_lint(cx, "item", foreign_item.id, &foreign_item.vis,
+                          foreign_item.span, true, Applicability::MachineApplicable);
     }
 
     fn check_struct_field(&mut self, cx: &LateContext, field: &hir::StructField) {
-        self.perform_lint(cx, "field", field.id, &field.vis, field.span, false);
+        self.perform_lint(cx, "field", field.id, &field.vis, field.span, false,
+                          Applicability::MachineApplicable);
     }
 
     fn check_impl_item(&mut self, cx: &LateContext, impl_item: &hir::ImplItem) {
-        self.perform_lint(cx, "item", impl_item.id, &impl_item.vis, impl_item.span, false);
+        self.perform_lint(cx, "item", impl_item.id, &impl_item.vis, impl_item.span, false,
+                          Applicability::MachineApplicable);
     }
 }
 
@@ -1506,6 +1522,130 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedBrokenConst {
                 ty
             ),
             _ => {},
+        }
+    }
+}
+
+declare_lint! {
+    pub UNNECESSARY_EXTERN_CRATE,
+    Allow,
+    "suggest removing `extern crate` for the 2018 edition"
+}
+
+pub struct ExternCrate(/* depth */ u32);
+
+impl ExternCrate {
+    pub fn new() -> Self {
+        ExternCrate(0)
+    }
+}
+
+impl LintPass for ExternCrate {
+    fn get_lints(&self) -> LintArray {
+        lint_array!(UNNECESSARY_EXTERN_CRATE)
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for ExternCrate {
+    fn check_item(&mut self, cx: &LateContext, it: &hir::Item) {
+        if !cx.tcx.features().extern_absolute_paths {
+            return
+        }
+        if let hir::ItemExternCrate(ref orig) =  it.node {
+            if it.attrs.iter().any(|a| a.check_name("macro_use")) {
+                return
+            }
+            let mut err = cx.struct_span_lint(UNNECESSARY_EXTERN_CRATE,
+                it.span, "`extern crate` is unnecessary in the new edition");
+            if it.vis == hir::Visibility::Public || self.0 > 1 || orig.is_some() {
+                let pub_ = if it.vis == hir::Visibility::Public {
+                    "pub "
+                } else {
+                    ""
+                };
+
+                let help = format!("use `{}use`", pub_);
+
+                if let Some(orig) = orig {
+                    err.span_suggestion(it.span, &help,
+                        format!("{}use {} as {};", pub_, orig, it.name));
+                } else {
+                    err.span_suggestion(it.span, &help,
+                        format!("{}use {};", pub_, it.name));
+                }
+            } else {
+                err.span_suggestion(it.span, "remove it", "".into());
+            }
+
+            err.emit();
+        }
+    }
+
+    fn check_mod(&mut self, _: &LateContext, _: &hir::Mod,
+                 _: Span, _: ast::NodeId) {
+        self.0 += 1;
+    }
+
+    fn check_mod_post(&mut self, _: &LateContext, _: &hir::Mod,
+                      _: Span, _: ast::NodeId) {
+        self.0 += 1;
+    }
+}
+
+/// Lint for trait and lifetime bounds that don't depend on type parameters
+/// which either do nothing, or stop the item from being used.
+pub struct TrivialConstraints;
+
+declare_lint! {
+    TRIVIAL_BOUNDS,
+    Warn,
+    "these bounds don't depend on an type parameters"
+}
+
+impl LintPass for TrivialConstraints {
+    fn get_lints(&self) -> LintArray {
+        lint_array!(TRIVIAL_BOUNDS)
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TrivialConstraints {
+    fn check_item(
+        &mut self,
+        cx: &LateContext<'a, 'tcx>,
+        item: &'tcx hir::Item,
+    ) {
+        use rustc::ty::fold::TypeFoldable;
+        use rustc::ty::Predicate::*;
+
+
+        if cx.tcx.features().trivial_bounds {
+            let def_id = cx.tcx.hir.local_def_id(item.id);
+            let predicates = cx.tcx.predicates_of(def_id);
+            for predicate in &predicates.predicates {
+                let predicate_kind_name = match *predicate {
+                    Trait(..) => "Trait",
+                    TypeOutlives(..) |
+                    RegionOutlives(..) => "Lifetime",
+
+                    // Ignore projections, as they can only be global
+                    // if the trait bound is global
+                    Projection(..) |
+                    // Ignore bounds that a user can't type
+                    WellFormed(..) |
+                    ObjectSafe(..) |
+                    ClosureKind(..) |
+                    Subtype(..) |
+                    ConstEvaluatable(..) => continue,
+                };
+                if predicate.is_global() {
+                    cx.span_lint(
+                        TRIVIAL_BOUNDS,
+                        item.span,
+                        &format!("{} bound {} does not depend on any type \
+                                or lifetime parameters", predicate_kind_name, predicate),
+                    );
+                }
+            }
         }
     }
 }

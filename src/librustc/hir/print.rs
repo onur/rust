@@ -13,7 +13,7 @@ pub use self::AnnNode::*;
 use rustc_target::spec::abi::Abi;
 use syntax::ast;
 use syntax::codemap::{CodeMap, Spanned};
-use syntax::parse::{token, ParseSess};
+use syntax::parse::ParseSess;
 use syntax::parse::lexer::comments;
 use syntax::print::pp::{self, Breaks};
 use syntax::print::pp::Breaks::{Consistent, Inconsistent};
@@ -1047,7 +1047,7 @@ impl<'a> State<'a> {
                         self.print_else(e.as_ref().map(|e| &**e))
                     }
                     // "final else"
-                    hir::ExprBlock(ref b) => {
+                    hir::ExprBlock(ref b, _) => {
                         self.cbox(indent_unit - 1)?;
                         self.ibox(0)?;
                         self.s.word(" else ")?;
@@ -1377,7 +1377,11 @@ impl<'a> State<'a> {
                 // empty box to satisfy the close.
                 self.ibox(0)?;
             }
-            hir::ExprBlock(ref blk) => {
+            hir::ExprBlock(ref blk, opt_label) => {
+                if let Some(label) = opt_label {
+                    self.print_name(label.name)?;
+                    self.word_space(":")?;
+                }
                 // containing cbox, will be closed by print-block at }
                 self.cbox(indent_unit)?;
                 // head-box, will be closed by print-block after {
@@ -1555,7 +1559,7 @@ impl<'a> State<'a> {
     }
 
     pub fn print_name(&mut self, name: ast::Name) -> io::Result<()> {
-        if token::is_raw_guess(ast::Ident::with_empty_ctxt(name)) {
+        if name.to_ident().is_raw_guess() {
             self.s.word(&format!("r#{}", name))?;
         } else {
             self.s.word(&name.as_str())?;
@@ -1893,7 +1897,11 @@ impl<'a> State<'a> {
         self.word_space("=>")?;
 
         match arm.body.node {
-            hir::ExprBlock(ref blk) => {
+            hir::ExprBlock(ref blk, opt_label) => {
+                if let Some(label) = opt_label {
+                    self.print_name(label.name)?;
+                    self.word_space(":")?;
+                }
                 // the block will close the pattern's ibox
                 self.print_block_unclosed_indent(&blk, indent_unit)?;
 
@@ -2299,7 +2307,7 @@ fn expr_requires_semi_to_be_stmt(e: &hir::Expr) -> bool {
     match e.node {
         hir::ExprIf(..) |
         hir::ExprMatch(..) |
-        hir::ExprBlock(_) |
+        hir::ExprBlock(..) |
         hir::ExprWhile(..) |
         hir::ExprLoop(..) => false,
         _ => true,

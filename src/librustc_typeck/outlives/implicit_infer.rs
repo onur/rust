@@ -149,8 +149,8 @@ fn insert_required_predicates_to_be_wf<'tcx>(
             // a predicate requirement of T: 'a (T outlives 'a).
             //
             // We also want to calculate potential predicates for the T
-            ty::TyRef(region, mt) => {
-                insert_outlives_predicate(tcx, mt.ty.into(), region, required_predicates);
+            ty::TyRef(region, rty, _) => {
+                insert_outlives_predicate(tcx, rty.into(), region, required_predicates);
             }
 
             // For each TyAdt (struct/enum/union) type `Foo<'a, T>`, we
@@ -353,7 +353,7 @@ fn insert_outlives_predicate<'tcx>(
                         // Vec<U>`.  Decomposing `Vec<U>` into
                         // components would yield `U`, and we add the
                         // where clause that `U: 'a`.
-                        let ty: Ty<'tcx> = tcx.mk_param(param_ty.idx, param_ty.name);
+                        let ty: Ty<'tcx> = tcx.mk_ty_param(param_ty.idx, param_ty.name);
                         required_predicates
                             .insert(ty::OutlivesPredicate(ty.into(), outlived_region));
                     }

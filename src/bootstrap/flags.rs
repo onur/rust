@@ -19,7 +19,7 @@ use std::process;
 
 use getopts::Options;
 
-use Build;
+use {Build, DocTests};
 use config::Config;
 use metadata;
 use builder::Builder;
@@ -59,10 +59,12 @@ pub enum Subcommand {
     },
     Test {
         paths: Vec<PathBuf>,
+        /// Whether to automatically update stderr/stdout files
+        bless: bool,
         test_args: Vec<String>,
         rustc_args: Vec<String>,
         fail_fast: bool,
-        doc_tests: bool,
+        doc_tests: DocTests,
     },
     Bench {
         paths: Vec<PathBuf>,
@@ -171,7 +173,9 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`");
                     "extra options to pass the compiler when running tests",
                     "ARGS",
                 );
-                opts.optflag("", "doc", "run doc tests");
+                opts.optflag("", "no-doc", "do not run doc tests");
+                opts.optflag("", "doc", "only run doc tests");
+                opts.optflag("", "bless", "update all stderr/stdout files of failing ui tests");
             },
             "bench" => { opts.optmulti("", "test-args", "extra arguments", "ARGS"); },
             "clean" => { opts.optflag("", "all", "clean all build artifacts"); },
@@ -257,6 +261,7 @@ Arguments:
         ./x.py test src/test/run-pass
         ./x.py test src/libstd --test-args hash_map
         ./x.py test src/libstd --stage 0
+        ./x.py test src/test/ui --bless
 
     If no arguments are passed then the complete artifacts for that stage are
     compiled and tested.
@@ -321,10 +326,17 @@ Arguments:
             "test" => {
                 Subcommand::Test {
                     paths,
+                    bless: matches.opt_present("bless"),
                     test_args: matches.opt_strs("test-args"),
                     rustc_args: matches.opt_strs("rustc-args"),
                     fail_fast: !matches.opt_present("no-fail-fast"),
-                    doc_tests: matches.opt_present("doc"),
+                    doc_tests: if matches.opt_present("doc") {
+                        DocTests::Only
+                    } else if matches.opt_present("no-doc") {
+                        DocTests::No
+                    } else {
+                        DocTests::Yes
+                    }
                 }
             }
             "bench" => {
@@ -411,9 +423,16 @@ impl Subcommand {
         }
     }
 
-    pub fn doc_tests(&self) -> bool {
+    pub fn doc_tests(&self) -> DocTests {
         match *self {
             Subcommand::Test { doc_tests, .. } => doc_tests,
+            _ => DocTests::Yes,
+        }
+    }
+
+    pub fn bless(&self) -> bool {
+        match *self {
+            Subcommand::Test { bless, .. } => bless,
             _ => false,
         }
     }

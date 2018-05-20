@@ -122,12 +122,9 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
 
         match *match_pair.pattern.kind {
             PatternKind::Constant { value } => {
-                // if the places match, the type should match
-                assert_eq!(match_pair.pattern.ty, switch_ty);
-
                 indices.entry(value)
                        .or_insert_with(|| {
-                           options.push(value.val.to_raw_bits().expect("switching on int"));
+                           options.push(value.unwrap_bits(switch_ty));
                            options.len() - 1
                        });
                 true
@@ -276,7 +273,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                     // array, so we can call `<[u8]>::eq` rather than having to find an
                     // `<[u8; N]>::eq`.
                     let unsize = |ty: Ty<'tcx>| match ty.sty {
-                        ty::TyRef(region, tam) => match tam.ty.sty {
+                        ty::TyRef(region, rty, _) => match rty.sty {
                             ty::TyArray(inner_ty, n) => Some((region, inner_ty, n)),
                             _ => None,
                         },

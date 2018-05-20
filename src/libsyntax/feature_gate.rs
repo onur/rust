@@ -190,7 +190,7 @@ declare_features! (
     (active, rustc_attrs, "1.0.0", Some(29642), None),
 
     // Allows the use of non lexical lifetimes; RFC 2094
-    (active, nll, "1.0.0", Some(43234), Some(Edition::Edition2018)),
+    (active, nll, "1.0.0", Some(43234), None),
 
     // Allows the use of #[allow_internal_unstable]. This is an
     // attribute on macro_rules! and can't use the attribute handling
@@ -300,7 +300,7 @@ declare_features! (
     (active, abi_unadjusted, "1.16.0", None, None),
 
     // Procedural macros 2.0.
-    (active, proc_macro, "1.16.0", Some(38356), None),
+    (active, proc_macro, "1.16.0", Some(38356), Some(Edition::Edition2018)),
 
     // Declarative macros 2.0 (`macro`).
     (active, decl_macro, "1.17.0", Some(39412), None),
@@ -324,7 +324,7 @@ declare_features! (
 
 
     // Allows the `catch {...}` expression
-    (active, catch_expr, "1.17.0", Some(31436), None),
+    (active, catch_expr, "1.17.0", Some(31436), Some(Edition::Edition2018)),
 
     // Used to preserve symbols (see llvm.used)
     (active, used, "1.18.0", Some(40289), None),
@@ -396,9 +396,6 @@ declare_features! (
     // Termination trait in tests (RFC 1937)
     (active, termination_trait_test, "1.24.0", Some(48854), Some(Edition::Edition2018)),
 
-    // Allows use of the :lifetime macro fragment specifier
-    (active, macro_lifetime_matcher, "1.24.0", Some(46895), None),
-
     // `extern` in paths
     (active, extern_in_paths, "1.23.0", Some(44660), None),
 
@@ -454,12 +451,25 @@ declare_features! (
     (active, proc_macro_mod, "1.27.0", None, None),
     (active, proc_macro_expr, "1.27.0", None, None),
     (active, proc_macro_non_items, "1.27.0", None, None),
+    (active, proc_macro_gen, "1.27.0", None, None),
 
     // #[doc(alias = "...")]
     (active, doc_alias, "1.27.0", Some(50146), None),
 
     // Access to crate names passed via `--extern` through prelude
     (active, extern_prelude, "1.27.0", Some(44660), Some(Edition::Edition2018)),
+
+    // Scoped attributes
+    (active, tool_attributes, "1.25.0", Some(44690), None),
+
+    // Allows use of the :literal macro fragment specifier (RFC 1576)
+    (active, macro_literal_matcher, "1.27.0", Some(35625), None),
+
+    // inconsistent bounds in where clauses
+    (active, trivial_bounds, "1.28.0", Some(48214), None),
+
+    // 'a: { break 'a; }
+    (active, label_break_value, "1.28.0", Some(48594), None),
 );
 
 declare_features! (
@@ -592,6 +602,8 @@ declare_features! (
     (accepted, dyn_trait, "1.27.0", Some(44662), None),
     // allow `#[must_use]` on functions; and, must-use operators (RFC 1940)
     (accepted, fn_must_use, "1.27.0", Some(43302), None),
+    // Allows use of the :lifetime macro fragment specifier
+    (accepted, macro_lifetime_matcher, "1.27.0", Some(34303), None),
 );
 
 // If you change this, please modify src/doc/unstable-book as well. You must
@@ -828,7 +840,7 @@ pub const BUILTIN_ATTRIBUTES: &'static [(&'static str, AttributeType, AttributeG
                                                    is just used for rustc unit tests \
                                                    and will never be stable",
                                                   cfg_fn!(rustc_attrs))),
-    ("rustc_partition_translated", Whitelisted, Gated(Stability::Unstable,
+    ("rustc_partition_codegened", Whitelisted, Gated(Stability::Unstable,
                                                       "rustc_attrs",
                                                       "this attribute \
                                                        is just used for rustc unit tests \
@@ -927,7 +939,7 @@ pub const BUILTIN_ATTRIBUTES: &'static [(&'static str, AttributeType, AttributeG
     // FIXME: #14408 whitelist docs since rustdoc looks at them
     ("doc", Whitelisted, Ungated),
 
-    // FIXME: #14406 these are processed in trans, which happens after the
+    // FIXME: #14406 these are processed in codegen, which happens after the
     // lint pass
     ("cold", Whitelisted, Ungated),
     ("naked", Whitelisted, Gated(Stability::Unstable,
@@ -1079,7 +1091,7 @@ pub struct GatedCfg {
 
 impl GatedCfg {
     pub fn gate(cfg: &ast::MetaItem) -> Option<GatedCfg> {
-        let name = cfg.ident.name.as_str();
+        let name = cfg.name().as_str();
         GATED_CFGS.iter()
                   .position(|info| info.0 == name)
                   .map(|idx| {
@@ -1132,7 +1144,7 @@ macro_rules! gate_feature {
 impl<'a> Context<'a> {
     fn check_attribute(&self, attr: &ast::Attribute, is_macro: bool) {
         debug!("check_attribute(attr = {:?})", attr);
-        let name = unwrap_or!(attr.name(), return).as_str();
+        let name = attr.name().as_str();
         for &(n, ty, ref gateage) in BUILTIN_ATTRIBUTES {
             if name == n {
                 if let Gated(_, name, desc, ref has_feature) = *gateage {
@@ -1172,12 +1184,28 @@ impl<'a> Context<'a> {
             // before the plugin attributes are registered
             // so we skip this then
             if !is_macro {
-                gate_feature!(self, custom_attribute, attr.span,
-                              &format!("The attribute `{}` is currently \
-                                        unknown to the compiler and \
-                                        may have meaning \
-                                        added to it in the future",
-                                       attr.path));
+                if attr.is_scoped() {
+                    gate_feature!(self, tool_attributes, attr.span,
+                                  &format!("scoped attribute `{}` is experimental", attr.path));
+                    if attr::is_known_tool(attr) {
+                        attr::mark_used(attr);
+                    } else {
+                        span_err!(
+                            self.parse_sess.span_diagnostic,
+                            attr.span,
+                            E0694,
+                            "an unknown tool name found in scoped attribute: `{}`.",
+                            attr.path
+                        );
+                    }
+                } else {
+                    gate_feature!(self, custom_attribute, attr.span,
+                                  &format!("The attribute `{}` is currently \
+                                            unknown to the compiler and \
+                                            may have meaning \
+                                            added to it in the future",
+                                           attr.path));
+                }
             }
         }
     }
@@ -1309,8 +1337,8 @@ pub const EXPLAIN_DERIVE_UNDERSCORE: &'static str =
 pub const EXPLAIN_VIS_MATCHER: &'static str =
     ":vis fragment specifier is experimental and subject to change";
 
-pub const EXPLAIN_LIFETIME_MATCHER: &'static str =
-    ":lifetime fragment specifier is experimental and subject to change";
+pub const EXPLAIN_LITERAL_MATCHER: &'static str =
+    ":literal fragment specifier is experimental and subject to change";
 
 pub const EXPLAIN_UNSIZED_TUPLE_COERCION: &'static str =
     "Unsized tuple coercion is not stable enough for use and is subject to change";
@@ -1672,6 +1700,12 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                                     "multiple patterns in `if let` and `while let` are unstable");
                 }
             }
+            ast::ExprKind::Block(_, opt_label) => {
+                if let Some(label) = opt_label {
+                    gate_feature_post!(&self, label_break_value, label.ident.span,
+                                    "labels on blocks are unstable");
+                }
+            }
             _ => {}
         }
         visit::walk_expr(self, e);
@@ -1829,61 +1863,74 @@ pub fn get_features(span_handler: &Handler, krate_attrs: &[ast::Attribute],
 
     let mut feature_checker = FeatureChecker::default();
 
+    for &(.., f_edition, set) in ACTIVE_FEATURES.iter() {
+        if let Some(f_edition) = f_edition {
+            if f_edition <= crate_edition {
+                set(&mut features, DUMMY_SP);
+            }
+        }
+    }
+
     for attr in krate_attrs {
         if !attr.check_name("feature") {
             continue
         }
 
-        match attr.meta_item_list() {
+        let list = match attr.meta_item_list() {
+            Some(list) => list,
             None => {
                 span_err!(span_handler, attr.span, E0555,
                           "malformed feature attribute, expected #![feature(...)]");
+                continue
             }
-            Some(list) => {
-                for mi in list {
+        };
 
-                    let name = if let Some(word) = mi.word() {
-                        word.ident.name
-                    } else {
-                        span_err!(span_handler, mi.span, E0556,
-                                  "malformed feature, expected just one word");
-                        continue
-                    };
+        for mi in list {
+            let name = if let Some(word) = mi.word() {
+                word.name()
+            } else {
+                span_err!(span_handler, mi.span, E0556,
+                          "malformed feature, expected just one word");
+                continue
+            };
 
-                    if let Some(&(_, _, _, _, set)) = ACTIVE_FEATURES.iter()
-                        .find(|& &(n, ..)| name == n) {
-                        set(&mut features, mi.span);
-                        feature_checker.collect(&features, mi.span);
-                    }
-                    else if let Some(&(.., reason)) = REMOVED_FEATURES.iter()
-                            .find(|& &(n, ..)| name == n)
-                        .or_else(|| STABLE_REMOVED_FEATURES.iter()
-                            .find(|& &(n, ..)| name == n)) {
-                        feature_removed(span_handler, mi.span, reason);
-                    }
-                    else if let Some(&(..)) = ACCEPTED_FEATURES.iter()
-                        .find(|& &(n, ..)| name == n) {
-                        features.declared_stable_lang_features.push((name, mi.span));
-                    } else if let Some(&edition) = ALL_EDITIONS.iter()
-                                                              .find(|e| name == e.feature_name()) {
-                        if edition <= crate_edition {
-                            feature_removed(span_handler, mi.span, None);
-                        } else {
-                            for &(.., f_edition, set) in ACTIVE_FEATURES.iter() {
-                                if let Some(f_edition) = f_edition {
-                                    if edition >= f_edition {
-                                        // FIXME(Manishearth) there is currently no way to set
-                                        // lib features by edition
-                                        set(&mut features, DUMMY_SP);
-                                    }
-                                }
-                            }
+            if let Some((.., set)) = ACTIVE_FEATURES.iter().find(|f| name == f.0) {
+                set(&mut features, mi.span);
+                feature_checker.collect(&features, mi.span);
+                continue
+            }
+
+            let removed = REMOVED_FEATURES.iter().find(|f| name == f.0);
+            let stable_removed = STABLE_REMOVED_FEATURES.iter().find(|f| name == f.0);
+            if let Some((.., reason)) = removed.or(stable_removed) {
+                feature_removed(span_handler, mi.span, *reason);
+                continue
+            }
+
+            if ACCEPTED_FEATURES.iter().any(|f| name == f.0) {
+                features.declared_stable_lang_features.push((name, mi.span));
+                continue
+            }
+
+            if let Some(edition) = ALL_EDITIONS.iter().find(|e| name == e.feature_name()) {
+                if *edition <= crate_edition {
+                    continue
+                }
+
+                for &(.., f_edition, set) in ACTIVE_FEATURES.iter() {
+                    if let Some(f_edition) = f_edition {
+                        if *edition >= f_edition {
+                            // FIXME(Manishearth) there is currently no way to set
+                            // lib features by edition
+                            set(&mut features, DUMMY_SP);
                         }
-                    } else {
-                        features.declared_lib_features.push((name, mi.span));
                     }
                 }
+
+                continue
             }
+
+            features.declared_lib_features.push((name, mi.span));
         }
     }
 

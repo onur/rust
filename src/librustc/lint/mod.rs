@@ -16,15 +16,15 @@
 //! other phases of the compiler, which are generally required to hold in order
 //! to compile the program at all.
 //!
-//! Most lints can be written as `LintPass` instances. These run just before
-//! translation to LLVM bytecode. The `LintPass`es built into rustc are defined
+//! Most lints can be written as `LintPass` instances. These run after
+//! all other analyses. The `LintPass`es built into rustc are defined
 //! within `builtin.rs`, which has further comments on how to add such a lint.
 //! rustc can also load user-defined lint plugins via the plugin mechanism.
 //!
 //! Some of rustc's lints are defined elsewhere in the compiler and work by
 //! calling `add_lint()` on the overall `Session` object. This works when
 //! it happens before the main lint pass, which emits the lints stored by
-//! `add_lint()`. To emit lints after the main lint pass (from trans, for
+//! `add_lint()`. To emit lints after the main lint pass (from codegen, for
 //! example) requires more effort. See `emit_lint` and `GatherNodeLevels`
 //! in `context.rs`.
 
@@ -507,7 +507,7 @@ pub fn struct_lint_level<'a>(sess: &'a Session,
 
         let explanation = if lint_id == LintId::of(::lint::builtin::UNSTABLE_NAME_COLLISION) {
             "once this method is added to the standard library, \
-             there will be ambiguity here, which will cause a hard error!"
+             the ambiguity may cause an error or change in behavior!"
                 .to_owned()
         } else if let Some(edition) = future_incompatible.edition {
             format!("{} in the {} edition!", STANDARD_MESSAGE, edition)

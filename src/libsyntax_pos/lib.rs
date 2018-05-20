@@ -20,6 +20,7 @@
 
 #![feature(const_fn)]
 #![feature(custom_attribute)]
+#![feature(non_exhaustive)]
 #![feature(optin_builtin_traits)]
 #![allow(unused_attributes)]
 #![feature(specialization)]
@@ -35,6 +36,7 @@ use std::path::PathBuf;
 use rustc_data_structures::stable_hasher::StableHasher;
 use rustc_data_structures::sync::{Lrc, Lock};
 
+extern crate arena;
 extern crate rustc_data_structures;
 
 #[macro_use]
@@ -47,6 +49,7 @@ extern crate serialize as rustc_serialize; // used by deriving
 
 extern crate unicode_width;
 
+pub mod edition;
 pub mod hygiene;
 pub use hygiene::{Mark, SyntaxContext, ExpnInfo, ExpnFormat, NameAndSpan, CompilerDesugaringKind};
 
@@ -297,6 +300,12 @@ impl Span {
         self.ctxt().outer().expn_info().map(|i| i.call_site)
     }
 
+    /// Edition of the crate from which this span came.
+    pub fn edition(self) -> edition::Edition {
+        self.ctxt().outer().expn_info().map_or_else(|| hygiene::default_edition(),
+                                                    |einfo| einfo.callee.edition)
+    }
+
     /// Return the source callee.
     ///
     /// Returns None if the supplied span has no expansion trace,
@@ -425,6 +434,13 @@ impl Span {
             end.lo,
             if end.ctxt == SyntaxContext::empty() { end.ctxt } else { span.ctxt },
         )
+    }
+
+    pub fn from_inner_byte_pos(self, start: usize, end: usize) -> Span {
+        let span = self.data();
+        Span::new(span.lo + BytePos::from_usize(start),
+                  span.lo + BytePos::from_usize(end),
+                  span.ctxt)
     }
 
     #[inline]
@@ -970,6 +986,15 @@ impl FileMap {
         lines.push(pos);
     }
 
+    /// Return the BytePos of the beginning of the current line.
+    pub fn line_begin_pos(&self) -> BytePos {
+        let lines = self.lines.borrow();
+        match lines.last() {
+            Some(&line_pos) => line_pos,
+            None => self.start_pos,
+        }
+    }
+
     /// Add externally loaded source.
     /// If the hash of the input doesn't match or no input is supplied via None,
     /// it is interpreted as an error and the corresponding enum variant is set.
@@ -1046,6 +1071,7 @@ impl FileMap {
         self.multibyte_chars.borrow_mut().push(mbc);
     }
 
+    #[inline]
     pub fn record_width(&self, pos: BytePos, ch: char) {
         let width = match ch {
             '\t' =>
@@ -1150,13 +1176,17 @@ pub struct CharPos(pub usize);
 // have been unsuccessful
 
 impl Pos for BytePos {
+    #[inline(always)]
     fn from_usize(n: usize) -> BytePos { BytePos(n as u32) }
+
+    #[inline(always)]
     fn to_usize(&self) -> usize { let BytePos(n) = *self; n as usize }
 }
 
 impl Add for BytePos {
     type Output = BytePos;
 
+    #[inline(always)]
     fn add(self, rhs: BytePos) -> BytePos {
         BytePos((self.to_usize() + rhs.to_usize()) as u32)
     }
@@ -1165,6 +1195,7 @@ impl Add for BytePos {
 impl Sub for BytePos {
     type Output = BytePos;
 
+    #[inline(always)]
     fn sub(self, rhs: BytePos) -> BytePos {
         BytePos((self.to_usize() - rhs.to_usize()) as u32)
     }
@@ -1183,13 +1214,17 @@ impl Decodable for BytePos {
 }
 
 impl Pos for CharPos {
+    #[inline(always)]
     fn from_usize(n: usize) -> CharPos { CharPos(n) }
+
+    #[inline(always)]
     fn to_usize(&self) -> usize { let CharPos(n) = *self; n }
 }
 
 impl Add for CharPos {
     type Output = CharPos;
 
+    #[inline(always)]
     fn add(self, rhs: CharPos) -> CharPos {
         CharPos(self.to_usize() + rhs.to_usize())
     }
@@ -1198,6 +1233,7 @@ impl Add for CharPos {
 impl Sub for CharPos {
     type Output = CharPos;
 
+    #[inline(always)]
     fn sub(self, rhs: CharPos) -> CharPos {
         CharPos(self.to_usize() - rhs.to_usize())
     }

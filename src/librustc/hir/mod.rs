@@ -48,6 +48,7 @@ use ty::AdtKind;
 use ty::maps::Providers;
 
 use rustc_data_structures::indexed_vec;
+use rustc_data_structures::sync::{ParallelIterator, par_iter, Send, Sync, scope};
 
 use serialize::{self, Encoder, Encodable, Decoder, Decodable};
 use std::collections::BTreeMap;
@@ -720,6 +721,31 @@ impl Crate {
         }
     }
 
+    /// A parallel version of visit_all_item_likes
+    pub fn par_visit_all_item_likes<'hir, V>(&'hir self, visitor: &V)
+        where V: itemlikevisit::ParItemLikeVisitor<'hir> + Sync + Send
+    {
+        scope(|s| {
+            s.spawn(|_| {
+                par_iter(&self.items).for_each(|(_, item)| {
+                    visitor.visit_item(item);
+                });
+            });
+
+            s.spawn(|_| {
+                par_iter(&self.trait_items).for_each(|(_, trait_item)| {
+                    visitor.visit_trait_item(trait_item);
+                });
+            });
+
+            s.spawn(|_| {
+                par_iter(&self.impl_items).for_each(|(_, impl_item)| {
+                    visitor.visit_impl_item(impl_item);
+                });
+            });
+        });
+    }
+
     pub fn body(&self, id: BodyId) -> &Body {
         &self.bodies[&id]
     }
@@ -752,9 +778,8 @@ pub struct Block {
     pub rules: BlockCheckMode,
     pub span: Span,
     /// If true, then there may exist `break 'a` values that aim to
-    /// break out of this block early. As of this writing, this is not
-    /// currently permitted in Rust itself, but it is generated as
-    /// part of `catch` statements.
+    /// break out of this block early.
+    /// Used by `'label: {}` blocks and by `catch` statements.
     pub targeted_by_break: bool,
     /// If true, don't emit return value type errors as the parser had
     /// to recover from a parse error so this block will not have an
@@ -1355,8 +1380,8 @@ pub enum Expr_ {
     /// This may also be a generator literal, indicated by the final boolean,
     /// in that case there is an GeneratorClause.
     ExprClosure(CaptureClause, P<FnDecl>, BodyId, Span, Option<GeneratorMovability>),
-    /// A block (`{ ... }`)
-    ExprBlock(P<Block>),
+    /// A block (`'label: { ... }`)
+    ExprBlock(P<Block>, Option<Label>),
 
     /// An assignment (`a = foo()`)
     ExprAssign(P<Expr>, P<Expr>),
@@ -1476,46 +1501,6 @@ impl fmt::Display for LoopIdError {
     }
 }
 
-// FIXME(cramertj) this should use `Result` once master compiles w/ a vesion of Rust where
-// `Result` implements `Encodable`/`Decodable`
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
-pub enum LoopIdResult {
-    Ok(NodeId),
-    Err(LoopIdError),
-}
-impl Into<Result<NodeId, LoopIdError>> for LoopIdResult {
-    fn into(self) -> Result<NodeId, LoopIdError> {
-        match self {
-            LoopIdResult::Ok(ok) => Ok(ok),
-            LoopIdResult::Err(err) => Err(err),
-        }
-    }
-}
-impl From<Result<NodeId, LoopIdError>> for LoopIdResult {
-    fn from(res: Result<NodeId, LoopIdError>) -> Self {
-        match res {
-            Ok(ok) => LoopIdResult::Ok(ok),
-            Err(err) => LoopIdResult::Err(err),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
-pub enum ScopeTarget {
-    Block(NodeId),
-    Loop(LoopIdResult),
-}
-
-impl ScopeTarget {
-    pub fn opt_id(self) -> Option<NodeId> {
-        match self {
-            ScopeTarget::Block(node_id) |
-            ScopeTarget::Loop(LoopIdResult::Ok(node_id)) => Some(node_id),
-            ScopeTarget::Loop(LoopIdResult::Err(_)) => None,
-        }
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
 pub struct Destination {
     // This is `Some(_)` iff there is an explicit user-specified `label
@@ -1523,7 +1508,7 @@ pub struct Destination {
 
     // These errors are caught and then reported during the diagnostics pass in
     // librustc_passes/loops.rs
-    pub target_id: ScopeTarget,
+    pub target_id: Result<NodeId, LoopIdError>,
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
@@ -2259,8 +2244,8 @@ pub fn provide(providers: &mut Providers) {
 }
 
 #[derive(Clone, RustcEncodable, RustcDecodable, Hash)]
-pub struct TransFnAttrs {
-    pub flags: TransFnAttrFlags,
+pub struct CodegenFnAttrs {
+    pub flags: CodegenFnAttrFlags,
     pub inline: InlineAttr,
     pub export_name: Option<Symbol>,
     pub target_features: Vec<Symbol>,
@@ -2269,7 +2254,7 @@ pub struct TransFnAttrs {
 
 bitflags! {
     #[derive(RustcEncodable, RustcDecodable)]
-    pub struct TransFnAttrFlags: u8 {
+    pub struct CodegenFnAttrFlags: u8 {
         const COLD                      = 0b0000_0001;
         const ALLOCATOR                 = 0b0000_0010;
         const UNWIND                    = 0b0000_0100;
@@ -2281,10 +2266,10 @@ bitflags! {
     }
 }
 
-impl TransFnAttrs {
-    pub fn new() -> TransFnAttrs {
-        TransFnAttrs {
-            flags: TransFnAttrFlags::empty(),
+impl CodegenFnAttrs {
+    pub fn new() -> CodegenFnAttrs {
+        CodegenFnAttrs {
+            flags: CodegenFnAttrFlags::empty(),
             inline: InlineAttr::None,
             export_name: None,
             target_features: vec![],
@@ -2302,7 +2287,6 @@ impl TransFnAttrs {
 
     /// True if `#[no_mangle]` or `#[export_name(...)]` is present.
     pub fn contains_extern_indicator(&self) -> bool {
-        self.flags.contains(TransFnAttrFlags::NO_MANGLE) || self.export_name.is_some()
+        self.flags.contains(CodegenFnAttrFlags::NO_MANGLE) || self.export_name.is_some()
     }
 }
-

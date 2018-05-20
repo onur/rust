@@ -635,6 +635,7 @@ pub fn noop_fold_interpolated<T: Folder>(nt: token::Nonterminal, fld: &mut T)
         token::NtTy(ty) => token::NtTy(fld.fold_ty(ty)),
         token::NtIdent(ident, is_raw) => token::NtIdent(fld.fold_ident(ident), is_raw),
         token::NtLifetime(ident) => token::NtLifetime(fld.fold_ident(ident)),
+        token::NtLiteral(expr) => token::NtLiteral(fld.fold_expr(expr)),
         token::NtMeta(meta) => token::NtMeta(fld.fold_meta_item(meta)),
         token::NtPath(path) => token::NtPath(fld.fold_path(path)),
         token::NtTT(tt) => token::NtTT(fld.fold_tt(tt)),
@@ -1255,7 +1256,10 @@ pub fn noop_fold_expr<T: Folder>(Expr {id, node, span, attrs}: Expr, folder: &mu
                                   folder.fold_expr(body),
                                   folder.new_span(span))
             }
-            ExprKind::Block(blk) => ExprKind::Block(folder.fold_block(blk)),
+            ExprKind::Block(blk, opt_label) => {
+                ExprKind::Block(folder.fold_block(blk),
+                                opt_label.map(|label| folder.fold_label(label)))
+            }
             ExprKind::Assign(el, er) => {
                 ExprKind::Assign(folder.fold_expr(el), folder.fold_expr(er))
             }

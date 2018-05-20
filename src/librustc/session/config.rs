@@ -95,6 +95,23 @@ pub enum Lto {
     Fat,
 }
 
+#[derive(Clone, PartialEq, Hash)]
+pub enum CrossLangLto {
+    LinkerPlugin(PathBuf),
+    NoLink,
+    Disabled
+}
+
+impl CrossLangLto {
+    pub fn embed_bitcode(&self) -> bool {
+        match *self {
+            CrossLangLto::LinkerPlugin(_) |
+            CrossLangLto::NoLink => true,
+            CrossLangLto::Disabled => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Hash)]
 pub enum DebugInfoLevel {
     NoDebugInfo,
@@ -253,7 +270,7 @@ impl OutputTypes {
     }
 
     // True if any of the output types require codegen or linking.
-    pub fn should_trans(&self) -> bool {
+    pub fn should_codegen(&self) -> bool {
         self.0.keys().any(|k| match *k {
             OutputType::Bitcode
             | OutputType::Assembly
@@ -412,6 +429,7 @@ top_level_options!(
 
         // Remap source path prefixes in all output (messages, object files, debug, etc)
         remap_path_prefix: Vec<(PathBuf, PathBuf)> [UNTRACKED],
+
         edition: Edition [TRACKED],
     }
 );
@@ -777,11 +795,15 @@ macro_rules! options {
             Some("`string` or `string=string`");
         pub const parse_lto: Option<&'static str> =
             Some("one of `thin`, `fat`, or omitted");
+        pub const parse_cross_lang_lto: Option<&'static str> =
+            Some("either a boolean (`yes`, `no`, `on`, `off`, etc), `no-link`, \
+                  or the path to the linker plugin");
     }
 
     #[allow(dead_code)]
     mod $mod_set {
-        use super::{$struct_name, Passes, SomePasses, AllPasses, Sanitizer, Lto};
+        use super::{$struct_name, Passes, SomePasses, AllPasses, Sanitizer, Lto,
+                    CrossLangLto};
         use rustc_target::spec::{LinkerFlavor, PanicStrategy, RelroLevel};
         use std::path::PathBuf;
 
@@ -986,6 +1008,26 @@ macro_rules! options {
             true
         }
 
+        fn parse_cross_lang_lto(slot: &mut CrossLangLto, v: Option<&str>) -> bool {
+            if v.is_some() {
+                let mut bool_arg = None;
+                if parse_opt_bool(&mut bool_arg, v) {
+                    *slot = if bool_arg.unwrap() {
+                        CrossLangLto::NoLink
+                    } else {
+                        CrossLangLto::Disabled
+                    };
+                    return true
+                }
+            }
+
+            *slot = match v {
+                None |
+                Some("no-link") => CrossLangLto::NoLink,
+                Some(path) => CrossLangLto::LinkerPlugin(PathBuf::from(path)),
+            };
+            true
+        }
     }
 ) }
 
@@ -1093,14 +1135,14 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "count where LLVM instrs originate"),
     time_llvm_passes: bool = (false, parse_bool, [UNTRACKED_WITH_WARNING(true,
         "The output of `-Z time-llvm-passes` will only reflect timings of \
-         re-translated modules when used with incremental compilation" )],
+         re-codegened modules when used with incremental compilation" )],
         "measure time of each LLVM pass"),
     input_stats: bool = (false, parse_bool, [UNTRACKED],
         "gather statistics about the input"),
-    trans_stats: bool = (false, parse_bool, [UNTRACKED_WITH_WARNING(true,
-        "The output of `-Z trans-stats` might not be accurate when incremental \
+    codegen_stats: bool = (false, parse_bool, [UNTRACKED_WITH_WARNING(true,
+        "The output of `-Z codegen-stats` might not be accurate when incremental \
          compilation is enabled")],
-        "gather trans statistics"),
+        "gather codegen statistics"),
     asm_comments: bool = (false, parse_bool, [TRACKED],
         "generate comments into the assembly (may change behavior)"),
     no_verify: bool = (false, parse_bool, [TRACKED],
@@ -1141,8 +1183,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           Use with RUST_REGION_GRAPH=help for more info"),
     parse_only: bool = (false, parse_bool, [UNTRACKED],
           "parse only; do not compile, assemble, or link"),
-    no_trans: bool = (false, parse_bool, [TRACKED],
-          "run all passes except translation; no output"),
+    no_codegen: bool = (false, parse_bool, [TRACKED],
+          "run all passes except codegen; no output"),
     treat_err_as_bug: bool = (false, parse_bool, [TRACKED],
           "treat all errors that occur as bugs"),
     external_macro_backtrace: bool = (false, parse_bool, [UNTRACKED],
@@ -1193,16 +1235,16 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "show spans for compiler debugging (expr|pat|ty)"),
     print_type_sizes: bool = (false, parse_bool, [UNTRACKED],
           "print layout information for each type encountered"),
-    print_trans_items: Option<String> = (None, parse_opt_string, [UNTRACKED],
-          "print the result of the translation item collection pass"),
+    print_mono_items: Option<String> = (None, parse_opt_string, [UNTRACKED],
+          "print the result of the monomorphization collection pass"),
     mir_opt_level: usize = (1, parse_uint, [TRACKED],
           "set the MIR optimization level (0-3, default: 1)"),
-    mutable_noalias: bool = (false, parse_bool, [UNTRACKED],
-          "emit noalias metadata for mutable references"),
-    arg_align_attributes: bool = (false, parse_bool, [UNTRACKED],
+    mutable_noalias: Option<bool> = (None, parse_opt_bool, [TRACKED],
+          "emit noalias metadata for mutable references (default: yes on LLVM >= 6)"),
+    arg_align_attributes: bool = (false, parse_bool, [TRACKED],
           "emit align metadata for reference arguments"),
     dump_mir: Option<String> = (None, parse_opt_string, [UNTRACKED],
-          "dump MIR state at various points in translation"),
+          "dump MIR state at various points in transforms"),
     dump_mir_dir: String = (String::from("mir_dump"), parse_string, [UNTRACKED],
           "the directory the MIR is dumped into"),
     dump_mir_graphviz: bool = (false, parse_bool, [UNTRACKED],
@@ -1250,10 +1292,12 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "choose which RELRO level to use"),
     nll_subminimal_causes: bool = (false, parse_bool, [UNTRACKED],
         "when tracking region error causes, accept subminimal results for faster execution."),
+    nll_facts: bool = (false, parse_bool, [UNTRACKED],
+                       "dump facts from NLL analysis into side files"),
     disable_nll_user_type_assert: bool = (false, parse_bool, [UNTRACKED],
         "disable user provided type assertion in NLL"),
-    trans_time_graph: bool = (false, parse_bool, [UNTRACKED],
-        "generate a graphical HTML report of time spent in trans and LLVM"),
+    codegen_time_graph: bool = (false, parse_bool, [UNTRACKED],
+        "generate a graphical HTML report of time spent in codegen and LLVM"),
     thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable ThinLTO when possible"),
     inline_in_all_cgus: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -1265,7 +1309,7 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
          the max/min integer respectively, and NaN is mapped to 0"),
     lower_128bit_ops: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "rewrite operators on i128 and u128 into lang item calls (typically provided \
-         by compiler-builtins) so translation doesn't need to support them,
+         by compiler-builtins) so codegen doesn't need to support them,
          overriding the default for the current target"),
     human_readable_cgu_names: bool = (false, parse_bool, [TRACKED],
         "generate human-readable, predictable names for codegen units"),
@@ -1293,6 +1337,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "make the current crate share its generic instantiations"),
     chalk: bool = (false, parse_bool, [TRACKED],
           "enable the experimental Chalk-based trait solving engine"),
+    cross_lang_lto: CrossLangLto = (CrossLangLto::Disabled, parse_cross_lang_lto, [TRACKED],
+          "generate build artifacts that are compatible with linker-based LTO."),
 }
 
 pub fn default_lib_output() -> CrateType {
@@ -1684,7 +1730,7 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> ast::CrateConfig {
                 early_error(ErrorOutputType::default(), &msg)
             }
 
-            (meta_item.ident.name, meta_item.value_str())
+            (meta_item.name(), meta_item.value_str())
         })
         .collect::<ast::CrateConfig>()
 }
@@ -2324,7 +2370,7 @@ mod dep_tracking {
     use std::path::PathBuf;
     use std::collections::hash_map::DefaultHasher;
     use super::{CrateType, DebugInfoLevel, ErrorOutputType, Lto, OptLevel, OutputTypes,
-                Passes, Sanitizer};
+                Passes, Sanitizer, CrossLangLto};
     use syntax::feature_gate::UnstableFeatures;
     use rustc_target::spec::{PanicStrategy, RelroLevel, TargetTriple};
     use syntax::edition::Edition;
@@ -2388,6 +2434,7 @@ mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(Option<Sanitizer>);
     impl_dep_tracking_hash_via_hash!(TargetTriple);
     impl_dep_tracking_hash_via_hash!(Edition);
+    impl_dep_tracking_hash_via_hash!(CrossLangLto);
 
     impl_dep_tracking_hash_for_sortable_vec_of!(String);
     impl_dep_tracking_hash_for_sortable_vec_of!(PathBuf);
@@ -2452,7 +2499,7 @@ mod tests {
     use lint;
     use middle::cstore;
     use session::config::{build_configuration, build_session_options_and_crate_config};
-    use session::config::Lto;
+    use session::config::{Lto, CrossLangLto};
     use session::build_session;
     use std::collections::{BTreeMap, BTreeSet};
     use std::iter::FromIterator;
@@ -3001,7 +3048,7 @@ mod tests {
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.input_stats = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-        opts.debugging_opts.trans_stats = true;
+        opts.debugging_opts.codegen_stats = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.borrowck_stats = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
@@ -3047,7 +3094,7 @@ mod tests {
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.keep_ast = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-        opts.debugging_opts.print_trans_items = Some(String::from("abc"));
+        opts.debugging_opts.print_mono_items = Some(String::from("abc"));
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.dump_mir = Some(String::from("abc"));
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
@@ -3074,7 +3121,7 @@ mod tests {
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
-        opts.debugging_opts.no_trans = true;
+        opts.debugging_opts.no_codegen = true;
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
@@ -3107,6 +3154,10 @@ mod tests {
 
         opts = reference.clone();
         opts.debugging_opts.relro_level = Some(RelroLevel::Full);
+        assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
+
+        opts = reference.clone();
+        opts.debugging_opts.cross_lang_lto = CrossLangLto::NoLink;
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
     }
 

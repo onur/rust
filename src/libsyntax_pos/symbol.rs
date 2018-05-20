@@ -12,12 +12,15 @@
 //! allows bidirectional lookup; i.e. given a value, one can easily find the
 //! type, and vice versa.
 
+use edition::Edition;
 use hygiene::SyntaxContext;
 use {Span, DUMMY_SP, GLOBALS};
 
 use rustc_data_structures::fx::FxHashMap;
+use arena::DroplessArena;
 use serialize::{Decodable, Decoder, Encodable, Encoder};
 use std::fmt;
+use std::str;
 use std::cmp::{PartialEq, Ordering, PartialOrd, Ord};
 use std::hash::{Hash, Hasher};
 
@@ -198,22 +201,35 @@ impl<T: ::std::ops::Deref<Target=str>> PartialEq<T> for Symbol {
     }
 }
 
-#[derive(Default)]
+// The &'static strs in this type actually point into the arena
 pub struct Interner {
-    names: FxHashMap<Box<str>, Symbol>,
-    strings: Vec<Box<str>>,
+    arena: DroplessArena,
+    names: FxHashMap<&'static str, Symbol>,
+    strings: Vec<&'static str>,
     gensyms: Vec<Symbol>,
 }
 
 impl Interner {
     pub fn new() -> Self {
-        Interner::default()
+        Interner {
+            arena: DroplessArena::new(),
+            names: Default::default(),
+            strings: Default::default(),
+            gensyms: Default::default(),
+        }
     }
 
     fn prefill(init: &[&str]) -> Self {
         let mut this = Interner::new();
         for &string in init {
-            this.intern(string);
+            if string == "" {
+                // We can't allocate empty strings in the arena, so handle this here
+                let name = Symbol(this.strings.len() as u32);
+                this.names.insert("", name);
+                this.strings.push("");
+            } else {
+                this.intern(string);
+            }
         }
         this
     }
@@ -224,8 +240,17 @@ impl Interner {
         }
 
         let name = Symbol(self.strings.len() as u32);
-        let string = string.to_string().into_boxed_str();
-        self.strings.push(string.clone());
+
+        // from_utf8_unchecked is safe since we just allocated a &str which is known to be utf8
+        let string: &str = unsafe {
+            str::from_utf8_unchecked(self.arena.alloc_slice(string.as_bytes()))
+        };
+        // It is safe to extend the arena allocation to 'static because we only access
+        // these while the arena is still alive
+        let string: &'static str =  unsafe {
+            &*(string as *const str)
+        };
+        self.strings.push(string);
         self.names.insert(string, name);
         name
     }
@@ -254,7 +279,7 @@ impl Interner {
 
     pub fn get(&self, symbol: Symbol) -> &str {
         match self.strings.get(symbol.0 as usize) {
-            Some(ref string) => string,
+            Some(string) => string,
             None => self.get(self.gensyms[(!0 - symbol.0) as usize]),
         }
     }
@@ -294,7 +319,7 @@ macro_rules! declare_keywords {(
 // NB: leaving holes in the ident table is bad! a different ident will get
 // interned with the id from the hole, but it will be between the min and max
 // of the reserved words, and thus tagged as "reserved".
-// After modifying this list adjust `is_special_ident`, `is_used_keyword`/`is_unused_keyword`,
+// After modifying this list adjust `is_special`, `is_used_keyword`/`is_unused_keyword`,
 // this should be rarely necessary though if the keywords are kept in alphabetic order.
 declare_keywords! {
     // Special reserved identifiers used internally for elided lifetimes,
@@ -359,16 +384,68 @@ declare_keywords! {
     (53, Virtual,            "virtual")
     (54, Yield,              "yield")
 
+    // Edition-specific keywords reserved for future use.
+    (55, Async,              "async") // >= 2018 Edition Only
+
     // Special lifetime names
-    (55, UnderscoreLifetime, "'_")
-    (56, StaticLifetime,     "'static")
+    (56, UnderscoreLifetime, "'_")
+    (57, StaticLifetime,     "'static")
 
     // Weak keywords, have special meaning only in specific contexts.
-    (57, Auto,               "auto")
-    (58, Catch,              "catch")
-    (59, Default,            "default")
-    (60, Dyn,                "dyn")
-    (61, Union,              "union")
+    (58, Auto,               "auto")
+    (59, Catch,              "catch")
+    (60, Default,            "default")
+    (61, Dyn,                "dyn")
+    (62, Union,              "union")
+}
+
+impl Symbol {
+    fn is_unused_keyword_2018(self) -> bool {
+        self == keywords::Async.name()
+    }
+}
+
+impl Ident {
+    // Returns true for reserved identifiers used internally for elided lifetimes,
+    // unnamed method parameters, crate root module, error recovery etc.
+    pub fn is_special(self) -> bool {
+        self.name <= keywords::Underscore.name()
+    }
+
+    /// Returns `true` if the token is a keyword used in the language.
+    pub fn is_used_keyword(self) -> bool {
+        self.name >= keywords::As.name() && self.name <= keywords::While.name()
+    }
+
+    /// Returns `true` if the token is a keyword reserved for possible future use.
+    pub fn is_unused_keyword(self) -> bool {
+        // Note: `span.edition()` is relatively expensive, don't call it unless necessary.
+        self.name >= keywords::Abstract.name() && self.name <= keywords::Yield.name() ||
+        self.name.is_unused_keyword_2018() && self.span.edition() == Edition::Edition2018
+    }
+
+    /// Returns `true` if the token is either a special identifier or a keyword.
+    pub fn is_reserved(self) -> bool {
+        self.is_special() || self.is_used_keyword() || self.is_unused_keyword()
+    }
+
+    /// A keyword or reserved identifier that can be used as a path segment.
+    pub fn is_path_segment_keyword(self) -> bool {
+        self.name == keywords::Super.name() ||
+        self.name == keywords::SelfValue.name() ||
+        self.name == keywords::SelfType.name() ||
+        self.name == keywords::Extern.name() ||
+        self.name == keywords::Crate.name() ||
+        self.name == keywords::CrateRoot.name() ||
+        self.name == keywords::DollarCrate.name()
+    }
+
+    // We see this identifier in a normal identifier position, like variable name or a type.
+    // How was it written originally? Did it use the raw form? Let's try to guess.
+    pub fn is_raw_guess(self) -> bool {
+        self.name != keywords::Invalid.name() &&
+        self.is_reserved() && !self.is_path_segment_keyword()
+    }
 }
 
 // If an interner exists, return it. Otherwise, prepare a fresh one.
@@ -503,7 +580,7 @@ impl PartialOrd<InternedString> for InternedString {
         if self.symbol == other.symbol {
             return Some(Ordering::Equal);
         }
-        self.with(|self_str| other.with(|other_str| self_str.partial_cmp(&other_str)))
+        self.with(|self_str| other.with(|other_str| self_str.partial_cmp(other_str)))
     }
 }
 

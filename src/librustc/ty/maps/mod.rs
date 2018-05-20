@@ -11,7 +11,7 @@
 use dep_graph::{DepConstructor, DepNode};
 use hir::def_id::{CrateNum, DefId, DefIndex};
 use hir::def::{Def, Export};
-use hir::{self, TraitCandidate, ItemLocalId, TransFnAttrs};
+use hir::{self, TraitCandidate, ItemLocalId, CodegenFnAttrs};
 use hir::svh::Svh;
 use infer::canonical::{self, Canonical};
 use lint;
@@ -28,7 +28,7 @@ use middle::exported_symbols::{SymbolExportLevel, ExportedSymbol};
 use middle::const_val::EvalResult;
 use mir::mono::{CodegenUnit, Stats};
 use mir;
-use mir::interpret::{GlobalId};
+use mir::interpret::{GlobalId, Allocation, ConstValue};
 use session::{CompileResult, CrateDisambiguator};
 use session::config::OutputFilenames;
 use traits::{self, Vtable};
@@ -181,7 +181,7 @@ define_maps! { <'tcx>
     [] fn mir_validated: MirValidated(DefId) -> &'tcx Steal<mir::Mir<'tcx>>,
 
     /// MIR after our optimization passes have run. This is MIR that is ready
-    /// for trans. This is also the only query that can fetch non-local MIR, at present.
+    /// for codegen. This is also the only query that can fetch non-local MIR, at present.
     [] fn optimized_mir: MirOptimized(DefId) -> &'tcx mir::Mir<'tcx>,
 
     /// The result of unsafety-checking this def-id.
@@ -228,6 +228,11 @@ define_maps! { <'tcx>
     [] fn const_eval: const_eval_dep_node(ty::ParamEnvAnd<'tcx, GlobalId<'tcx>>)
         -> EvalResult<'tcx>,
 
+    /// Converts a constant value to an constant allocation
+    [] fn const_value_to_allocation: const_value_to_allocation(
+        (ConstValue<'tcx>, Ty<'tcx>)
+    ) -> &'tcx Allocation,
+
     [] fn check_match: CheckMatch(DefId)
         -> Result<(), ErrorReported>,
 
@@ -250,7 +255,7 @@ define_maps! { <'tcx>
     [] fn lookup_stability: LookupStability(DefId) -> Option<&'tcx attr::Stability>,
     [] fn lookup_deprecation_entry: LookupDeprecationEntry(DefId) -> Option<DeprecationEntry>,
     [] fn item_attrs: ItemAttrs(DefId) -> Lrc<[ast::Attribute]>,
-    [] fn trans_fn_attrs: trans_fn_attrs(DefId) -> TransFnAttrs,
+    [] fn codegen_fn_attrs: codegen_fn_attrs(DefId) -> CodegenFnAttrs,
     [] fn fn_arg_names: FnArgNames(DefId) -> Vec<ast::Name>,
     /// Gets the rendered value of the specified constant or associated constant.
     /// Used by rustdoc.
@@ -263,7 +268,7 @@ define_maps! { <'tcx>
     [] fn vtable_methods: vtable_methods_node(ty::PolyTraitRef<'tcx>)
                           -> Lrc<Vec<Option<(DefId, &'tcx Substs<'tcx>)>>>,
 
-    [] fn trans_fulfill_obligation: fulfill_obligation_dep_node(
+    [] fn codegen_fulfill_obligation: fulfill_obligation_dep_node(
         (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>)) -> Vtable<'tcx, ()>,
     [] fn trait_impls_of: TraitImpls(DefId) -> Lrc<ty::trait_def::TraitImpls>,
     [] fn specialization_graph_of: SpecializationGraph(DefId) -> Lrc<specialization_graph::Graph>,
@@ -397,10 +402,10 @@ define_maps! { <'tcx>
 
     [] fn exported_symbols: ExportedSymbols(CrateNum)
         -> Arc<Vec<(ExportedSymbol<'tcx>, SymbolExportLevel)>>,
-    [] fn collect_and_partition_translation_items:
-        collect_and_partition_translation_items_node(CrateNum)
+    [] fn collect_and_partition_mono_items:
+        collect_and_partition_mono_items_node(CrateNum)
         -> (Arc<DefIdSet>, Arc<Vec<Arc<CodegenUnit<'tcx>>>>),
-    [] fn is_translated_item: IsTranslatedItem(DefId) -> bool,
+    [] fn is_codegened_item: IsCodegenedItem(DefId) -> bool,
     [] fn codegen_unit: CodegenUnit(InternedString) -> Arc<CodegenUnit<'tcx>>,
     [] fn compile_codegen_unit: CompileCodegenUnit(InternedString) -> Stats,
     [] fn output_filenames: output_filenames_node(CrateNum)
@@ -470,12 +475,18 @@ fn features_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
     DepConstructor::Features
 }
 
-fn trans_fn_attrs<'tcx>(id: DefId) -> DepConstructor<'tcx> {
-    DepConstructor::TransFnAttrs { 0: id }
+fn codegen_fn_attrs<'tcx>(id: DefId) -> DepConstructor<'tcx> {
+    DepConstructor::CodegenFnAttrs { 0: id }
 }
 
 fn erase_regions_ty<'tcx>(ty: Ty<'tcx>) -> DepConstructor<'tcx> {
     DepConstructor::EraseRegionsTy { ty }
+}
+
+fn const_value_to_allocation<'tcx>(
+    (val, ty): (ConstValue<'tcx>, Ty<'tcx>)
+) -> DepConstructor<'tcx> {
+    DepConstructor::ConstValueToAllocation { val, ty }
 }
 
 fn type_param_predicates<'tcx>((item_id, param_id): (DefId, DefId)) -> DepConstructor<'tcx> {
@@ -598,8 +609,8 @@ fn all_traits_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
     DepConstructor::AllTraits
 }
 
-fn collect_and_partition_translation_items_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
-    DepConstructor::CollectAndPartitionTranslationItems
+fn collect_and_partition_mono_items_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::CollectAndPartitionMonoItems
 }
 
 fn output_filenames_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {

@@ -13,7 +13,6 @@
 //! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/mir.html
 
 use graphviz::IntoCow;
-use middle::const_val::ConstVal;
 use middle::region;
 use rustc_data_structures::sync::{Lrc};
 use rustc_data_structures::indexed_vec::{IndexVec, Idx};
@@ -27,9 +26,8 @@ use hir::def_id::DefId;
 use mir::visit::MirVisitable;
 use mir::interpret::{Value, PrimVal, EvalErrorKind};
 use ty::subst::{Subst, Substs};
-use ty::{self, AdtDef, CanonicalTy, ClosureSubsts, Region, Ty, TyCtxt, GeneratorInterior};
+use ty::{self, AdtDef, CanonicalTy, ClosureSubsts, GeneratorSubsts, Region, Ty, TyCtxt};
 use ty::fold::{TypeFoldable, TypeFolder, TypeVisitor};
-use ty::TypeAndMut;
 use util::ppaux;
 use std::slice;
 use hir::{self, InlineAsm};
@@ -698,7 +696,7 @@ pub struct BasicBlockData<'tcx> {
     pub terminator: Option<Terminator<'tcx>>,
 
     /// If true, this block lies on an unwind path. This is used
-    /// during trans where distinct kinds of basic blocks may be
+    /// during codegen where distinct kinds of basic blocks may be
     /// generated (particularly for MSVC cleanup). Unwind blocks must
     /// only branch to other unwind blocks.
     pub is_cleanup: bool,
@@ -1550,11 +1548,7 @@ impl<'tcx> Operand<'tcx> {
             span,
             ty,
             literal: Literal::Value {
-                value: tcx.mk_const(ty::Const {
-                    // ZST function type
-                    val: ConstVal::Value(Value::ByVal(PrimVal::Undef)),
-                    ty
-                })
+                value: ty::Const::zero_sized(tcx, ty),
             },
         })
     }
@@ -1620,7 +1614,7 @@ pub enum CastKind {
     UnsafeFnPointer,
 
     /// "Unsize" -- convert a thin-or-fat pointer to a fat pointer.
-    /// trans must figure out the details once full monomorphization
+    /// codegen must figure out the details once full monomorphization
     /// is known. For example, this could be used to cast from a
     /// `&[i32;N]` to a `&[i32]`, or a `Box<T>` to a `Box<Trait>`
     /// (presuming `T: Trait`).
@@ -1641,7 +1635,7 @@ pub enum AggregateKind<'tcx> {
     Adt(&'tcx AdtDef, usize, &'tcx Substs<'tcx>, Option<usize>),
 
     Closure(DefId, ClosureSubsts<'tcx>),
-    Generator(DefId, ClosureSubsts<'tcx>, GeneratorInterior<'tcx>),
+    Generator(DefId, GeneratorSubsts<'tcx>, hir::GeneratorMovability),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
@@ -1882,11 +1876,17 @@ impl<'tcx> Debug for Literal<'tcx> {
 }
 
 /// Write a `ConstVal` in a way closer to the original source code than the `Debug` output.
-fn fmt_const_val<W: Write>(fmt: &mut W, const_val: &ty::Const) -> fmt::Result {
-    use middle::const_val::ConstVal::*;
+pub fn fmt_const_val<W: Write>(fmt: &mut W, const_val: &ty::Const) -> fmt::Result {
+    use middle::const_val::ConstVal;
     match const_val.val {
-        Unevaluated(..) => write!(fmt, "{:?}", const_val),
-        Value(val) => print_miri_value(val, const_val.ty, fmt),
+        ConstVal::Unevaluated(..) => write!(fmt, "{:?}", const_val),
+        ConstVal::Value(val) => {
+            if let Some(value) = val.to_byval_value() {
+                print_miri_value(value, const_val.ty, fmt)
+            } else {
+                write!(fmt, "{:?}:{}", val, const_val.ty)
+            }
+        },
     }
 }
 
@@ -1905,16 +1905,15 @@ pub fn print_miri_value<W: Write>(value: Value, ty: Ty, f: &mut W) -> fmt::Resul
             write!(f, "{:?}", ::std::char::from_u32(n as u32).unwrap()),
         (Value::ByVal(PrimVal::Undef), &TyFnDef(did, _)) =>
             write!(f, "{}", item_path_str(did)),
-        (Value::ByValPair(PrimVal::Ptr(ptr), PrimVal::Bytes(len)), &TyRef(_, TypeAndMut {
-            ty: &ty::TyS { sty: TyStr, .. }, ..
-        })) => {
+        (Value::ByValPair(PrimVal::Ptr(ptr), PrimVal::Bytes(len)),
+         &TyRef(_, &ty::TyS { sty: TyStr, .. }, _)) => {
             ty::tls::with(|tcx| {
                 let alloc = tcx
                     .interpret_interner
                     .get_alloc(ptr.alloc_id);
                 if let Some(alloc) = alloc {
                     assert_eq!(len as usize as u128, len);
-                    let slice = &alloc.bytes[(ptr.offset as usize)..][..(len as usize)];
+                    let slice = &alloc.bytes[(ptr.offset.bytes() as usize)..][..(len as usize)];
                     let s = ::std::str::from_utf8(slice)
                         .expect("non utf8 str from miri");
                     write!(f, "{:?}", s)
@@ -1978,6 +1977,11 @@ impl fmt::Debug for Location {
 }
 
 impl Location {
+    pub const START: Location = Location {
+        block: START_BLOCK,
+        statement_index: 0,
+    };
+
     /// Returns the location immediately after this one within the enclosing block.
     ///
     /// Note that if this location represents a terminator, then the
@@ -2370,10 +2374,8 @@ impl<'tcx> TypeFoldable<'tcx> for Rvalue<'tcx> {
                         AggregateKind::Adt(def, v, substs.fold_with(folder), n),
                     AggregateKind::Closure(id, substs) =>
                         AggregateKind::Closure(id, substs.fold_with(folder)),
-                    AggregateKind::Generator(id, substs, interior) =>
-                        AggregateKind::Generator(id,
-                                                 substs.fold_with(folder),
-                                                 interior.fold_with(folder)),
+                    AggregateKind::Generator(id, substs, movablity) =>
+                        AggregateKind::Generator(id, substs.fold_with(folder), movablity),
                 };
                 Aggregate(kind, fields.fold_with(folder))
             }
@@ -2400,8 +2402,7 @@ impl<'tcx> TypeFoldable<'tcx> for Rvalue<'tcx> {
                     AggregateKind::Tuple => false,
                     AggregateKind::Adt(_, _, substs, _) => substs.visit_with(visitor),
                     AggregateKind::Closure(_, substs) => substs.visit_with(visitor),
-                    AggregateKind::Generator(_, substs, interior) => substs.visit_with(visitor) ||
-                        interior.visit_with(visitor),
+                    AggregateKind::Generator(_, substs, _) => substs.visit_with(visitor),
                 }) || fields.visit_with(visitor)
             }
         }

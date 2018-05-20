@@ -1179,7 +1179,7 @@ extern "rust-intrinsic" {
 ```
 
 Please check you didn't make a mistake in the function's name. All intrinsic
-functions are defined in librustc_trans/trans/intrinsic.rs and in
+functions are defined in librustc_codegen_llvm/intrinsic.rs and in
 libcore/intrinsics.rs in the Rust source code. Example:
 
 ```
@@ -1209,7 +1209,7 @@ fn main() {
 ```
 
 Please check you didn't make a mistake in the function's name. All intrinsic
-functions are defined in librustc_trans/trans/intrinsic.rs and in
+functions are defined in librustc_codegen_llvm/intrinsic.rs and in
 libcore/intrinsics.rs in the Rust source code. Example:
 
 ```
@@ -4515,6 +4515,32 @@ trait Foo {
 impl Foo for () {
     fn foo<U: Iterator>(&self, _: &U) { } // error method `foo` has incompatible
                                           // signature for trait
+}
+```
+"##,
+
+E0646: r##"
+It is not possible to define `main` with a where clause.
+Erroneous code example:
+
+```compile_fail,E0646
+fn main() where i32: Copy { // error: main function is not allowed to have
+                            // a where clause
+}
+```
+"##,
+
+E0647: r##"
+It is not possible to define `start` with a where clause.
+Erroneous code example:
+
+```compile_fail,E0647
+#![feature(start)]
+
+#[start]
+fn start(_: isize, _: *const *const u8) -> isize where (): Copy {
+    //^ error: start function is not allowed to have a where clause
+    0
 }
 ```
 "##,

@@ -43,7 +43,7 @@ use middle::const_val::ConstVal;
 use hir::def_id::DefId;
 use ty::{self, Binder, Ty, TyCtxt, TypeFlags};
 
-use rustc_data_structures::lazy_btree_map::LazyBTreeMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use util::nodemap::FxHashSet;
 
@@ -116,10 +116,14 @@ pub trait TypeFoldable<'tcx>: fmt::Debug + Clone {
 
     /// Indicates whether this value references only 'global'
     /// types/lifetimes that are the same regardless of what fn we are
-    /// in. This is used for caching. Errs on the side of returning
-    /// false.
+    /// in. This is used for caching.
     fn is_global(&self) -> bool {
-        !self.has_type_flags(TypeFlags::HAS_LOCAL_NAMES)
+        !self.has_type_flags(TypeFlags::HAS_FREE_LOCAL_NAMES)
+    }
+
+    /// True if there are any late-bound regions
+    fn has_late_bound_regions(&self) -> bool {
+        self.has_type_flags(TypeFlags::HAS_RE_LATE_BOUND)
     }
 }
 
@@ -328,7 +332,7 @@ struct RegionReplacer<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     tcx: TyCtxt<'a, 'gcx, 'tcx>,
     current_depth: u32,
     fld_r: &'a mut (dyn FnMut(ty::BoundRegion) -> ty::Region<'tcx> + 'a),
-    map: LazyBTreeMap<ty::BoundRegion, ty::Region<'tcx>>
+    map: BTreeMap<ty::BoundRegion, ty::Region<'tcx>>
 }
 
 impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
@@ -343,7 +347,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     pub fn replace_late_bound_regions<T,F>(self,
         value: &Binder<T>,
         mut f: F)
-        -> (T, LazyBTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
+        -> (T, BTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
         where F : FnMut(ty::BoundRegion) -> ty::Region<'tcx>,
               T : TypeFoldable<'tcx>,
     {
@@ -420,7 +424,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         collector.regions
     }
 
-    /// Replace any late-bound regions bound in `value` with `'erased`. Useful in trans but also
+    /// Replace any late-bound regions bound in `value` with `'erased`. Useful in codegen but also
     /// method lookup and a few other places where precise region relationships are not required.
     pub fn erase_late_bound_regions<T>(self, value: &Binder<T>) -> T
         where T : TypeFoldable<'tcx>
@@ -456,7 +460,7 @@ impl<'a, 'gcx, 'tcx> RegionReplacer<'a, 'gcx, 'tcx> {
             tcx,
             current_depth: 1,
             fld_r,
-            map: LazyBTreeMap::default()
+            map: BTreeMap::default()
         }
     }
 }

@@ -50,6 +50,15 @@
 
 // Since libcore defines many fundamental lang items, all tests live in a
 // separate crate, libcoretest, to avoid bizarre issues.
+//
+// Here we explicitly #[cfg]-out this whole crate when testing. If we don't do
+// this, both the generated test artifact and the linked libtest (which
+// transitively includes libcore) will both define the same set of lang items,
+// and this will cause the E0152 "duplicate lang item found" error. See
+// discussion in #50466 for details.
+//
+// This cfg won't affect doc tests.
+#![cfg(not(test))]
 
 #![stable(feature = "core", since = "1.6.0")]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -103,18 +112,13 @@
 #![feature(unwind_attributes)]
 #![feature(doc_alias)]
 #![feature(inclusive_range_methods)]
-
-#![cfg_attr(not(stage0), feature(mmx_target_feature))]
-#![cfg_attr(not(stage0), feature(tbm_target_feature))]
-#![cfg_attr(not(stage0), feature(sse4a_target_feature))]
-#![cfg_attr(not(stage0), feature(arm_target_feature))]
-#![cfg_attr(not(stage0), feature(powerpc_target_feature))]
-#![cfg_attr(not(stage0), feature(mips_target_feature))]
-#![cfg_attr(not(stage0), feature(aarch64_target_feature))]
-
-#![cfg_attr(stage0, feature(target_feature))]
-#![cfg_attr(stage0, feature(cfg_target_feature))]
-#![cfg_attr(stage0, feature(fn_must_use))]
+#![feature(mmx_target_feature)]
+#![feature(tbm_target_feature)]
+#![feature(sse4a_target_feature)]
+#![feature(arm_target_feature)]
+#![feature(powerpc_target_feature)]
+#![feature(mips_target_feature)]
+#![feature(aarch64_target_feature)]
 
 #[prelude_import]
 #[allow(unused)]
@@ -162,7 +166,6 @@ pub mod prelude;
 
 pub mod intrinsics;
 pub mod mem;
-pub mod nonzero;
 pub mod ptr;
 pub mod hint;
 
@@ -212,6 +215,7 @@ pub mod heap {
 
 // note: does not need to be public
 mod iter_private;
+mod nonzero;
 mod tuple;
 mod unit;
 

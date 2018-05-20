@@ -11,7 +11,7 @@
 use dep_graph::SerializedDepNodeIndex;
 use dep_graph::DepNode;
 use hir::def_id::{CrateNum, DefId, DefIndex};
-use mir::interpret::{GlobalId};
+use mir::interpret::{GlobalId, ConstValue};
 use traits::query::{CanonicalPredicateGoal, CanonicalProjectionGoal, CanonicalTyGoal};
 use ty::{self, ParamEnvAnd, Ty, TyCtxt};
 use ty::subst::Substs;
@@ -134,6 +134,12 @@ impl<'tcx> QueryDescription<'tcx> for queries::super_predicates_of<'tcx> {
     fn describe(tcx: TyCtxt, def_id: DefId) -> String {
         format!("computing the supertraits of `{}`",
                 tcx.item_path_str(def_id))
+    }
+}
+
+impl<'tcx> QueryDescription<'tcx> for queries::const_value_to_allocation<'tcx> {
+    fn describe(_tcx: TyCtxt, (val, ty): (ConstValue<'tcx>, Ty<'tcx>)) -> String {
+        format!("converting value `{:?}` ({}) to an allocation", val, ty)
     }
 }
 
@@ -343,7 +349,7 @@ impl<'tcx> QueryDescription<'tcx> for queries::is_mir_available<'tcx> {
     }
 }
 
-impl<'tcx> QueryDescription<'tcx> for queries::trans_fulfill_obligation<'tcx> {
+impl<'tcx> QueryDescription<'tcx> for queries::codegen_fulfill_obligation<'tcx> {
     fn describe(tcx: TyCtxt, key: (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>)) -> String {
         format!("checking if `{}` fulfills its obligations", tcx.item_path_str(key.1.def_id()))
     }
@@ -537,7 +543,7 @@ impl<'tcx> QueryDescription<'tcx> for queries::named_region_map<'tcx> {
 
 impl<'tcx> QueryDescription<'tcx> for queries::is_late_bound_map<'tcx> {
     fn describe(_tcx: TyCtxt, _: DefIndex) -> String {
-        format!("testing if a region is late boudn")
+        format!("testing if a region is late bound")
     }
 }
 
@@ -631,9 +637,9 @@ impl<'tcx> QueryDescription<'tcx> for queries::exported_symbols<'tcx> {
     }
 }
 
-impl<'tcx> QueryDescription<'tcx> for queries::collect_and_partition_translation_items<'tcx> {
+impl<'tcx> QueryDescription<'tcx> for queries::collect_and_partition_mono_items<'tcx> {
     fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
-        format!("collect_and_partition_translation_items")
+        format!("collect_and_partition_mono_items")
     }
 }
 
@@ -789,5 +795,5 @@ impl_disk_cacheable_query!(def_symbol_name, |_| true);
 impl_disk_cacheable_query!(type_of, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(predicates_of, |def_id| def_id.is_local());
 impl_disk_cacheable_query!(used_trait_imports, |def_id| def_id.is_local());
-impl_disk_cacheable_query!(trans_fn_attrs, |_| true);
+impl_disk_cacheable_query!(codegen_fn_attrs, |_| true);
 impl_disk_cacheable_query!(specialization_graph_of, |_| true);
