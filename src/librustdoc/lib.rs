@@ -429,7 +429,7 @@ pub fn main_args(args: &[String]) -> isize {
     let extern_versions = match parse_extern_versions(&matches) {
         Ok(ex) => ex,
         Err(err) => {
-            print_error(err);
+            diag.struct_err(&err.to_string()).emit();
             return 1;
         }
     };
