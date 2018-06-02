@@ -294,7 +294,7 @@ pub trait Copy : Clone {
 /// This trait is automatically implemented when the compiler determines
 /// it's appropriate.
 ///
-/// The precise definition is: a type `T` is `Sync` if `&T` is
+/// The precise definition is: a type `T` is `Sync` if and only if `&T` is
 /// [`Send`][send]. In other words, if there is no possibility of
 /// [undefined behavior][ub] (including data races) when passing
 /// `&T` references between threads.
@@ -605,7 +605,17 @@ unsafe impl<'a, T: ?Sized> Freeze for &'a mut T {}
 ///
 /// [`PinMut`]: ../mem/struct.PinMut.html
 #[unstable(feature = "pin", issue = "49150")]
-pub unsafe auto trait Unpin {}
+pub auto trait Unpin {}
+
+/// A type which does not implement `Unpin`.
+///
+/// If a type contains a `Pinned`, it will not implement `Unpin` by default.
+#[unstable(feature = "pin", issue = "49150")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Pinned;
+
+#[unstable(feature = "pin", issue = "49150")]
+impl !Unpin for Pinned {}
 
 /// Implementations of `Copy` for primitive types.
 ///
