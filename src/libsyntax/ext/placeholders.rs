@@ -27,6 +27,7 @@ pub fn placeholder(kind: ExpansionKind, id: ast::NodeId) -> Expansion {
         dummy_spanned(ast::Mac_ {
             path: ast::Path { span: DUMMY_SP, segments: Vec::new() },
             tts: TokenStream::empty().into(),
+            delim: ast::MacDelimiter::Brace,
         })
     }
 
@@ -59,6 +60,10 @@ pub fn placeholder(kind: ExpansionKind, id: ast::NodeId) -> Expansion {
             node: ast::ImplItemKind::Macro(mac_placeholder()),
             defaultness: ast::Defaultness::Final,
             tokens: None,
+        })),
+        ExpansionKind::ForeignItems => Expansion::ForeignItems(SmallVector::one(ast::ForeignItem {
+            id, span, ident, vis, attrs,
+            node: ast::ForeignItemKind::Macro(mac_placeholder()),
         })),
         ExpansionKind::Pat => Expansion::Pat(P(ast::Pat {
             id, span, node: ast::PatKind::Mac(mac_placeholder()),
@@ -129,6 +134,13 @@ impl<'a, 'b> Folder for PlaceholderExpander<'a, 'b> {
         match item.node {
             ast::ImplItemKind::Macro(_) => self.remove(item.id).make_impl_items(),
             _ => noop_fold_impl_item(item, self),
+        }
+    }
+
+    fn fold_foreign_item(&mut self, item: ast::ForeignItem) -> SmallVector<ast::ForeignItem> {
+        match item.node {
+            ast::ForeignItemKind::Macro(_) => self.remove(item.id).make_foreign_items(),
+            _ => noop_fold_foreign_item(item, self),
         }
     }
 

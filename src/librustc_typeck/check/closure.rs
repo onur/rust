@@ -18,12 +18,12 @@ use rustc::infer::{InferOk, InferResult};
 use rustc::infer::LateBoundRegionConversionTime;
 use rustc::infer::type_variable::TypeVariableOrigin;
 use rustc::traits::error_reporting::ArgKind;
-use rustc::ty::{self, ToPolyTraitRef, Ty};
+use rustc::ty::{self, ToPolyTraitRef, Ty, GenericParamDefKind};
+use rustc::ty::fold::TypeFoldable;
 use rustc::ty::subst::Substs;
-use rustc::ty::TypeFoldable;
 use std::cmp;
 use std::iter;
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::codemap::Span;
 use rustc::hir;
 
@@ -104,32 +104,39 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // inference phase (`upvar.rs`).
         let base_substs =
             Substs::identity_for_item(self.tcx, self.tcx.closure_base_def_id(expr_def_id));
-        let substs = base_substs.extend_to(
-            self.tcx,
-            expr_def_id,
-            |_, _| span_bug!(expr.span, "closure has region param"),
-            |_, _| {
-                self.infcx
-                    .next_ty_var(ty::UniverseIndex::ROOT,
-                                 TypeVariableOrigin::ClosureSynthetic(expr.span))
-            },
-        );
-        let substs = ty::ClosureSubsts { substs };
-        let closure_type = self.tcx.mk_closure(expr_def_id, substs);
-
-        if let Some(GeneratorTypes { yield_ty, interior }) = generator_types {
+        let substs = base_substs.extend_to(self.tcx,expr_def_id, |param, _| {
+            match param.kind {
+                GenericParamDefKind::Lifetime => {
+                    span_bug!(expr.span, "closure has region param")
+                }
+                GenericParamDefKind::Type {..} => {
+                    self.infcx
+                        .next_ty_var(TypeVariableOrigin::ClosureSynthetic(expr.span)).into()
+                }
+            }
+        });
+        if let Some(GeneratorTypes { yield_ty, interior, movability }) = generator_types {
+            let substs = ty::GeneratorSubsts { substs };
             self.demand_eqtype(
                 expr.span,
                 yield_ty,
-                substs.generator_yield_ty(expr_def_id, self.tcx),
+                substs.yield_ty(expr_def_id, self.tcx),
             );
             self.demand_eqtype(
                 expr.span,
                 liberated_sig.output(),
-                substs.generator_return_ty(expr_def_id, self.tcx),
+                substs.return_ty(expr_def_id, self.tcx),
             );
-            return self.tcx.mk_generator(expr_def_id, substs, interior);
+            self.demand_eqtype(
+                expr.span,
+                interior,
+                substs.witness(expr_def_id, self.tcx),
+            );
+            return self.tcx.mk_generator(expr_def_id, substs, movability);
         }
+
+        let substs = ty::ClosureSubsts { substs };
+        let closure_type = self.tcx.mk_closure(expr_def_id, substs);
 
         debug!(
             "check_closure: expr.id={:?} closure_type={:?}",
@@ -304,7 +311,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             return None;
         }
 
-        let arg_param_ty = trait_ref.substs().type_at(1);
+        let arg_param_ty = trait_ref.skip_binder().substs.type_at(1);
         let arg_param_ty = self.resolve_type_vars_if_possible(&arg_param_ty);
         debug!(
             "deduce_sig_from_projection: arg_param_ty {:?}",
@@ -318,7 +325,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             }
         };
 
-        let ret_param_ty = projection.0.ty;
+        let ret_param_ty = projection.skip_binder().ty;
         let ret_param_ty = self.resolve_type_vars_if_possible(&ret_param_ty);
         debug!(
             "deduce_sig_from_projection: ret_param_ty {:?}",
@@ -458,8 +465,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // Create a `PolyFnSig`. Note the oddity that late bound
         // regions appearing free in `expected_sig` are now bound up
         // in this binder we are creating.
-        assert!(!expected_sig.sig.has_regions_escaping_depth(1));
-        let bound_sig = ty::Binder(self.tcx.mk_fn_sig(
+        assert!(!expected_sig.sig.has_regions_bound_above(ty::DebruijnIndex::INNERMOST));
+        let bound_sig = ty::Binder::bind(self.tcx.mk_fn_sig(
             expected_sig.sig.inputs().iter().cloned(),
             expected_sig.sig.output(),
             decl.variadic,
@@ -563,7 +570,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 let (supplied_ty, _) = self.infcx.replace_late_bound_regions_with_fresh_var(
                     hir_ty.span,
                     LateBoundRegionConversionTime::FnCall,
-                    &ty::Binder(supplied_ty),
+                    &ty::Binder::bind(supplied_ty),
                 ); // recreated from (*) above
 
                 // Check that E' = S'.
@@ -608,7 +615,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             hir::DefaultReturn(_) => astconv.ty_infer(decl.output.span()),
         };
 
-        let result = ty::Binder(self.tcx.mk_fn_sig(
+        let result = ty::Binder::bind(self.tcx.mk_fn_sig(
             supplied_arguments,
             supplied_return,
             decl.variadic,
@@ -640,7 +647,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             hir::DefaultReturn(_) => {}
         }
 
-        let result = ty::Binder(self.tcx.mk_fn_sig(
+        let result = ty::Binder::bind(self.tcx.mk_fn_sig(
             supplied_arguments,
             self.tcx.types.err,
             decl.variadic,

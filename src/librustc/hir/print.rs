@@ -10,7 +10,7 @@
 
 pub use self::AnnNode::*;
 
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::ast;
 use syntax::codemap::{CodeMap, Spanned};
 use syntax::parse::ParseSess;
@@ -416,16 +416,16 @@ impl<'a> State<'a> {
             hir::TyImplTraitExistential(ref existty, ref _lifetimes) => {
                 self.print_bounds("impl", &existty.bounds[..])?;
             }
-            hir::TyArray(ref ty, v) => {
+            hir::TyArray(ref ty, ref length) => {
                 self.s.word("[")?;
                 self.print_type(&ty)?;
                 self.s.word("; ")?;
-                self.ann.nested(self, Nested::Body(v))?;
+                self.print_anon_const(length)?;
                 self.s.word("]")?;
             }
-            hir::TyTypeof(e) => {
+            hir::TyTypeof(ref e) => {
                 self.s.word("typeof(")?;
-                self.ann.nested(self, Nested::Body(e))?;
+                self.print_anon_const(e)?;
                 self.s.word(")")?;
             }
             hir::TyInfer => {
@@ -524,15 +524,10 @@ impl<'a> State<'a> {
         self.print_outer_attributes(&item.attrs)?;
         self.ann.pre(self, NodeItem(item))?;
         match item.node {
-            hir::ItemExternCrate(ref optional_path) => {
+            hir::ItemExternCrate(orig_name) => {
                 self.head(&visibility_qualified(&item.vis, "extern crate"))?;
-                if let Some(p) = *optional_path {
-                    let val = p.as_str();
-                    if val.contains("-") {
-                        self.print_string(&val, ast::StrStyle::Cooked)?;
-                    } else {
-                        self.print_name(p)?;
-                    }
+                if let Some(orig_name) = orig_name {
+                    self.print_name(orig_name)?;
                     self.s.space()?;
                     self.s.word("as")?;
                     self.s.space()?;
@@ -862,7 +857,7 @@ impl<'a> State<'a> {
                 self.maybe_print_comment(field.span.lo())?;
                 self.print_outer_attributes(&field.attrs)?;
                 self.print_visibility(&field.vis)?;
-                self.print_name(field.name)?;
+                self.print_ident(field.ident)?;
                 self.word_nbsp(":")?;
                 self.print_type(&field.ty)?;
                 self.s.word(",")?;
@@ -876,10 +871,10 @@ impl<'a> State<'a> {
         self.head("")?;
         let generics = hir::Generics::empty();
         self.print_struct(&v.node.data, &generics, v.node.name, v.span, false)?;
-        if let Some(d) = v.node.disr_expr {
+        if let Some(ref d) = v.node.disr_expr {
             self.s.space()?;
             self.word_space("=")?;
-            self.ann.nested(self, Nested::Body(d))?;
+            self.print_anon_const(d)?;
         }
         Ok(())
     }
@@ -1052,7 +1047,7 @@ impl<'a> State<'a> {
                         self.print_else(e.as_ref().map(|e| &**e))
                     }
                     // "final else"
-                    hir::ExprBlock(ref b) => {
+                    hir::ExprBlock(ref b, _) => {
                         self.cbox(indent_unit - 1)?;
                         self.ibox(0)?;
                         self.s.word(" else ")?;
@@ -1096,6 +1091,9 @@ impl<'a> State<'a> {
         self.print_else(elseopt)
     }
 
+    pub fn print_anon_const(&mut self, constant: &hir::AnonConst) -> io::Result<()> {
+        self.ann.nested(self, Nested::Body(constant.body))
+    }
 
     fn print_call_post(&mut self, args: &[hir::Expr]) -> io::Result<()> {
         self.popen()?;
@@ -1146,12 +1144,12 @@ impl<'a> State<'a> {
         self.end()
     }
 
-    fn print_expr_repeat(&mut self, element: &hir::Expr, count: hir::BodyId) -> io::Result<()> {
+    fn print_expr_repeat(&mut self, element: &hir::Expr, count: &hir::AnonConst) -> io::Result<()> {
         self.ibox(indent_unit)?;
         self.s.word("[")?;
         self.print_expr(element)?;
         self.word_space(";")?;
-        self.ann.nested(self, Nested::Body(count))?;
+        self.print_anon_const(count)?;
         self.s.word("]")?;
         self.end()
     }
@@ -1168,7 +1166,7 @@ impl<'a> State<'a> {
                            |s, field| {
                                s.ibox(indent_unit)?;
                                if !field.is_shorthand {
-                                    s.print_name(field.name.node)?;
+                                    s.print_ident(field.ident)?;
                                     s.word_space(":")?;
                                }
                                s.print_expr(&field.expr)?;
@@ -1206,8 +1204,7 @@ impl<'a> State<'a> {
     fn print_expr_call(&mut self, func: &hir::Expr, args: &[hir::Expr]) -> io::Result<()> {
         let prec =
             match func.node {
-                hir::ExprField(..) |
-                hir::ExprTupField(..) => parser::PREC_FORCE_PAREN,
+                hir::ExprField(..) => parser::PREC_FORCE_PAREN,
                 _ => parser::PREC_POSTFIX,
             };
 
@@ -1294,7 +1291,7 @@ impl<'a> State<'a> {
             hir::ExprArray(ref exprs) => {
                 self.print_expr_vec(exprs)?;
             }
-            hir::ExprRepeat(ref element, count) => {
+            hir::ExprRepeat(ref element, ref count) => {
                 self.print_expr_repeat(&element, count)?;
             }
             hir::ExprStruct(ref qpath, ref fields, ref wth) => {
@@ -1383,7 +1380,11 @@ impl<'a> State<'a> {
                 // empty box to satisfy the close.
                 self.ibox(0)?;
             }
-            hir::ExprBlock(ref blk) => {
+            hir::ExprBlock(ref blk, opt_label) => {
+                if let Some(label) = opt_label {
+                    self.print_name(label.name)?;
+                    self.word_space(":")?;
+                }
                 // containing cbox, will be closed by print-block at }
                 self.cbox(indent_unit)?;
                 // head-box, will be closed by print-block after {
@@ -1405,15 +1406,10 @@ impl<'a> State<'a> {
                 self.word_space("=")?;
                 self.print_expr_maybe_paren(&rhs, prec)?;
             }
-            hir::ExprField(ref expr, name) => {
+            hir::ExprField(ref expr, ident) => {
                 self.print_expr_maybe_paren(expr, parser::PREC_POSTFIX)?;
                 self.s.word(".")?;
-                self.print_name(name.node)?;
-            }
-            hir::ExprTupField(ref expr, id) => {
-                self.print_expr_maybe_paren(&expr, parser::PREC_POSTFIX)?;
-                self.s.word(".")?;
-                self.print_usize(id.node)?;
+                self.print_ident(ident)?;
             }
             hir::ExprIndex(ref expr, ref index) => {
                 self.print_expr_maybe_paren(&expr, parser::PREC_POSTFIX)?;
@@ -1565,9 +1561,17 @@ impl<'a> State<'a> {
         self.s.word(&i.to_string())
     }
 
+    pub fn print_ident(&mut self, ident: ast::Ident) -> io::Result<()> {
+        if ident.is_raw_guess() {
+            self.s.word(&format!("r#{}", ident.name))?;
+        } else {
+            self.s.word(&ident.as_str())?;
+        }
+        self.ann.post(self, NodeName(&ident.name))
+    }
+
     pub fn print_name(&mut self, name: ast::Name) -> io::Result<()> {
-        self.s.word(&name.as_str())?;
-        self.ann.post(self, NodeName(&name))
+        self.print_ident(name.to_ident())
     }
 
     pub fn print_for_decl(&mut self, loc: &hir::Local, coll: &hir::Expr) -> io::Result<()> {
@@ -1773,7 +1777,7 @@ impl<'a> State<'a> {
                                    |s, f| {
                                        s.cbox(indent_unit)?;
                                        if !f.node.is_shorthand {
-                                           s.print_name(f.node.name)?;
+                                           s.print_ident(f.node.ident)?;
                                            s.word_nbsp(":")?;
                                        }
                                        s.print_pat(&f.node.pat)?;
@@ -1900,7 +1904,11 @@ impl<'a> State<'a> {
         self.word_space("=>")?;
 
         match arm.body.node {
-            hir::ExprBlock(ref blk) => {
+            hir::ExprBlock(ref blk, opt_label) => {
+                if let Some(label) = opt_label {
+                    self.print_name(label.name)?;
+                    self.word_space(":")?;
+                }
                 // the block will close the pattern's ibox
                 self.print_block_unclosed_indent(&blk, indent_unit)?;
 
@@ -2306,7 +2314,7 @@ fn expr_requires_semi_to_be_stmt(e: &hir::Expr) -> bool {
     match e.node {
         hir::ExprIf(..) |
         hir::ExprMatch(..) |
-        hir::ExprBlock(_) |
+        hir::ExprBlock(..) |
         hir::ExprWhile(..) |
         hir::ExprLoop(..) => false,
         _ => true,
@@ -2377,7 +2385,6 @@ fn contains_exterior_struct_lit(value: &hir::Expr) -> bool {
         hir::ExprCast(ref x, _) |
         hir::ExprType(ref x, _) |
         hir::ExprField(ref x, _) |
-        hir::ExprTupField(ref x, _) |
         hir::ExprIndex(ref x, _) => {
             // &X { y: 1 }, X { y: 1 }.y
             contains_exterior_struct_lit(&x)

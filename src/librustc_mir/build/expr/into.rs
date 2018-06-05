@@ -16,7 +16,7 @@ use hair::*;
 use rustc::ty;
 use rustc::mir::*;
 
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 
 impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
     /// Compile `expr`, storing the result into `destination`, which
@@ -220,7 +220,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                         let f = ty.fn_sig(this.hir.tcx());
                         if f.abi() == Abi::RustIntrinsic ||
                            f.abi() == Abi::PlatformIntrinsic {
-                            Some(this.hir.tcx().item_name(def_id))
+                            Some(this.hir.tcx().item_name(def_id).as_str())
                         } else {
                             None
                         }
@@ -247,7 +247,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                         ty: ptr_ty,
                         name: None,
                         source_info,
-                        syntactic_scope: source_info.scope,
+                        visibility_scope: source_info.scope,
                         internal: true,
                         is_user_variable: false
                     });

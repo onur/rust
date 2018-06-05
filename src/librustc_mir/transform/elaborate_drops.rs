@@ -15,11 +15,8 @@ use dataflow::{on_all_children_bits, on_all_drop_children_bits};
 use dataflow::{drop_flag_effects_for_location, on_lookup_result_bits};
 use dataflow::MoveDataParamEnv;
 use dataflow::{self, do_dataflow, DebugFormatted};
-use rustc::hir;
 use rustc::ty::{self, TyCtxt};
 use rustc::mir::*;
-use rustc::middle::const_val::ConstVal;
-use rustc::mir::interpret::{Value, PrimVal};
 use rustc::util::nodemap::FxHashMap;
 use rustc_data_structures::indexed_set::IdxSetBuf;
 use rustc_data_structures::indexed_vec::Idx;
@@ -42,15 +39,8 @@ impl MirPass for ElaborateDrops {
     {
         debug!("elaborate_drops({:?} @ {:?})", src, mir.span);
 
-        // Don't run on constant MIR, because trans might not be able to
-        // evaluate the modified MIR.
-        // FIXME(eddyb) Remove check after miri is merged.
         let id = tcx.hir.as_local_node_id(src.def_id).unwrap();
-        match (tcx.hir.body_owner_kind(id), src.promoted) {
-            (hir::BodyOwnerKind::Fn, None) => {},
-            _ => return
-        }
-        let param_env = tcx.param_env(src.def_id);
+        let param_env = tcx.param_env(src.def_id).with_reveal_all();
         let move_data = MoveData::gather_moves(mir, tcx).unwrap();
         let elaborate_patch = {
             let mir = &*mir;
@@ -182,7 +172,7 @@ struct Elaborator<'a, 'b: 'a, 'tcx: 'b> {
 }
 
 impl<'a, 'b, 'tcx> fmt::Debug for Elaborator<'a, 'b, 'tcx> {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
         Ok(())
     }
 }
@@ -452,7 +442,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     /// Elaborate a MIR `replace` terminator. This instruction
-    /// is not directly handled by translation, and therefore
+    /// is not directly handled by codegen, and therefore
     /// must be desugared.
     ///
     /// The desugaring drops the location if needed, and then writes
@@ -541,10 +531,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
             span,
             ty: self.tcx.types.bool,
             literal: Literal::Value {
-                value: self.tcx.mk_const(ty::Const {
-                    val: ConstVal::Value(Value::ByVal(PrimVal::Bytes(val as u128))),
-                    ty: self.tcx.types.bool
-                })
+                value: ty::Const::from_bool(self.tcx, val)
             }
         })))
     }
@@ -558,7 +545,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn drop_flags_on_init(&mut self) {
-        let loc = Location { block: START_BLOCK, statement_index: 0 };
+        let loc = Location::START;
         let span = self.patch.source_info_for_location(self.mir, loc).span;
         let false_ = self.constant_bool(span, false);
         for flag in self.drop_flags.values() {
@@ -584,7 +571,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn drop_flags_for_args(&mut self) {
-        let loc = Location { block: START_BLOCK, statement_index: 0 };
+        let loc = Location::START;
         dataflow::drop_flag_effects_for_function_entry(
             self.tcx, self.mir, self.env, |path, ds| {
                 self.set_drop_flag(loc, path, ds);

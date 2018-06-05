@@ -14,38 +14,33 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 
 */
 
-#![deny(warnings)]
-
 #![feature(slice_patterns)]
+#![feature(slice_sort_by_cached_key)]
 #![feature(from_ref)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 #![feature(catch_expr)]
-#![feature(conservative_impl_trait)]
+#![feature(crate_visibility_modifier)]
 #![feature(const_fn)]
 #![feature(core_intrinsics)]
 #![feature(decl_macro)]
-#![feature(dyn_trait)]
 #![feature(fs_read_write)]
-#![feature(i128_type)]
-#![cfg_attr(stage0, feature(inclusive_range_syntax))]
 #![feature(macro_vis_matcher)]
-#![feature(match_default_bindings)]
 #![feature(exhaustive_patterns)]
 #![feature(range_contains)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(placement_in_syntax)]
-#![feature(collection_placement)]
-#![feature(nonzero)]
-#![feature(underscore_lifetimes)]
-#![cfg_attr(stage0, feature(never_type))]
-#![feature(inclusive_range_fields)]
+#![feature(crate_visibility_modifier)]
+#![feature(never_type)]
+#![feature(specialization)]
+#![feature(try_trait)]
 
 extern crate arena;
 #[macro_use]
 extern crate bitflags;
 #[macro_use] extern crate log;
+extern crate either;
 extern crate graphviz as dot;
+extern crate polonius_engine;
 #[macro_use]
 extern crate rustc;
 #[macro_use] extern crate rustc_data_structures;
@@ -54,9 +49,7 @@ extern crate rustc_errors;
 #[macro_use]
 extern crate syntax;
 extern crate syntax_pos;
-extern crate rustc_back;
-extern crate rustc_const_math;
-extern crate core; // for NonZero
+extern crate rustc_target;
 extern crate log_settings;
 extern crate rustc_apfloat;
 extern crate byteorder;
@@ -81,6 +74,7 @@ pub fn provide(providers: &mut Providers) {
     shim::provide(providers);
     transform::provide(providers);
     providers.const_eval = interpret::const_eval_provider;
+    providers.const_value_to_allocation = interpret::const_value_to_allocation_provider;
     providers.check_match = hair::pattern::check_match;
 }
 

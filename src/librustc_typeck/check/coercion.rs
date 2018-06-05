@@ -60,14 +60,14 @@
 //! sort of a minor point so I've opted to leave it for later---after all
 //! we may want to adjust precisely when coercions occur.
 
-use check::{Diverges, FnCtxt, Needs};
+use check::{FnCtxt, Needs};
 
 use rustc::hir;
 use rustc::hir::def_id::DefId;
 use rustc::infer::{Coercion, InferResult, InferOk};
 use rustc::infer::type_variable::TypeVariableOrigin;
 use rustc::traits::{self, ObligationCause, ObligationCauseCode};
-use rustc::ty::adjustment::{Adjustment, Adjust, AutoBorrow, AutoBorrowMutability};
+use rustc::ty::adjustment::{Adjustment, Adjust, AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
 use rustc::ty::{self, TypeAndMut, Ty, ClosureSubsts};
 use rustc::ty::fold::TypeFoldable;
 use rustc::ty::error::TypeError;
@@ -84,6 +84,13 @@ struct Coerce<'a, 'gcx: 'a + 'tcx, 'tcx: 'a> {
     fcx: &'a FnCtxt<'a, 'gcx, 'tcx>,
     cause: ObligationCause<'tcx>,
     use_lub: bool,
+    /// Determines whether or not allow_two_phase_borrow is set on any
+    /// autoref adjustments we create while coercing. We don't want to
+    /// allow deref coercions to create two-phase borrows, at least initially,
+    /// but we do need two-phase borrows for function argument reborrows.
+    /// See #47489 and #48598
+    /// See docs on the "AllowTwoPhase" type for a more detailed discussion
+    allow_two_phase: AllowTwoPhase,
 }
 
 impl<'a, 'gcx, 'tcx> Deref for Coerce<'a, 'gcx, 'tcx> {
@@ -123,10 +130,13 @@ fn success<'tcx>(adj: Vec<Adjustment<'tcx>>,
 }
 
 impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
-    fn new(fcx: &'f FnCtxt<'f, 'gcx, 'tcx>, cause: ObligationCause<'tcx>) -> Self {
+    fn new(fcx: &'f FnCtxt<'f, 'gcx, 'tcx>,
+           cause: ObligationCause<'tcx>,
+           allow_two_phase: AllowTwoPhase) -> Self {
         Coerce {
             fcx,
             cause,
+            allow_two_phase,
             use_lub: false,
         }
     }
@@ -176,7 +186,6 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
                 // micro-optimization: no need for this if `b` is
                 // already resolved in some way.
                 let diverging_ty = self.next_diverging_ty_var(
-                    ty::UniverseIndex::ROOT,
                     TypeVariableOrigin::AdjustmentType(self.cause.span));
                 self.unify_and(&b, &diverging_ty, simple(Adjust::NeverToAny))
             } else {
@@ -205,7 +214,8 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
                 return self.coerce_unsafe_ptr(a, b, mt_b.mutbl);
             }
 
-            ty::TyRef(r_b, mt_b) => {
+            ty::TyRef(r_b, ty, mutbl) => {
+                let mt_b = ty::TypeAndMut { ty, mutbl };
                 return self.coerce_borrowed_pointer(a, b, r_b, mt_b);
             }
 
@@ -257,7 +267,8 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
         // yield.
 
         let (r_a, mt_a) = match a.sty {
-            ty::TyRef(r_a, mt_a) => {
+            ty::TyRef(r_a, ty, mutbl) => {
+                let mt_a = ty::TypeAndMut { ty, mutbl };
                 coerce_mutbls(mt_a.mutbl, mt_b.mutbl)?;
                 (r_a, mt_a)
             }
@@ -418,16 +429,13 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
         // Now apply the autoref. We have to extract the region out of
         // the final ref type we got.
         let r_borrow = match ty.sty {
-            ty::TyRef(r_borrow, _) => r_borrow,
+            ty::TyRef(r_borrow, _, _) => r_borrow,
             _ => span_bug!(span, "expected a ref type, got {:?}", ty),
         };
         let mutbl = match mt_b.mutbl {
             hir::MutImmutable => AutoBorrowMutability::Immutable,
             hir::MutMutable => AutoBorrowMutability::Mutable {
-                // Deref-coercion is a case where we deliberately
-                // disallow two-phase borrows in its initial
-                // deployment; see discussion on PR #47489.
-                allow_two_phase_borrow: false,
+                allow_two_phase_borrow: self.allow_two_phase,
             }
         };
         adjustments.push(Adjustment {
@@ -465,39 +473,42 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
 
         // Handle reborrows before selecting `Source: CoerceUnsized<Target>`.
         let reborrow = match (&source.sty, &target.sty) {
-            (&ty::TyRef(_, mt_a), &ty::TyRef(_, mt_b)) => {
-                coerce_mutbls(mt_a.mutbl, mt_b.mutbl)?;
+            (&ty::TyRef(_, ty_a, mutbl_a), &ty::TyRef(_, _, mutbl_b)) => {
+                coerce_mutbls(mutbl_a, mutbl_b)?;
 
                 let coercion = Coercion(self.cause.span);
                 let r_borrow = self.next_region_var(coercion);
-                let mutbl = match mt_b.mutbl {
+                let mutbl = match mutbl_b {
                     hir::MutImmutable => AutoBorrowMutability::Immutable,
                     hir::MutMutable => AutoBorrowMutability::Mutable {
-                        allow_two_phase_borrow: false,
+                        // We don't allow two-phase borrows here, at least for initial
+                        // implementation. If it happens that this coercion is a function argument,
+                        // the reborrow in coerce_borrowed_ptr will pick it up.
+                        allow_two_phase_borrow: AllowTwoPhase::No,
                     }
                 };
                 Some((Adjustment {
                     kind: Adjust::Deref(None),
-                    target: mt_a.ty
+                    target: ty_a
                 }, Adjustment {
                     kind: Adjust::Borrow(AutoBorrow::Ref(r_borrow, mutbl)),
                     target:  self.tcx.mk_ref(r_borrow, ty::TypeAndMut {
-                        mutbl: mt_b.mutbl,
-                        ty: mt_a.ty
+                        mutbl: mutbl_b,
+                        ty: ty_a
                     })
                 }))
             }
-            (&ty::TyRef(_, mt_a), &ty::TyRawPtr(mt_b)) => {
-                coerce_mutbls(mt_a.mutbl, mt_b.mutbl)?;
+            (&ty::TyRef(_, ty_a, mt_a), &ty::TyRawPtr(ty::TypeAndMut { mutbl: mt_b, .. })) => {
+                coerce_mutbls(mt_a, mt_b)?;
 
                 Some((Adjustment {
                     kind: Adjust::Deref(None),
-                    target: mt_a.ty
+                    target: ty_a
                 }, Adjustment {
-                    kind: Adjust::Borrow(AutoBorrow::RawPtr(mt_b.mutbl)),
+                    kind: Adjust::Borrow(AutoBorrow::RawPtr(mt_b)),
                     target:  self.tcx.mk_ptr(ty::TypeAndMut {
-                        mutbl: mt_b.mutbl,
-                        ty: mt_a.ty
+                        mutbl: mt_b,
+                        ty: ty_a
                     })
                 }))
             }
@@ -510,7 +521,7 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
         // We only have the latter, so we use an inference variable
         // for the former and let type inference do the rest.
         let origin = TypeVariableOrigin::MiscVariable(self.cause.span);
-        let coerce_target = self.next_ty_var(ty::UniverseIndex::ROOT, origin);
+        let coerce_target = self.next_ty_var(origin);
         let mut coercion = self.unify_and(coerce_target, target, |target| {
             let unsize = Adjustment {
                 kind: Adjust::Unsize,
@@ -526,8 +537,9 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
 
         let mut selcx = traits::SelectionContext::new(self);
 
-        // Use a FIFO queue for this custom fulfillment procedure.
-        let mut queue = VecDeque::new();
+        // Use a FIFO queue for this custom fulfillment procedure. (The maximum
+        // length is almost always 1.)
+        let mut queue = VecDeque::with_capacity(1);
 
         // Create an obligation for `Source: CoerceUnsized<Target>`.
         let cause = ObligationCause::misc(self.cause.span, self.body_id);
@@ -536,7 +548,7 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
                                                          coerce_unsized_did,
                                                          0,
                                                          coerce_source,
-                                                         &[coerce_target]));
+                                                         &[coerce_target.into()]));
 
         let mut has_unsized_tuple_coercion = false;
 
@@ -549,7 +561,8 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
             let trait_ref = match obligation.predicate {
                 ty::Predicate::Trait(ref tr) if traits.contains(&tr.def_id()) => {
                     if unsize_did == tr.def_id() {
-                        if let ty::TyTuple(..) = tr.0.input_types().nth(1).unwrap().sty {
+                        let sty = &tr.skip_binder().input_types().nth(1).unwrap().sty;
+                        if let ty::TyTuple(..) = sty {
                             debug!("coerce_unsized: found unsized tuple coercion");
                             has_unsized_tuple_coercion = true;
                         }
@@ -709,7 +722,7 @@ impl<'f, 'gcx, 'tcx> Coerce<'f, 'gcx, 'tcx> {
         debug!("coerce_unsafe_ptr(a={:?}, b={:?})", a, b);
 
         let (is_ref, mt_a) = match a.sty {
-            ty::TyRef(_, mt) => (true, mt),
+            ty::TyRef(_, ty, mutbl) => (true, ty::TypeAndMut { ty, mutbl }),
             ty::TyRawPtr(mt) => (false, mt),
             _ => {
                 return self.unify_and(a, b, identity);
@@ -751,13 +764,14 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     pub fn try_coerce(&self,
                       expr: &hir::Expr,
                       expr_ty: Ty<'tcx>,
-                      target: Ty<'tcx>)
+                      target: Ty<'tcx>,
+                      allow_two_phase: AllowTwoPhase)
                       -> RelateResult<'tcx, Ty<'tcx>> {
         let source = self.resolve_type_vars_with_obligations(expr_ty);
         debug!("coercion::try({:?}: {:?} -> {:?})", expr, source, target);
 
         let cause = self.cause(expr.span, ObligationCauseCode::ExprAssignable);
-        let coerce = Coerce::new(self, cause);
+        let coerce = Coerce::new(self, cause, allow_two_phase);
         let ok = self.commit_if_ok(|_| coerce.coerce(source, target))?;
 
         let (adjustments, _) = self.register_infer_ok_obligations(ok);
@@ -771,7 +785,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         debug!("coercion::can({:?} -> {:?})", source, target);
 
         let cause = self.cause(syntax_pos::DUMMY_SP, ObligationCauseCode::ExprAssignable);
-        let coerce = Coerce::new(self, cause);
+        // We don't ever need two-phase here since we throw out the result of the coercion
+        let coerce = Coerce::new(self, cause, AllowTwoPhase::No);
         self.probe(|_| coerce.coerce(source, target)).is_ok()
     }
 
@@ -786,21 +801,13 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                 exprs: &[E],
                                 prev_ty: Ty<'tcx>,
                                 new: &hir::Expr,
-                                new_ty: Ty<'tcx>,
-                                new_diverges: Diverges)
+                                new_ty: Ty<'tcx>)
                                 -> RelateResult<'tcx, Ty<'tcx>>
         where E: AsCoercionSite
     {
         let prev_ty = self.resolve_type_vars_with_obligations(prev_ty);
         let new_ty = self.resolve_type_vars_with_obligations(new_ty);
         debug!("coercion::try_find_coercion_lub({:?}, {:?})", prev_ty, new_ty);
-
-        // Special-ish case: we can coerce any type `T` into the `!`
-        // type, but only if the source expression diverges.
-        if prev_ty.is_never() && new_diverges.always() {
-            debug!("permit coercion to `!` because expr diverges");
-            return Ok(prev_ty);
-        }
 
         // Special-case that coercion alone cannot handle:
         // Two function item types of differing IDs or Substs.
@@ -840,7 +847,12 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             return Ok(fn_ptr);
         }
 
-        let mut coerce = Coerce::new(self, cause.clone());
+        // Configure a Coerce instance to compute the LUB.
+        // We don't allow two-phase borrows on any autorefs this creates since we
+        // probably aren't processing function arguments here and even if we were,
+        // they're going to get autorefed again anyway and we can apply 2-phase borrows
+        // at that time.
+        let mut coerce = Coerce::new(self, cause.clone(), AllowTwoPhase::No);
         coerce.use_lub = true;
 
         // First try to coerce the new expression to the type of the previous ones,
@@ -869,12 +881,12 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                     Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(_, mutbl_adj)), .. }
                 ] => {
                     match self.node_ty(expr.hir_id).sty {
-                        ty::TyRef(_, mt_orig) => {
+                        ty::TyRef(_, _, mt_orig) => {
                             let mutbl_adj: hir::Mutability = mutbl_adj.into();
                             // Reborrow that we can safely ignore, because
                             // the next adjustment can only be a Deref
                             // which will be merged into it.
-                            mutbl_adj == mt_orig.mutbl
+                            mutbl_adj == mt_orig
                         }
                         _ => false,
                     }
@@ -1035,14 +1047,12 @@ impl<'gcx, 'tcx, 'exprs, E> CoerceMany<'gcx, 'tcx, 'exprs, E>
                       fcx: &FnCtxt<'a, 'gcx, 'tcx>,
                       cause: &ObligationCause<'tcx>,
                       expression: &'gcx hir::Expr,
-                      expression_ty: Ty<'tcx>,
-                      expression_diverges: Diverges)
+                      expression_ty: Ty<'tcx>)
     {
         self.coerce_inner(fcx,
                           cause,
                           Some(expression),
                           expression_ty,
-                          expression_diverges,
                           None, false)
     }
 
@@ -1068,7 +1078,6 @@ impl<'gcx, 'tcx, 'exprs, E> CoerceMany<'gcx, 'tcx, 'exprs, E>
                           cause,
                           None,
                           fcx.tcx.mk_nil(),
-                          Diverges::Maybe,
                           Some(augment_error),
                           label_unit_as_expected)
     }
@@ -1081,7 +1090,6 @@ impl<'gcx, 'tcx, 'exprs, E> CoerceMany<'gcx, 'tcx, 'exprs, E>
                         cause: &ObligationCause<'tcx>,
                         expression: Option<&'gcx hir::Expr>,
                         mut expression_ty: Ty<'tcx>,
-                        expression_diverges: Diverges,
                         augment_error: Option<&mut FnMut(&mut DiagnosticBuilder)>,
                         label_expression_as_expected: bool)
     {
@@ -1106,7 +1114,8 @@ impl<'gcx, 'tcx, 'exprs, E> CoerceMany<'gcx, 'tcx, 'exprs, E>
             if self.pushed == 0 {
                 // Special-case the first expression we are coercing.
                 // To be honest, I'm not entirely sure why we do this.
-                fcx.try_coerce(expression, expression_ty, self.expected_ty)
+                // We don't allow two-phase borrows, see comment in try_find_coercion_lub for why
+                fcx.try_coerce(expression, expression_ty, self.expected_ty, AllowTwoPhase::No)
             } else {
                 match self.expressions {
                     Expressions::Dynamic(ref exprs) =>
@@ -1114,15 +1123,13 @@ impl<'gcx, 'tcx, 'exprs, E> CoerceMany<'gcx, 'tcx, 'exprs, E>
                                                   exprs,
                                                   self.merged_ty(),
                                                   expression,
-                                                  expression_ty,
-                                                  expression_diverges),
+                                                  expression_ty),
                     Expressions::UpFront(ref coercion_sites) =>
                         fcx.try_find_coercion_lub(cause,
                                                   &coercion_sites[0..self.pushed],
                                                   self.merged_ty(),
                                                   expression,
-                                                  expression_ty,
-                                                  expression_diverges),
+                                                  expression_ty),
                 }
             }
         } else {

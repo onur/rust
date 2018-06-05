@@ -43,9 +43,11 @@ use std::collections::HashSet;
 
 use syntax::ast;
 use syntax::attr;
+use syntax::edition::Edition;
 use syntax::feature_gate::{AttributeGate, AttributeType, Stability, deprecated_attributes};
 use syntax_pos::{BytePos, Span, SyntaxContext};
 use syntax::symbol::keywords;
+use syntax::errors::{Applicability, DiagnosticBuilder};
 
 use rustc::hir::{self, PatKind};
 use rustc::hir::intravisit::FnKind;
@@ -165,21 +167,32 @@ impl LintPass for NonShorthandFieldPatterns {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NonShorthandFieldPatterns {
     fn check_pat(&mut self, cx: &LateContext, pat: &hir::Pat) {
-        if let PatKind::Struct(_, ref field_pats, _) = pat.node {
+        if let PatKind::Struct(ref qpath, ref field_pats, _) = pat.node {
+            let variant = cx.tables.pat_ty(pat).ty_adt_def()
+                                   .expect("struct pattern type is not an ADT")
+                                   .variant_of_def(cx.tables.qpath_def(qpath, pat.hir_id));
             for fieldpat in field_pats {
                 if fieldpat.node.is_shorthand {
                     continue;
                 }
-                if let PatKind::Binding(_, _, ident, None) = fieldpat.node.pat.node {
-                    if ident.node == fieldpat.node.name {
+                if fieldpat.span.ctxt().outer().expn_info().is_some() {
+                    // Don't lint if this is a macro expansion: macro authors
+                    // shouldn't have to worry about this kind of style issue
+                    // (Issue #49588)
+                    continue;
+                }
+                if let PatKind::Binding(_, _, name, None) = fieldpat.node.pat.node {
+                    let binding_ident = ast::Ident::new(name.node, name.span);
+                    if cx.tcx.find_field_index(binding_ident, &variant) ==
+                       Some(cx.tcx.field_index(fieldpat.node.id, cx.tables)) {
                         let mut err = cx.struct_span_lint(NON_SHORTHAND_FIELD_PATTERNS,
                                      fieldpat.span,
                                      &format!("the `{}:` in this pattern is redundant",
-                                              ident.node));
+                                              name.node));
                         let subspan = cx.tcx.sess.codemap().span_through_char(fieldpat.span, ':');
                         err.span_suggestion_short(subspan,
                                                   "remove this",
-                                                  format!("{}", ident.node));
+                                                  format!("{}", name.node));
                         err.emit();
                     }
                 }
@@ -216,7 +229,7 @@ impl UnsafeCode {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnsafeCode {
     fn check_expr(&mut self, cx: &LateContext, e: &hir::Expr) {
-        if let hir::ExprBlock(ref blk) = e.node {
+        if let hir::ExprBlock(ref blk, _) = e.node {
             // Don't warn about generated blocks, that'll just pollute the output.
             if blk.rules == hir::UnsafeBlock(hir::UserProvided) {
                 self.report_unsafe(cx, blk.span, "usage of an `unsafe` block");
@@ -529,7 +542,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MissingCopyImplementations {
         if !ty.moves_by_default(cx.tcx, param_env, item.span) {
             return;
         }
-        if param_env.can_type_implement_copy(cx.tcx, ty, item.span).is_ok() {
+        if param_env.can_type_implement_copy(cx.tcx, ty).is_ok() {
             cx.span_lint(MISSING_COPY_IMPLEMENTATIONS,
                          item.span,
                          "type could implement `Copy`; consider adding `impl \
@@ -604,7 +617,8 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MissingDebugImplementations {
 declare_lint! {
     pub ANONYMOUS_PARAMETERS,
     Allow,
-    "detects anonymous parameters"
+    "detects anonymous parameters",
+    Edition::Edition2018 => Warn,
 }
 
 /// Checks for use of anonymous parameters (RFC 1685)
@@ -624,10 +638,30 @@ impl EarlyLintPass for AnonymousParameters {
                 for arg in sig.decl.inputs.iter() {
                     match arg.pat.node {
                         ast::PatKind::Ident(_, ident, None) => {
-                            if ident.node.name == keywords::Invalid.name() {
-                                cx.span_lint(ANONYMOUS_PARAMETERS,
-                                             arg.pat.span,
-                                             "use of deprecated anonymous parameter");
+                            if ident.name == keywords::Invalid.name() {
+                                let ty_snip = cx
+                                    .sess
+                                    .codemap()
+                                    .span_to_snippet(arg.ty.span);
+
+                                let (ty_snip, appl) = if let Ok(snip) = ty_snip {
+                                    (snip, Applicability::MachineApplicable)
+                                } else {
+                                    ("<type>".to_owned(), Applicability::HasPlaceholders)
+                                };
+
+                                cx.struct_span_lint(
+                                    ANONYMOUS_PARAMETERS,
+                                    arg.pat.span,
+                                    "anonymous parameters are deprecated and will be \
+                                     removed in the next edition."
+                                ).span_suggestion_with_applicability(
+                                    arg.pat.span,
+                                    "Try naming the parameter or explicitly \
+                                    ignoring it",
+                                    format!("_: {}", ty_snip),
+                                    appl
+                                ).emit();
                             }
                         }
                         _ => (),
@@ -663,9 +697,8 @@ impl LintPass for DeprecatedAttr {
 
 impl EarlyLintPass for DeprecatedAttr {
     fn check_attribute(&mut self, cx: &EarlyContext, attr: &ast::Attribute) {
-        let name = unwrap_or!(attr.name(), return);
         for &&(n, _, ref g) in &self.depr_attrs {
-            if name == n {
+            if attr.name() == n {
                 if let &AttributeGate::Gated(Stability::Deprecated(link),
                                              ref name,
                                              ref reason,
@@ -683,7 +716,7 @@ impl EarlyLintPass for DeprecatedAttr {
 }
 
 declare_lint! {
-    pub UNUSED_DOC_COMMENT,
+    pub UNUSED_DOC_COMMENTS,
     Warn,
     "detects doc comments that aren't used by rustdoc"
 }
@@ -693,7 +726,7 @@ pub struct UnusedDocComment;
 
 impl LintPass for UnusedDocComment {
     fn get_lints(&self) -> LintArray {
-        lint_array![UNUSED_DOC_COMMENT]
+        lint_array![UNUSED_DOC_COMMENTS]
     }
 }
 
@@ -702,7 +735,7 @@ impl UnusedDocComment {
                    I: Iterator<Item=&'a ast::Attribute>,
                    C: LintContext<'tcx>>(&self, mut attrs: I, cx: &C) {
         if let Some(attr) = attrs.find(|a| a.is_value_str() && a.check_name("doc")) {
-            cx.struct_span_lint(UNUSED_DOC_COMMENT, attr.span, "doc comment not used by rustdoc")
+            cx.struct_span_lint(UNUSED_DOC_COMMENTS, attr.span, "doc comment not used by rustdoc")
               .emit();
         }
     }
@@ -948,7 +981,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnconditionalRecursion {
                 // Attempt to select a concrete impl before checking.
                 ty::TraitContainer(trait_def_id) => {
                     let trait_ref = ty::TraitRef::from_method(tcx, trait_def_id, callee_substs);
-                    let trait_ref = ty::Binder(trait_ref);
+                    let trait_ref = ty::Binder::bind(trait_ref);
                     let span = tcx.hir.span(expr_id);
                     let obligation =
                         traits::Obligation::new(traits::ObligationCause::misc(span, expr_id),
@@ -1082,7 +1115,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for InvalidNoMangleItems {
                     if !cx.access_levels.is_reachable(it.id) {
                         let msg = "function is marked #[no_mangle], but not exported";
                         let mut err = cx.struct_span_lint(PRIVATE_NO_MANGLE_FNS, it.span, msg);
-                        let insertion_span = it.span.with_hi(it.span.lo());
+                        let insertion_span = it.span.shrink_to_lo();
                         if it.vis == hir::Visibility::Inherited {
                             err.span_suggestion(insertion_span,
                                                 "try making it public",
@@ -1107,7 +1140,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for InvalidNoMangleItems {
                    !cx.access_levels.is_reachable(it.id) {
                        let msg = "static is marked #[no_mangle], but not exported";
                        let mut err = cx.struct_span_lint(PRIVATE_NO_MANGLE_STATICS, it.span, msg);
-                       let insertion_span = it.span.with_hi(it.span.lo());
+                       let insertion_span = it.span.shrink_to_lo();
                        if it.vis == hir::Visibility::Inherited {
                            err.span_suggestion(insertion_span,
                                                "try making it public",
@@ -1157,14 +1190,14 @@ impl LintPass for MutableTransmutes {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MutableTransmutes {
     fn check_expr(&mut self, cx: &LateContext, expr: &hir::Expr) {
-        use syntax::abi::Abi::RustIntrinsic;
+        use rustc_target::spec::abi::Abi::RustIntrinsic;
 
         let msg = "mutating transmuted &mut T from &T may cause undefined behavior, \
                    consider instead using an UnsafeCell";
         match get_transmute_from_to(cx, expr) {
-            Some((&ty::TyRef(_, from_mt), &ty::TyRef(_, to_mt))) => {
-                if to_mt.mutbl == hir::Mutability::MutMutable &&
-                   from_mt.mutbl == hir::Mutability::MutImmutable {
+            Some((&ty::TyRef(_, _, from_mt), &ty::TyRef(_, _, to_mt))) => {
+                if to_mt == hir::Mutability::MutMutable &&
+                   from_mt == hir::Mutability::MutImmutable {
                     cx.span_lint(MUTABLE_TRANSMUTES, expr.span, msg);
                 }
             }
@@ -1276,20 +1309,27 @@ impl LintPass for UnreachablePub {
 
 impl UnreachablePub {
     fn perform_lint(&self, cx: &LateContext, what: &str, id: ast::NodeId,
-                    vis: &hir::Visibility, span: Span, exportable: bool) {
+                    vis: &hir::Visibility, span: Span, exportable: bool,
+                    mut applicability: Applicability) {
         if !cx.access_levels.is_reachable(id) && *vis == hir::Visibility::Public {
+            if span.ctxt().outer().expn_info().is_some() {
+                applicability = Applicability::MaybeIncorrect;
+            }
             let def_span = cx.tcx.sess.codemap().def_span(span);
             let mut err = cx.struct_span_lint(UNREACHABLE_PUB, def_span,
                                               &format!("unreachable `pub` {}", what));
-            // visibility is token at start of declaration (can be macro
-            // variable rather than literal `pub`)
+            // We are presuming that visibility is token at start of
+            // declaration (can be macro variable rather than literal `pub`)
             let pub_span = cx.tcx.sess.codemap().span_until_char(def_span, ' ');
             let replacement = if cx.tcx.features().crate_visibility_modifier {
                 "crate"
             } else {
                 "pub(crate)"
             }.to_owned();
-            err.span_suggestion(pub_span, "consider restricting its visibility", replacement);
+            err.span_suggestion_with_applicability(pub_span,
+                                                   "consider restricting its visibility",
+                                                   replacement,
+                                                   applicability);
             if exportable {
                 err.help("or consider exporting it for use by other crates");
             }
@@ -1298,66 +1338,335 @@ impl UnreachablePub {
     }
 }
 
+
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnreachablePub {
     fn check_item(&mut self, cx: &LateContext, item: &hir::Item) {
-        self.perform_lint(cx, "item", item.id, &item.vis, item.span, true);
+        let applicability = match item.node {
+            // suggestion span-manipulation is inadequate for `pub use
+            // module::{item}` (Issue #50455)
+            hir::ItemUse(..) => Applicability::MaybeIncorrect,
+            _ => Applicability::MachineApplicable,
+        };
+        self.perform_lint(cx, "item", item.id, &item.vis, item.span, true, applicability);
     }
 
     fn check_foreign_item(&mut self, cx: &LateContext, foreign_item: &hir::ForeignItem) {
-        self.perform_lint(cx, "item", foreign_item.id, &foreign_item.vis, foreign_item.span, true);
+        self.perform_lint(cx, "item", foreign_item.id, &foreign_item.vis,
+                          foreign_item.span, true, Applicability::MachineApplicable);
     }
 
     fn check_struct_field(&mut self, cx: &LateContext, field: &hir::StructField) {
-        self.perform_lint(cx, "field", field.id, &field.vis, field.span, false);
+        self.perform_lint(cx, "field", field.id, &field.vis, field.span, false,
+                          Applicability::MachineApplicable);
     }
 
     fn check_impl_item(&mut self, cx: &LateContext, impl_item: &hir::ImplItem) {
-        self.perform_lint(cx, "item", impl_item.id, &impl_item.vis, impl_item.span, false);
+        self.perform_lint(cx, "item", impl_item.id, &impl_item.vis, impl_item.span, false,
+                          Applicability::MachineApplicable);
     }
 }
 
-/// Lint for trait and lifetime bounds that are (accidentally) accepted by the parser, but
-/// ignored later.
+/// Lint for trait and lifetime bounds in type aliases being mostly ignored:
+/// They are relevant when using associated types, but otherwise neither checked
+/// at definition site nor enforced at use site.
 
-pub struct IgnoredGenericBounds;
+pub struct TypeAliasBounds;
 
 declare_lint! {
-    IGNORED_GENERIC_BOUNDS,
+    TYPE_ALIAS_BOUNDS,
     Warn,
-    "these generic bounds are ignored"
+    "bounds in type aliases are not enforced"
 }
 
-impl LintPass for IgnoredGenericBounds {
+impl LintPass for TypeAliasBounds {
     fn get_lints(&self) -> LintArray {
-        lint_array!(IGNORED_GENERIC_BOUNDS)
+        lint_array!(TYPE_ALIAS_BOUNDS)
     }
 }
 
-impl EarlyLintPass for IgnoredGenericBounds {
-    fn check_item(&mut self, cx: &EarlyContext, item: &ast::Item) {
-        let type_alias_generics = match item.node {
-            ast::ItemKind::Ty(_, ref generics) => generics,
+impl TypeAliasBounds {
+    fn is_type_variable_assoc(qpath: &hir::QPath) -> bool {
+        match *qpath {
+            hir::QPath::TypeRelative(ref ty, _) => {
+                // If this is a type variable, we found a `T::Assoc`.
+                match ty.node {
+                    hir::TyPath(hir::QPath::Resolved(None, ref path)) => {
+                        match path.def {
+                            Def::TyParam(_) => true,
+                            _ => false
+                        }
+                    }
+                    _ => false
+                }
+            }
+            hir::QPath::Resolved(..) => false,
+        }
+    }
+
+    fn suggest_changing_assoc_types(ty: &hir::Ty, err: &mut DiagnosticBuilder) {
+        // Access to associates types should use `<T as Bound>::Assoc`, which does not need a
+        // bound.  Let's see if this type does that.
+
+        // We use a HIR visitor to walk the type.
+        use rustc::hir::intravisit::{self, Visitor};
+        use syntax::ast::NodeId;
+        struct WalkAssocTypes<'a, 'db> where 'db: 'a {
+            err: &'a mut DiagnosticBuilder<'db>
+        }
+        impl<'a, 'db, 'v> Visitor<'v> for WalkAssocTypes<'a, 'db> {
+            fn nested_visit_map<'this>(&'this mut self) -> intravisit::NestedVisitorMap<'this, 'v>
+            {
+                intravisit::NestedVisitorMap::None
+            }
+
+            fn visit_qpath(&mut self, qpath: &'v hir::QPath, id: NodeId, span: Span) {
+                if TypeAliasBounds::is_type_variable_assoc(qpath) {
+                    self.err.span_help(span,
+                        "use fully disambiguated paths (i.e., `<T as Trait>::Assoc`) to refer to \
+                         associated types in type aliases");
+                }
+                intravisit::walk_qpath(self, qpath, id, span)
+            }
+        }
+
+        // Let's go for a walk!
+        let mut visitor = WalkAssocTypes { err };
+        visitor.visit_ty(ty);
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeAliasBounds {
+    fn check_item(&mut self, cx: &LateContext, item: &hir::Item) {
+        let (ty, type_alias_generics) = match item.node {
+            hir::ItemTy(ref ty, ref generics) => (&*ty, generics),
             _ => return,
         };
+        let mut suggested_changing_assoc_types = false;
         // There must not be a where clause
         if !type_alias_generics.where_clause.predicates.is_empty() {
             let spans : Vec<_> = type_alias_generics.where_clause.predicates.iter()
                 .map(|pred| pred.span()).collect();
-            cx.span_lint(IGNORED_GENERIC_BOUNDS, spans,
-                "where clauses are ignored in type aliases");
+            let mut err = cx.struct_span_lint(TYPE_ALIAS_BOUNDS, spans,
+                "where clauses are not enforced in type aliases");
+            err.help("the clause will not be checked when the type alias is used, \
+                      and should be removed");
+            if !suggested_changing_assoc_types {
+                TypeAliasBounds::suggest_changing_assoc_types(ty, &mut err);
+                suggested_changing_assoc_types = true;
+            }
+            err.emit();
         }
         // The parameters must not have bounds
         for param in type_alias_generics.params.iter() {
             let spans : Vec<_> = match param {
-                &ast::GenericParam::Lifetime(ref l) => l.bounds.iter().map(|b| b.span).collect(),
-                &ast::GenericParam::Type(ref ty) => ty.bounds.iter().map(|b| b.span()).collect(),
+                &hir::GenericParam::Lifetime(ref l) => l.bounds.iter().map(|b| b.span).collect(),
+                &hir::GenericParam::Type(ref ty) => ty.bounds.iter().map(|b| b.span()).collect(),
             };
             if !spans.is_empty() {
-                cx.span_lint(
-                    IGNORED_GENERIC_BOUNDS,
+                let mut err = cx.struct_span_lint(
+                    TYPE_ALIAS_BOUNDS,
                     spans,
-                    "bounds on generic parameters are ignored in type aliases",
+                    "bounds on generic parameters are not enforced in type aliases",
                 );
+                err.help("the bound will not be checked when the type alias is used, \
+                          and should be removed");
+                if !suggested_changing_assoc_types {
+                    TypeAliasBounds::suggest_changing_assoc_types(ty, &mut err);
+                    suggested_changing_assoc_types = true;
+                }
+                err.emit();
+            }
+        }
+    }
+}
+
+/// Lint constants that are erroneous.
+/// Without this lint, we might not get any diagnostic if the constant is
+/// unused within this crate, even though downstream crates can't use it
+/// without producing an error.
+pub struct UnusedBrokenConst;
+
+impl LintPass for UnusedBrokenConst {
+    fn get_lints(&self) -> LintArray {
+        lint_array!()
+    }
+}
+
+fn check_const(cx: &LateContext, body_id: hir::BodyId, what: &str) {
+    let def_id = cx.tcx.hir.body_owner_def_id(body_id);
+    let param_env = cx.tcx.param_env(def_id);
+    let cid = ::rustc::mir::interpret::GlobalId {
+        instance: ty::Instance::mono(cx.tcx, def_id),
+        promoted: None
+    };
+    if let Err(err) = cx.tcx.const_eval(param_env.and(cid)) {
+        let span = cx.tcx.def_span(def_id);
+        let mut diag = cx.struct_span_lint(
+            CONST_ERR,
+            span,
+            &format!("this {} cannot be used", what),
+        );
+        use rustc::middle::const_val::ConstEvalErrDescription;
+        match err.description() {
+            ConstEvalErrDescription::Simple(message) => {
+                diag.span_label(span, message);
+            }
+            ConstEvalErrDescription::Backtrace(miri, frames) => {
+                diag.span_label(span, format!("{}", miri));
+                for frame in frames {
+                    diag.span_label(frame.span, format!("inside call to `{}`", frame.location));
+                }
+            }
+        }
+        diag.emit()
+    }
+}
+
+struct UnusedBrokenConstVisitor<'a, 'tcx: 'a>(&'a LateContext<'a, 'tcx>);
+
+impl<'a, 'tcx, 'v> hir::intravisit::Visitor<'v> for UnusedBrokenConstVisitor<'a, 'tcx> {
+    fn visit_nested_body(&mut self, id: hir::BodyId) {
+        check_const(self.0, id, "array length");
+    }
+    fn nested_visit_map<'this>(&'this mut self) -> hir::intravisit::NestedVisitorMap<'this, 'v> {
+        hir::intravisit::NestedVisitorMap::None
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedBrokenConst {
+    fn check_item(&mut self, cx: &LateContext, it: &hir::Item) {
+        match it.node {
+            hir::ItemConst(_, body_id) => {
+                check_const(cx, body_id, "constant");
+            },
+            hir::ItemTy(ref ty, _) => hir::intravisit::walk_ty(
+                &mut UnusedBrokenConstVisitor(cx),
+                ty
+            ),
+            _ => {},
+        }
+    }
+}
+
+declare_lint! {
+    pub UNNECESSARY_EXTERN_CRATES,
+    Allow,
+    "suggest removing `extern crate` for the 2018 edition"
+}
+
+pub struct ExternCrate(/* depth */ u32);
+
+impl ExternCrate {
+    pub fn new() -> Self {
+        ExternCrate(0)
+    }
+}
+
+impl LintPass for ExternCrate {
+    fn get_lints(&self) -> LintArray {
+        lint_array!(UNNECESSARY_EXTERN_CRATES)
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for ExternCrate {
+    fn check_item(&mut self, cx: &LateContext, it: &hir::Item) {
+        if !cx.tcx.features().extern_absolute_paths {
+            return
+        }
+        if let hir::ItemExternCrate(ref orig) =  it.node {
+            if it.attrs.iter().any(|a| a.check_name("macro_use")) {
+                return
+            }
+            let mut err = cx.struct_span_lint(UNNECESSARY_EXTERN_CRATES,
+                it.span, "`extern crate` is unnecessary in the new edition");
+            if it.vis == hir::Visibility::Public || self.0 > 1 || orig.is_some() {
+                let pub_ = if it.vis == hir::Visibility::Public {
+                    "pub "
+                } else {
+                    ""
+                };
+
+                let help = format!("use `{}use`", pub_);
+
+                if let Some(orig) = orig {
+                    err.span_suggestion(it.span, &help,
+                        format!("{}use {} as {};", pub_, orig, it.name));
+                } else {
+                    err.span_suggestion(it.span, &help,
+                        format!("{}use {};", pub_, it.name));
+                }
+            } else {
+                err.span_suggestion(it.span, "remove it", "".into());
+            }
+
+            err.emit();
+        }
+    }
+
+    fn check_mod(&mut self, _: &LateContext, _: &hir::Mod,
+                 _: Span, _: ast::NodeId) {
+        self.0 += 1;
+    }
+
+    fn check_mod_post(&mut self, _: &LateContext, _: &hir::Mod,
+                      _: Span, _: ast::NodeId) {
+        self.0 += 1;
+    }
+}
+
+/// Lint for trait and lifetime bounds that don't depend on type parameters
+/// which either do nothing, or stop the item from being used.
+pub struct TrivialConstraints;
+
+declare_lint! {
+    TRIVIAL_BOUNDS,
+    Warn,
+    "these bounds don't depend on an type parameters"
+}
+
+impl LintPass for TrivialConstraints {
+    fn get_lints(&self) -> LintArray {
+        lint_array!(TRIVIAL_BOUNDS)
+    }
+}
+
+impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TrivialConstraints {
+    fn check_item(
+        &mut self,
+        cx: &LateContext<'a, 'tcx>,
+        item: &'tcx hir::Item,
+    ) {
+        use rustc::ty::fold::TypeFoldable;
+        use rustc::ty::Predicate::*;
+
+
+        if cx.tcx.features().trivial_bounds {
+            let def_id = cx.tcx.hir.local_def_id(item.id);
+            let predicates = cx.tcx.predicates_of(def_id);
+            for predicate in &predicates.predicates {
+                let predicate_kind_name = match *predicate {
+                    Trait(..) => "Trait",
+                    TypeOutlives(..) |
+                    RegionOutlives(..) => "Lifetime",
+
+                    // Ignore projections, as they can only be global
+                    // if the trait bound is global
+                    Projection(..) |
+                    // Ignore bounds that a user can't type
+                    WellFormed(..) |
+                    ObjectSafe(..) |
+                    ClosureKind(..) |
+                    Subtype(..) |
+                    ConstEvaluatable(..) => continue,
+                };
+                if predicate.is_global() {
+                    cx.span_lint(
+                        TRIVIAL_BOUNDS,
+                        item.span,
+                        &format!("{} bound {} does not depend on any type \
+                                or lifetime parameters", predicate_kind_name, predicate),
+                    );
+                }
             }
         }
     }

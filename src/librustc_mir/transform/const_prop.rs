@@ -19,15 +19,17 @@ use rustc::mir::{TerminatorKind, ClearCrossCrate, SourceInfo, BinOp, ProjectionE
 use rustc::mir::visit::{Visitor, PlaceContext};
 use rustc::middle::const_val::ConstVal;
 use rustc::ty::{TyCtxt, self, Instance};
-use rustc::mir::interpret::{Value, PrimVal, GlobalId};
-use interpret::{eval_body_with_mir, mk_borrowck_eval_cx, ValTy};
+use rustc::mir::interpret::{Value, Scalar, GlobalId, EvalResult};
+use interpret::EvalContext;
+use interpret::CompileTimeEvaluator;
+use interpret::{eval_promoted, mk_borrowck_eval_cx, ValTy};
 use transform::{MirPass, MirSource};
-use syntax::codemap::Span;
+use syntax::codemap::{Span, DUMMY_SP};
 use rustc::ty::subst::Substs;
 use rustc_data_structures::indexed_vec::IndexVec;
 use rustc::ty::ParamEnv;
 use rustc::ty::layout::{
-    LayoutOf, TyLayout, LayoutError,
+    LayoutOf, TyLayout, LayoutError, LayoutCx,
     HasTyCtxt, TargetDataLayout, HasDataLayout,
 };
 
@@ -64,6 +66,7 @@ type Const<'tcx> = (Value, ty::Ty<'tcx>, Span);
 
 /// Finds optimization opportunities on the MIR.
 struct ConstPropagator<'b, 'a, 'tcx:'a+'b> {
+    ecx: EvalContext<'a, 'b, 'tcx, CompileTimeEvaluator>,
     mir: &'b Mir<'tcx>,
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     source: MirSource,
@@ -72,7 +75,8 @@ struct ConstPropagator<'b, 'a, 'tcx:'a+'b> {
     param_env: ParamEnv<'tcx>,
 }
 
-impl<'a, 'b, 'tcx> LayoutOf<ty::Ty<'tcx>> for &'a ConstPropagator<'a, 'b, 'tcx> {
+impl<'a, 'b, 'tcx> LayoutOf for &'a ConstPropagator<'a, 'b, 'tcx> {
+    type Ty = ty::Ty<'tcx>;
     type TyLayout = Result<TyLayout<'tcx>, LayoutError<'tcx>>;
 
     fn layout_of(self, ty: ty::Ty<'tcx>) -> Self::TyLayout {
@@ -101,7 +105,11 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
         source: MirSource,
     ) -> ConstPropagator<'b, 'a, 'tcx> {
         let param_env = tcx.param_env(source.def_id);
+        let substs = Substs::identity_for_item(tcx, source.def_id);
+        let instance = Instance::new(source.def_id, substs);
+        let ecx = mk_borrowck_eval_cx(tcx, instance, mir, DUMMY_SP).unwrap();
         ConstPropagator {
+            ecx,
             mir,
             tcx,
             source,
@@ -111,7 +119,27 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
         }
     }
 
-    fn const_eval(&self, cid: GlobalId<'tcx>, span: Span) -> Option<Const<'tcx>> {
+    fn use_ecx<F, T>(
+        &mut self,
+        span: Span,
+        f: F
+    ) -> Option<T>
+    where
+        F: FnOnce(&mut Self) -> EvalResult<'tcx, T>,
+    {
+        self.ecx.tcx.span = span;
+        let r = match f(self) {
+            Ok(val) => Some(val),
+            Err(mut err) => {
+                self.ecx.report(&mut err, false, Some(span));
+                None
+            },
+        };
+        self.ecx.tcx.span = DUMMY_SP;
+        r
+    }
+
+    fn const_eval(&mut self, cid: GlobalId<'tcx>, span: Span) -> Option<Const<'tcx>> {
         let value = match self.tcx.const_eval(self.param_env.and(cid)) {
             Ok(val) => val,
             Err(err) => {
@@ -120,7 +148,9 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
             },
         };
         let val = match value.val {
-            ConstVal::Value(v) => v,
+            ConstVal::Value(v) => {
+                self.use_ecx(span, |this| this.ecx.const_value_to_value(v, value.ty))?
+            },
             _ => bug!("eval produced: {:?}", value),
         };
         let val = (val, value.ty, span);
@@ -131,7 +161,12 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
     fn eval_constant(&mut self, c: &Constant<'tcx>) -> Option<Const<'tcx>> {
         match c.literal {
             Literal::Value { value } => match value.val {
-                ConstVal::Value(v) => Some((v, value.ty, c.span)),
+                ConstVal::Value(v) => {
+                    let v = self.use_ecx(c.span, |this| {
+                        this.ecx.const_value_to_value(v, value.ty)
+                    })?;
+                    Some((v, value.ty, c.span))
+                },
                 ConstVal::Unevaluated(did, substs) => {
                     let instance = Instance::resolve(
                         self.tcx,
@@ -149,7 +184,7 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
             // evaluate the promoted and replace the constant with the evaluated result
             Literal::Promoted { index } => {
                 let generics = self.tcx.generics_of(self.source.def_id);
-                if generics.parent_types as usize + generics.types.len() > 0 {
+                if generics.requires_monomorphization(self.tcx) {
                     // FIXME: can't handle code with generics
                     return None;
                 }
@@ -161,7 +196,10 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
                 };
                 // cannot use `const_eval` here, because that would require having the MIR
                 // for the current function available, but we're producing said MIR right now
-                let (value, _, ty) = eval_body_with_mir(self.tcx, cid, self.mir, self.param_env)?;
+                let span = self.mir.span;
+                let (value, _, ty) = self.use_ecx(span, |this| {
+                    Ok(eval_promoted(&mut this.ecx, cid, this.mir, this.param_env))
+                })??;
                 let val = (value, ty, c.span);
                 trace!("evaluated {:?} to {:?}", c, val);
                 Some(val)
@@ -177,16 +215,20 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
                     trace!("field proj on {:?}", proj.base);
                     let (base, ty, span) = self.eval_place(&proj.base)?;
                     match base {
-                        Value::ByValPair(a, b) => {
+                        Value::ScalarPair(a, b) => {
                             trace!("by val pair: {:?}, {:?}", a, b);
                             let base_layout = self.tcx.layout_of(self.param_env.and(ty)).ok()?;
                             trace!("layout computed");
                             use rustc_data_structures::indexed_vec::Idx;
                             let field_index = field.index();
                             let val = [a, b][field_index];
-                            let field = base_layout.field(&*self, field_index).ok()?;
+                            let cx = LayoutCx {
+                                tcx: self.tcx,
+                                param_env: self.param_env,
+                            };
+                            let field = base_layout.field(cx, field_index).ok()?;
                             trace!("projection resulted in: {:?}", val);
-                            Some((Value::ByVal(val), field.ty, span))
+                            Some((Value::Scalar(val), field.ty, span))
                         },
                         _ => None,
                     }
@@ -241,7 +283,10 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
             Rvalue::NullaryOp(NullOp::SizeOf, ty) => {
                 let param_env = self.tcx.param_env(self.source.def_id);
                 type_size_of(self.tcx, param_env, ty).map(|n| (
-                    Value::ByVal(PrimVal::Bytes(n as u128)),
+                    Value::Scalar(Scalar::Bits {
+                        bits: n as u128,
+                        defined: self.tcx.data_layout.pointer_size.bits() as u8,
+                    }),
                     self.tcx.types.usize,
                     span,
                 ))
@@ -253,23 +298,17 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
                     self.source.def_id
                 };
                 let generics = self.tcx.generics_of(def_id);
-                if generics.parent_types as usize + generics.types.len() > 0 {
+                if generics.requires_monomorphization(self.tcx) {
                     // FIXME: can't handle code with generics
                     return None;
                 }
-                let substs = Substs::identity_for_item(self.tcx, self.source.def_id);
-                let instance = Instance::new(self.source.def_id, substs);
-                let ecx = mk_borrowck_eval_cx(self.tcx, instance, self.mir, span).unwrap();
 
                 let val = self.eval_operand(arg)?;
-                let prim = ecx.value_to_primval(ValTy { value: val.0, ty: val.1 }).ok()?;
-                match ecx.unary_op(op, prim, val.1) {
-                    Ok(val) => Some((Value::ByVal(val), place_ty, span)),
-                    Err(mut err) => {
-                        ecx.report(&mut err, false, Some(span));
-                        None
-                    },
-                }
+                let prim = self.use_ecx(span, |this| {
+                    this.ecx.value_to_scalar(ValTy { value: val.0, ty: val.1 })
+                })?;
+                let val = self.use_ecx(span, |this| this.ecx.unary_op(op, prim, val.1))?;
+                Some((Value::Scalar(val), place_ty, span))
             }
             Rvalue::CheckedBinaryOp(op, ref left, ref right) |
             Rvalue::BinaryOp(op, ref left, ref right) => {
@@ -281,22 +320,25 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
                     self.source.def_id
                 };
                 let generics = self.tcx.generics_of(def_id);
-                let has_generics = generics.parent_types as usize + generics.types.len() > 0;
-                if has_generics {
+                if generics.requires_monomorphization(self.tcx) {
                     // FIXME: can't handle code with generics
                     return None;
                 }
-                let substs = Substs::identity_for_item(self.tcx, self.source.def_id);
-                let instance = Instance::new(self.source.def_id, substs);
-                let ecx = mk_borrowck_eval_cx(self.tcx, instance, self.mir, span).unwrap();
 
-                let r = ecx.value_to_primval(ValTy { value: right.0, ty: right.1 }).ok()?;
+                let r = self.use_ecx(span, |this| {
+                    this.ecx.value_to_scalar(ValTy { value: right.0, ty: right.1 })
+                })?;
                 if op == BinOp::Shr || op == BinOp::Shl {
-                    let param_env = self.tcx.param_env(self.source.def_id);
                     let left_ty = left.ty(self.mir, self.tcx);
-                    let bits = self.tcx.layout_of(param_env.and(left_ty)).unwrap().size.bits();
-                    if r.to_bytes().ok().map_or(false, |b| b >= bits as u128) {
-                        let scope_info = match self.mir.visibility_scope_info {
+                    let left_bits = self
+                        .tcx
+                        .layout_of(self.param_env.and(left_ty))
+                        .unwrap()
+                        .size
+                        .bits();
+                    let right_size = self.tcx.layout_of(self.param_env.and(right.1)).unwrap().size;
+                    if r.to_bits(right_size).ok().map_or(false, |b| b >= left_bits as u128) {
+                        let source_scope_local_data = match self.mir.source_scope_local_data {
                             ClearCrossCrate::Set(ref data) => data,
                             ClearCrossCrate::Clear => return None,
                         };
@@ -305,7 +347,7 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
                         } else {
                             "left"
                         };
-                        let node_id = scope_info[source_info.scope].lint_root;
+                        let node_id = source_scope_local_data[source_info.scope].lint_root;
                         self.tcx.lint_node(
                             ::rustc::lint::builtin::EXCEEDING_BITSHIFTS,
                             node_id,
@@ -315,31 +357,31 @@ impl<'b, 'a, 'tcx:'b> ConstPropagator<'b, 'a, 'tcx> {
                     }
                 }
                 let left = self.eval_operand(left)?;
-                let l = ecx.value_to_primval(ValTy { value: left.0, ty: left.1 }).ok()?;
+                let l = self.use_ecx(span, |this| {
+                    this.ecx.value_to_scalar(ValTy { value: left.0, ty: left.1 })
+                })?;
                 trace!("const evaluating {:?} for {:?} and {:?}", op, left, right);
-                match ecx.binary_op(op, l, left.1, r, right.1) {
-                    Ok((val, overflow)) => {
-                        let val = if let Rvalue::CheckedBinaryOp(..) = *rvalue {
-                            Value::ByValPair(
-                                val,
-                                PrimVal::from_bool(overflow),
-                            )
-                        } else {
-                            if overflow {
-                                use rustc::mir::interpret::EvalErrorKind;
-                                let mut err = EvalErrorKind::OverflowingMath.into();
-                                ecx.report(&mut err, false, Some(span));
-                                return None;
-                            }
-                            Value::ByVal(val)
-                        };
-                        Some((val, place_ty, span))
-                    },
-                    Err(mut err) => {
-                        ecx.report(&mut err, false, Some(span));
-                        None
-                    },
-                }
+                let (val, overflow) = self.use_ecx(span, |this| {
+                    this.ecx.binary_op(op, l, left.1, r, right.1)
+                })?;
+                let val = if let Rvalue::CheckedBinaryOp(..) = *rvalue {
+                    Value::ScalarPair(
+                        val,
+                        Scalar::from_bool(overflow),
+                    )
+                } else {
+                    if overflow {
+                        use rustc::mir::interpret::EvalErrorKind;
+                        let mut err = EvalErrorKind::Overflow(op).into();
+                        self.use_ecx(span, |this| {
+                            this.ecx.report(&mut err, false, Some(span));
+                            Ok(())
+                        });
+                        return None;
+                    }
+                    Value::Scalar(val)
+                };
+                Some((val, place_ty, span))
             },
         }
     }
@@ -451,7 +493,7 @@ impl<'b, 'a, 'tcx> Visitor<'tcx> for ConstPropagator<'b, 'a, 'tcx> {
         if let TerminatorKind::Assert { expected, msg, cond, .. } = kind {
             if let Some(value) = self.eval_operand(cond) {
                 trace!("assertion on {:?} should be {:?}", value, expected);
-                if Value::ByVal(PrimVal::from_bool(*expected)) != value.0 {
+                if Value::Scalar(Scalar::from_bool(*expected)) != value.0 {
                     // poison all places this operand references so that further code
                     // doesn't use the invalid value
                     match cond {
@@ -477,23 +519,23 @@ impl<'b, 'a, 'tcx> Visitor<'tcx> for ConstPropagator<'b, 'a, 'tcx> {
                         .hir
                         .as_local_node_id(self.source.def_id)
                         .expect("some part of a failing const eval must be local");
-                    use rustc::mir::AssertMessage::*;
+                    use rustc::mir::interpret::EvalErrorKind::*;
                     let msg = match msg {
-                        // Need proper const propagator for these
-                        GeneratorResumedAfterReturn |
-                        GeneratorResumedAfterPanic => return,
-                        Math(ref err) => err.description().to_owned(),
+                        Overflow(_) |
+                        OverflowNeg |
+                        DivisionByZero |
+                        RemainderByZero => msg.description().to_owned(),
                         BoundsCheck { ref len, ref index } => {
                             let len = self.eval_operand(len).expect("len must be const");
                             let len = match len.0 {
-                                Value::ByVal(PrimVal::Bytes(n)) => n,
+                                Value::Scalar(Scalar::Bits { bits, ..}) => bits,
                                 _ => bug!("const len not primitive: {:?}", len),
                             };
                             let index = self
                                 .eval_operand(index)
                                 .expect("index must be const");
                             let index = match index.0 {
-                                Value::ByVal(PrimVal::Bytes(n)) => n,
+                                Value::Scalar(Scalar::Bits { bits, .. }) => bits,
                                 _ => bug!("const index not primitive: {:?}", index),
                             };
                             format!(
@@ -503,6 +545,8 @@ impl<'b, 'a, 'tcx> Visitor<'tcx> for ConstPropagator<'b, 'a, 'tcx> {
                                 index,
                             )
                         },
+                        // Need proper const propagator for these
+                        _ => return,
                     };
                     self.tcx.lint_node(
                         ::rustc::lint::builtin::CONST_ERR,

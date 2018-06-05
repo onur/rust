@@ -11,48 +11,27 @@
 use hir::def_id::DefId;
 use ty::{self, TyCtxt, layout};
 use ty::subst::Substs;
-use rustc_const_math::*;
-use mir::interpret::{Value, PrimVal};
+use mir::interpret::ConstValue;
 use errors::DiagnosticBuilder;
 
 use graphviz::IntoCow;
 use syntax_pos::Span;
 
 use std::borrow::Cow;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 
 pub type EvalResult<'tcx> = Result<&'tcx ty::Const<'tcx>, ConstEvalErr<'tcx>>;
 
-#[derive(Copy, Clone, Debug, Hash, RustcEncodable, RustcDecodable, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Hash, RustcEncodable, RustcDecodable, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ConstVal<'tcx> {
     Unevaluated(DefId, &'tcx Substs<'tcx>),
-    Value(Value),
-}
-
-impl<'tcx> ConstVal<'tcx> {
-    pub fn to_raw_bits(&self) -> Option<u128> {
-        match *self {
-            ConstVal::Value(Value::ByVal(PrimVal::Bytes(b))) => {
-                Some(b)
-            },
-            _ => None,
-        }
-    }
-    pub fn unwrap_u64(&self) -> u64 {
-        match self.to_raw_bits() {
-            Some(val) => {
-                assert_eq!(val as u64 as u128, val);
-                val as u64
-            },
-            None => bug!("expected constant u64, got {:#?}", self),
-        }
-    }
+    Value(ConstValue<'tcx>),
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstEvalErr<'tcx> {
     pub span: Span,
-    pub kind: Rc<ErrKind<'tcx>>,
+    pub kind: Lrc<ErrKind<'tcx>>,
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +41,6 @@ pub enum ErrKind<'tcx> {
     UnimplementedConstVal(&'static str),
     IndexOutOfBounds { len: u64, index: u64 },
 
-    Math(ConstMathErr),
     LayoutError(layout::LayoutError<'tcx>),
 
     TypeckError,
@@ -74,15 +52,6 @@ pub enum ErrKind<'tcx> {
 pub struct FrameInfo {
     pub span: Span,
     pub location: String,
-}
-
-impl<'tcx> From<ConstMathErr> for ErrKind<'tcx> {
-    fn from(err: ConstMathErr) -> ErrKind<'tcx> {
-        match err {
-            ConstMathErr::UnsignedNegation => ErrKind::TypeckError,
-            _ => ErrKind::Math(err)
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +91,6 @@ impl<'a, 'gcx, 'tcx> ConstEvalErr<'tcx> {
                         len, index)
             }
 
-            Math(ref err) => Simple(err.description().into_cow()),
             LayoutError(ref err) => Simple(err.to_string().into_cow()),
 
             TypeckError => simple!("type-checking failed"),

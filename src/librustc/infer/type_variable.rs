@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use syntax::ast;
+use syntax::symbol::InternedString;
 use syntax_pos::Span;
 use ty::{self, Ty};
 
@@ -53,7 +53,7 @@ pub enum TypeVariableOrigin {
     MiscVariable(Span),
     NormalizeProjectionType(Span),
     TypeInference(Span),
-    TypeParameterDefinition(Span, ast::Name),
+    TypeParameterDefinition(Span, InternedString),
 
     /// one of the upvars or closure kind parameters in a `ClosureSubsts`
     /// (before it has been determined)
@@ -81,12 +81,6 @@ pub enum TypeVariableValue<'tcx> {
     Unknown { universe: ty::UniverseIndex },
 }
 
-#[derive(Copy, Clone, Debug)]
-pub enum ProbeTyValue<'tcx> {
-    Ty(Ty<'tcx>),
-    Vid(ty::TyVid),
-}
-
 impl<'tcx> TypeVariableValue<'tcx> {
     /// If this value is known, returns the type it is known to be.
     /// Otherwise, `None`.
@@ -94,14 +88,6 @@ impl<'tcx> TypeVariableValue<'tcx> {
         match *self {
             TypeVariableValue::Unknown { .. } => None,
             TypeVariableValue::Known { value } => Some(value),
-        }
-    }
-
-    /// If this value is unknown, returns the universe, otherwise `None`.
-    pub fn universe(&self) -> Option<ty::UniverseIndex> {
-        match *self {
-            TypeVariableValue::Unknown { universe } => Some(universe),
-            TypeVariableValue::Known { .. } => None,
         }
     }
 
@@ -453,9 +439,14 @@ impl<'tcx> ut::UnifyValue for TypeVariableValue<'tcx> {
             (&TypeVariableValue::Known { .. }, &TypeVariableValue::Unknown { .. }) => Ok(*value1),
             (&TypeVariableValue::Unknown { .. }, &TypeVariableValue::Known { .. }) => Ok(*value2),
 
-            // If both sides are unknown, we need to pick the most restrictive universe.
+            // If both sides are *unknown*, it hardly matters, does it?
             (&TypeVariableValue::Unknown { universe: universe1 },
-             &TypeVariableValue::Unknown { universe: universe2 }) => {
+             &TypeVariableValue::Unknown { universe: universe2 }) =>  {
+                // If we unify two unbound variables, ?T and ?U, then whatever
+                // value they wind up taking (which must be the same value) must
+                // be nameable by both universes. Therefore, the resulting
+                // universe is the minimum of the two universes, because that is
+                // the one which contains the fewest names in scope.
                 let universe = cmp::min(universe1, universe2);
                 Ok(TypeVariableValue::Unknown { universe })
             }

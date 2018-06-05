@@ -335,6 +335,18 @@ pub mod builtin {
     /// proxied through this one.  `format_args!`, unlike its derived macros, avoids
     /// heap allocations.
     ///
+    /// You can use the [`fmt::Arguments`] value that `format_args!` returns
+    /// in `Debug` and `Display` contexts as seen below. The example also shows
+    /// that `Debug` and `Display` format to the same thing: the interpolated
+    /// format string in `format_args!`.
+    ///
+    /// ```rust
+    /// let debug = format!("{:?}", format_args!("{} foo {:?}", 1, 2));
+    /// let display = format!("{}", format_args!("{} foo {:?}", 1, 2));
+    /// assert_eq!("1 foo 2", display);
+    /// assert_eq!(display, debug);
+    /// ```
+    ///
     /// For more information, see the documentation in [`std::fmt`].
     ///
     /// [`Display`]: ../std/fmt/trait.Display.html
@@ -352,7 +364,6 @@ pub mod builtin {
     ///
     /// let s = fmt::format(format_args!("hello {}", "world"));
     /// assert_eq!(s, format!("hello {}", "world"));
-    ///
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[macro_export]
@@ -367,7 +378,7 @@ pub mod builtin {
     /// compile time, yielding an expression of type `&'static str`.
     ///
     /// If the environment variable is not defined, then a compilation error
-    /// will be emitted.  To not emit a compile error, use the [`option_env!`]
+    /// will be emitted. To not emit a compile error, use the [`option_env!`]
     /// macro instead.
     ///
     /// [`option_env!`]: ../std/macro.option_env.html
@@ -377,6 +388,20 @@ pub mod builtin {
     /// ```
     /// let path: &'static str = env!("PATH");
     /// println!("the $PATH variable at the time of compiling was: {}", path);
+    /// ```
+    ///
+    /// You can customize the error message by passing a string as the second
+    /// parameter:
+    ///
+    /// ```compile_fail
+    /// let doc: &'static str = env!("documentation", "what's that?!");
+    /// ```
+    ///
+    /// If the `documentation` environment variable is not defined, you'll get
+    /// the following error:
+    ///
+    /// ```text
+    /// error: what's that?!
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[macro_export]
@@ -438,8 +463,8 @@ pub mod builtin {
     #[unstable(feature = "concat_idents_macro", issue = "29599")]
     #[macro_export]
     macro_rules! concat_idents {
-        ($($e:ident),*) => ({ /* compiler built-in */ });
-        ($($e:ident,)*) => ({ /* compiler built-in */ });
+        ($($e:ident),+) => ({ /* compiler built-in */ });
+        ($($e:ident,)+) => ({ /* compiler built-in */ });
     }
 
     /// Concatenates literals into a static string slice.
@@ -775,13 +800,13 @@ pub mod builtin {
     }
 }
 
-/// A macro for defining #[cfg] if-else statements.
+/// A macro for defining `#[cfg]` if-else statements.
 ///
 /// This is similar to the `if/elif` C preprocessor macro by allowing definition
 /// of a cascade of `#[cfg]` cases, emitting the implementation which matches
 /// first.
 ///
-/// This allows you to conveniently provide a long list #[cfg]'d blocks of code
+/// This allows you to conveniently provide a long list `#[cfg]`'d blocks of code
 /// without having to rewrite each clause multiple times.
 macro_rules! cfg_if {
     ($(

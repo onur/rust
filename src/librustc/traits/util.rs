@@ -9,7 +9,7 @@
 // except according to those terms.
 
 use hir::def_id::DefId;
-use ty::subst::{Subst, Substs};
+use ty::subst::{Kind, Subst, Substs};
 use ty::{self, Ty, TyCtxt, ToPredicate, ToPolyTraitRef};
 use ty::outlives::Component;
 use util::nodemap::FxHashSet;
@@ -209,13 +209,13 @@ impl<'cx, 'gcx, 'tcx> Elaborator<'cx, 'gcx, 'tcx> {
                                None
                            } else {
                                Some(ty::Predicate::RegionOutlives(
-                                   ty::Binder(ty::OutlivesPredicate(r, r_min))))
+                                   ty::Binder::dummy(ty::OutlivesPredicate(r, r_min))))
                            },
 
                            Component::Param(p) => {
-                               let ty = tcx.mk_param(p.idx, p.name);
+                               let ty = tcx.mk_ty_param(p.idx, p.name);
                                Some(ty::Predicate::TypeOutlives(
-                                   ty::Binder(ty::OutlivesPredicate(ty, r_min))))
+                                   ty::Binder::dummy(ty::OutlivesPredicate(ty, r_min))))
                            },
 
                            Component::UnresolvedInferenceVariable(_) => {
@@ -347,6 +347,11 @@ impl<'tcx,I:Iterator<Item=ty::Predicate<'tcx>>> Iterator for FilterToTraits<I> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (_, upper) = self.base_iterator.size_hint();
+        (0, upper)
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -425,13 +430,13 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                                    cause: ObligationCause<'tcx>,
                                    trait_def_id: DefId,
                                    recursion_depth: usize,
-                                   param_ty: Ty<'tcx>,
-                                   ty_params: &[Ty<'tcx>])
+                                   self_ty: Ty<'tcx>,
+                                   params: &[Kind<'tcx>])
         -> PredicateObligation<'tcx>
     {
         let trait_ref = ty::TraitRef {
             def_id: trait_def_id,
-            substs: self.mk_substs_trait(param_ty, ty_params)
+            substs: self.mk_substs_trait(self_ty, params)
         };
         predicate_for_trait_ref(cause, param_env, trait_ref, recursion_depth)
     }
@@ -507,9 +512,9 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         };
         let trait_ref = ty::TraitRef {
             def_id: fn_trait_def_id,
-            substs: self.mk_substs_trait(self_ty, &[arguments_tuple]),
+            substs: self.mk_substs_trait(self_ty, &[arguments_tuple.into()]),
         };
-        ty::Binder((trait_ref, sig.skip_binder().output()))
+        ty::Binder::bind((trait_ref, sig.skip_binder().output()))
     }
 
     pub fn generator_trait_ref_and_outputs(self,
@@ -522,7 +527,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             def_id: fn_trait_def_id,
             substs: self.mk_substs_trait(self_ty, &[]),
         };
-        ty::Binder((trait_ref, sig.skip_binder().yield_ty, sig.skip_binder().return_ty))
+        ty::Binder::bind((trait_ref, sig.skip_binder().yield_ty, sig.skip_binder().return_ty))
     }
 
     pub fn impl_is_default(self, node_item_def_id: DefId) -> bool {

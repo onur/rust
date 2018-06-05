@@ -18,27 +18,24 @@
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
        test(attr(deny(warnings))))]
-#![deny(warnings)]
 
-#![feature(unicode)]
+#![feature(unicode_internals)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(match_default_bindings)]
-#![feature(non_exhaustive)]
-#![feature(i128_type)]
+#![feature(slice_sort_by_cached_key)]
 #![feature(const_atomic_usize_new)]
 #![feature(rustc_attrs)]
+#![feature(str_escape)]
 
-// See librustc_cratesio_shim/Cargo.toml for a comment explaining this.
-#[allow(unused_extern_crates)]
-extern crate rustc_cratesio_shim;
+#![recursion_limit="256"]
 
 #[macro_use] extern crate bitflags;
+extern crate core;
 extern crate serialize;
 #[macro_use] extern crate log;
-extern crate std_unicode;
 pub extern crate rustc_errors as errors;
 extern crate syntax_pos;
 extern crate rustc_data_structures;
+extern crate rustc_target;
 #[macro_use] extern crate scoped_tls;
 
 extern crate serialize as rustc_serialize; // used by deriving
@@ -75,7 +72,7 @@ macro_rules! unwrap_or {
     }
 }
 
-struct Globals {
+pub struct Globals {
     used_attrs: Lock<Vec<u64>>,
     known_attrs: Lock<Vec<u64>>,
     syntax_pos_globals: syntax_pos::Globals,
@@ -100,7 +97,7 @@ pub fn with_globals<F, R>(f: F) -> R
     })
 }
 
-scoped_thread_local!(static GLOBALS: Globals);
+scoped_thread_local!(pub static GLOBALS: Globals);
 
 #[macro_use]
 pub mod diagnostics {
@@ -138,14 +135,12 @@ pub mod syntax {
     pub use ast;
 }
 
-pub mod abi;
 pub mod ast;
 pub mod attr;
 pub mod codemap;
 #[macro_use]
 pub mod config;
 pub mod entry;
-pub mod epoch;
 pub mod feature_gate;
 pub mod fold;
 pub mod parse;
@@ -153,6 +148,7 @@ pub mod ptr;
 pub mod show_span;
 pub mod std_inject;
 pub mod str;
+pub use syntax_pos::edition;
 pub use syntax_pos::symbol;
 pub mod test;
 pub mod tokenstream;

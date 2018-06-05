@@ -26,7 +26,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use hir::def_id::DefId;
 use infer::{InferCtxt, InferOk};
 use ty::subst::{Subst, Substs};
-use traits::{self, ObligationCause};
+use traits::{self, ObligationCause, TraitEngine};
 use traits::select::IntercrateAmbiguityCause;
 use ty::{self, TyCtxt, TypeFoldable};
 use syntax_pos::DUMMY_SP;
@@ -196,6 +196,7 @@ pub(super) fn specializes<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         // that this always succeeds.
         let impl1_trait_ref =
             match traits::fully_normalize(&infcx,
+                                          FulfillmentContext::new(),
                                           ObligationCause::dummy(),
                                           penv,
                                           &impl1_trait_ref) {
@@ -221,7 +222,7 @@ fn fulfill_implication<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
                                        target_impl: DefId)
                                        -> Result<&'tcx Substs<'tcx>, ()> {
     let selcx = &mut SelectionContext::new(&infcx);
-    let target_substs = infcx.fresh_substs_for_item(param_env.universe, DUMMY_SP, target_impl);
+    let target_substs = infcx.fresh_substs_for_item(DUMMY_SP, target_impl);
     let (target_trait_ref, mut obligations) = impl_trait_ref_and_oblig(selcx,
                                                                        param_env,
                                                                        target_impl,

@@ -14,11 +14,11 @@ use errors;
 
 use syntax::ast::{self, Ident, NodeId};
 use syntax::attr;
-use syntax::codemap::{ExpnInfo, NameAndSpan, MacroAttribute, respan};
+use syntax::codemap::{ExpnInfo, NameAndSpan, MacroAttribute, hygiene, respan};
 use syntax::ext::base::ExtCtxt;
 use syntax::ext::build::AstBuilder;
 use syntax::ext::expand::ExpansionConfig;
-use syntax::ext::hygiene::{Mark, SyntaxContext};
+use syntax::ext::hygiene::Mark;
 use syntax::fold::Folder;
 use syntax::parse::ParseSess;
 use syntax::ptr::P;
@@ -369,9 +369,10 @@ fn mk_registrar(cx: &mut ExtCtxt,
             span: None,
             allow_internal_unstable: true,
             allow_internal_unsafe: false,
+            edition: hygiene::default_edition(),
         }
     });
-    let span = DUMMY_SP.with_ctxt(SyntaxContext::empty().apply_mark(mark));
+    let span = DUMMY_SP.apply_mark(mark);
 
     let proc_macro = Ident::from_str("proc_macro");
     let krate = cx.item(span,

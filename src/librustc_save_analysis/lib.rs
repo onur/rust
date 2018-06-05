@@ -11,10 +11,11 @@
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 #![feature(custom_attribute)]
-#![feature(macro_lifetime_matcher)]
+#![cfg_attr(stage0, feature(macro_lifetime_matcher))]
 #![allow(unused_attributes)]
+
+#![recursion_limit="256"]
 
 #[macro_use]
 extern crate rustc;
@@ -23,6 +24,7 @@ extern crate rustc;
 extern crate log;
 extern crate rustc_data_structures;
 extern crate rustc_serialize;
+extern crate rustc_target;
 extern crate rustc_typeck;
 #[macro_use]
 extern crate syntax;
@@ -40,8 +42,9 @@ mod sig;
 
 use rustc::hir;
 use rustc::hir::def::Def as HirDef;
-use rustc::hir::map::{Node, NodeItem};
+use rustc::hir::map::{Node, NodeTraitItem, NodeImplItem};
 use rustc::hir::def_id::{DefId, LOCAL_CRATE};
+use rustc::middle::cstore::ExternCrate;
 use rustc::session::config::CrateType::CrateTypeExecutable;
 use rustc::ty::{self, TyCtxt};
 use rustc_typeck::hir_ty_to_ty;
@@ -112,7 +115,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
 
         for &n in self.tcx.crates().iter() {
             let span = match *self.tcx.extern_crate(n.as_def_id()) {
-                Some(ref c) => c.span,
+                Some(ExternCrate { span, .. }) => span,
                 None => {
                     debug!("Skipping crate {}, no data", n);
                     continue;
@@ -182,6 +185,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
             }
             // FIXME(plietar): needs a new DefKind in rls-data
             ast::ForeignItemKind::Ty => None,
+            ast::ForeignItemKind::Macro(..) => None,
         }
     }
 
@@ -296,7 +300,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
                 filter!(self.span_utils, sub_span, item.span, None);
                 let variants_str = def.variants
                     .iter()
-                    .map(|v| v.node.name.to_string())
+                    .map(|v| v.node.ident.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
                 let value = format!("{}::{{{}}}", name, variants_str);
@@ -416,34 +420,30 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
                 Some(impl_id) => match self.tcx.hir.get_if_local(impl_id) {
                     Some(Node::NodeItem(item)) => match item.node {
                         hir::ItemImpl(.., ref ty, _) => {
-                            let mut result = String::from("<");
-                            result.push_str(&self.tcx.hir.node_to_pretty_string(ty.id));
+                            let mut qualname = String::from("<");
+                            qualname.push_str(&self.tcx.hir.node_to_pretty_string(ty.id));
 
                             let mut trait_id = self.tcx.trait_id_of_impl(impl_id);
                             let mut decl_id = None;
+                            let mut docs = String::new();
+                            let mut attrs = vec![];
+                            if let Some(NodeImplItem(item)) = self.tcx.hir.find(id) {
+                                docs = self.docs_for_attrs(&item.attrs);
+                                attrs = item.attrs.to_vec();
+                            }
+
                             if let Some(def_id) = trait_id {
-                                result.push_str(" as ");
-                                result.push_str(&self.tcx.item_path_str(def_id));
+                                // A method in a trait impl.
+                                qualname.push_str(" as ");
+                                qualname.push_str(&self.tcx.item_path_str(def_id));
                                 self.tcx
                                     .associated_items(def_id)
                                     .find(|item| item.name == name)
                                     .map(|item| decl_id = Some(item.def_id));
-                            } else {
-                                if let Some(NodeItem(item)) = self.tcx.hir.find(id) {
-                                    if let hir::ItemImpl(_, _, _, _, _, ref ty, _) = item.node {
-                                        trait_id = self.lookup_ref_id(ty.id);
-                                    }
-                                }
                             }
-                            result.push_str(">");
+                            qualname.push_str(">");
 
-                            (
-                                result,
-                                trait_id,
-                                decl_id,
-                                self.docs_for_attrs(&item.attrs),
-                                item.attrs.to_vec(),
-                            )
+                            (qualname, trait_id, decl_id, docs, attrs)
                         }
                         _ => {
                             span_bug!(
@@ -465,25 +465,23 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
                     }
                 },
                 None => match self.tcx.trait_of_item(self.tcx.hir.local_def_id(id)) {
-                    Some(def_id) => match self.tcx.hir.get_if_local(def_id) {
-                        Some(Node::NodeItem(item)) => (
+                    Some(def_id) => {
+                        let mut docs = String::new();
+                        let mut attrs = vec![];
+
+                        if let Some(NodeTraitItem(item)) = self.tcx.hir.find(id) {
+                            docs = self.docs_for_attrs(&item.attrs);
+                            attrs = item.attrs.to_vec();
+                        }
+
+                        (
                             format!("::{}", self.tcx.item_path_str(def_id)),
                             Some(def_id),
                             None,
-                            self.docs_for_attrs(&item.attrs),
-                            item.attrs.to_vec(),
-                        ),
-                        r => {
-                            span_bug!(
-                                span,
-                                "Could not find container {:?} for \
-                                 method {}, got {:?}",
-                                def_id,
-                                id,
-                                r
-                            );
-                        }
-                    },
+                            docs,
+                            attrs,
+                        )
+                    }
                     None => {
                         debug!("Could not find container for method {} at {:?}", id, span);
                         // This is not necessarily a bug, if there was a compilation error,
@@ -553,16 +551,18 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
                 };
                 match self.tables.expr_ty_adjusted(&hir_node).sty {
                     ty::TyAdt(def, _) if !def.is_enum() => {
-                        let f = def.non_enum_variant().field_named(ident.node.name);
+                        let variant = &def.non_enum_variant();
+                        let index = self.tcx.find_field_index(ident, variant).unwrap();
                         let sub_span = self.span_utils.span_for_last_ident(expr.span);
                         filter!(self.span_utils, sub_span, expr.span, None);
                         let span = self.span_from_span(sub_span.unwrap());
                         return Some(Data::RefData(Ref {
                             kind: RefKind::Variable,
                             span,
-                            ref_id: id_from_def_id(f.did),
+                            ref_id: id_from_def_id(variant.fields[index].did),
                         }));
                     }
+                    ty::TyTuple(..) => None,
                     _ => {
                         debug!("Expected struct or union type, found {:?}", ty);
                         None
@@ -602,7 +602,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
                     ty::ImplContainer(_) => (Some(method_id), None),
                     ty::TraitContainer(_) => (None, Some(method_id)),
                 };
-                let sub_span = seg.span;
+                let sub_span = seg.ident.span;
                 filter!(self.span_utils, Some(sub_span), expr.span, None);
                 let span = self.span_from_span(sub_span);
                 Some(Data::RefData(Ref {
@@ -706,7 +706,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
 
         let def = self.get_path_def(id);
         let last_seg = &path.segments[path.segments.len() - 1];
-        let sub_span = last_seg.span;
+        let sub_span = last_seg.ident.span;
         filter!(self.span_utils, Some(sub_span), path.span, None);
         match def {
             HirDef::Upvar(id, ..) | HirDef::Local(id) => {
@@ -816,7 +816,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
         field_ref: &ast::Field,
         variant: &ty::VariantDef,
     ) -> Option<Ref> {
-        let f = variant.find_field_named(field_ref.ident.node.name)?;
+        let index = self.tcx.find_field_index(field_ref.ident, variant).unwrap();
         // We don't really need a sub-span here, but no harm done
         let sub_span = self.span_utils.span_for_last_ident(field_ref.ident.span);
         filter!(self.span_utils, sub_span, field_ref.ident.span, None);
@@ -824,7 +824,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
         Some(Ref {
             kind: RefKind::Variable,
             span,
-            ref_id: id_from_def_id(f.did),
+            ref_id: id_from_def_id(variant.fields[index].did),
         })
     }
 
@@ -960,7 +960,7 @@ fn make_signature(decl: &ast::FnDecl, generics: &ast::Generics) -> String {
 // variables (idents) from patterns.
 struct PathCollector<'l> {
     collected_paths: Vec<(NodeId, &'l ast::Path)>,
-    collected_idents: Vec<(NodeId, ast::Ident, Span, ast::Mutability)>,
+    collected_idents: Vec<(NodeId, ast::Ident, ast::Mutability)>,
 }
 
 impl<'l> PathCollector<'l> {
@@ -981,12 +981,12 @@ impl<'l, 'a: 'l> Visitor<'a> for PathCollector<'l> {
             PatKind::TupleStruct(ref path, ..) | PatKind::Path(_, ref path) => {
                 self.collected_paths.push((p.id, path));
             }
-            PatKind::Ident(bm, ref path1, _) => {
+            PatKind::Ident(bm, ident, _) => {
                 debug!(
                     "PathCollector, visit ident in pat {}: {:?} {:?}",
-                    path1.node,
+                    ident,
                     p.span,
-                    path1.span
+                    ident.span
                 );
                 let immut = match bm {
                     // Even if the ref is mut, you can't change the ref, only
@@ -996,7 +996,7 @@ impl<'l, 'a: 'l> Visitor<'a> for PathCollector<'l> {
                     ast::BindingMode::ByValue(mt) => mt,
                 };
                 self.collected_idents
-                    .push((p.id, path1.node, path1.span, immut));
+                    .push((p.id, ident, immut));
             }
             _ => {}
         }

@@ -11,20 +11,19 @@
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 
 #![feature(box_patterns)]
-#![feature(conservative_impl_trait)]
 #![feature(fs_read_write)]
-#![feature(i128_type)]
 #![feature(libc)]
-#![feature(macro_lifetime_matcher)]
+#![cfg_attr(stage0, feature(macro_lifetime_matcher))]
 #![feature(proc_macro_internals)]
-#![feature(macro_lifetime_matcher)]
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
+#![feature(slice_sort_by_cached_key)]
 #![feature(specialization)]
 #![feature(rustc_private)]
+
+#![recursion_limit="256"]
 
 extern crate libc;
 #[macro_use]
@@ -40,13 +39,12 @@ extern crate proc_macro;
 
 #[macro_use]
 extern crate rustc;
-extern crate rustc_back;
+extern crate rustc_target;
 #[macro_use]
 extern crate rustc_data_structures;
 
 mod diagnostics;
 
-mod astencode;
 mod index_builder;
 mod index;
 mod encoder;
@@ -56,6 +54,7 @@ mod isolated_encoder;
 mod schema;
 mod native_libs;
 mod link_args;
+mod foreign_modules;
 
 pub mod creader;
 pub mod cstore;

@@ -13,7 +13,7 @@ use rustc::ty;
 use lint::{LateContext, LintContext, LintArray};
 use lint::{LintPass, LateLintPass};
 
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::ast;
 use syntax::attr;
 use syntax_pos::Span;
@@ -324,7 +324,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NonSnakeCase {
                         _: &hir::Generics,
                         _: ast::NodeId) {
         for sf in s.fields() {
-            self.check_snake_case(cx, "structure field", &sf.name.as_str(), Some(sf.span));
+            self.check_snake_case(cx, "structure field", &sf.ident.as_str(), Some(sf.span));
         }
     }
 }
@@ -368,6 +368,9 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NonUpperCaseGlobals {
     fn check_item(&mut self, cx: &LateContext, it: &hir::Item) {
         match it.node {
             hir::ItemStatic(..) => {
+                if attr::find_by_name(&it.attrs, "no_mangle").is_some() {
+                    return;
+                }
                 NonUpperCaseGlobals::check_upper_case(cx, "static variable", it.name, it.span);
             }
             hir::ItemConst(..) => {

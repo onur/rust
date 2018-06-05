@@ -38,6 +38,7 @@ use rustc::util::nodemap::{ItemLocalSet, NodeSet};
 use rustc::hir;
 use rustc_data_structures::sync::Lrc;
 use syntax::ast;
+use syntax::attr;
 use syntax_pos::{Span, DUMMY_SP};
 use rustc::hir::intravisit::{self, Visitor, NestedVisitorMap};
 
@@ -119,7 +120,7 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
         !ty.needs_drop(self.tcx, self.param_env)
     }
 
-    fn handle_const_fn_call(&mut self, def_id: DefId, ret_ty: Ty<'gcx>) {
+    fn handle_const_fn_call(&mut self, def_id: DefId, ret_ty: Ty<'gcx>, span: Span) {
         self.promotable &= self.type_has_only_promotable_values(ret_ty);
 
         self.promotable &= if let Some(fn_id) = self.tcx.hir.as_local_node_id(def_id) {
@@ -129,6 +130,25 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
         } else {
             self.tcx.is_const_fn(def_id)
         };
+
+        if let Some(&attr::Stability {
+            rustc_const_unstable: Some(attr::RustcConstUnstable {
+                feature: ref feature_name
+            }),
+        .. }) = self.tcx.lookup_stability(def_id) {
+            self.promotable &=
+                // feature-gate is enabled,
+                self.tcx.features()
+                    .declared_lib_features
+                    .iter()
+                    .any(|&(ref sym, _)| sym == feature_name) ||
+
+                // this comes from a crate with the feature-gate enabled,
+                !def_id.is_local() ||
+
+                // this comes from a macro that has #[allow_internal_unstable]
+                span.allows_unstable();
+        }
     }
 }
 
@@ -275,7 +295,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
         hir::ExprCast(ref from, _) => {
             debug!("Checking const cast(id={})", from.id);
             match v.tables.cast_kinds().get(from.hir_id) {
-                None => span_bug!(e.span, "no kind for cast"),
+                None => v.tcx.sess.delay_span_bug(e.span, "no kind for cast"),
                 Some(&CastKind::PtrAddrCast) | Some(&CastKind::FnPtrAddrCast) => {
                     v.promotable = false;
                 }
@@ -342,7 +362,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             let mut callee = &**callee;
             loop {
                 callee = match callee.node {
-                    hir::ExprBlock(ref block) => match block.expr {
+                    hir::ExprBlock(ref block, _) => match block.expr {
                         Some(ref tail) => &tail,
                         None => break
                     },
@@ -359,12 +379,12 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
                 Def::StructCtor(_, CtorKind::Fn) |
                 Def::VariantCtor(_, CtorKind::Fn) => {}
                 Def::Fn(did) => {
-                    v.handle_const_fn_call(did, node_ty)
+                    v.handle_const_fn_call(did, node_ty, e.span)
                 }
                 Def::Method(did) => {
                     match v.tcx.associated_item(did).container {
                         ty::ImplContainer(_) => {
-                            v.handle_const_fn_call(did, node_ty)
+                            v.handle_const_fn_call(did, node_ty, e.span)
                         }
                         ty::TraitContainer(_) => v.promotable = false
                     }
@@ -373,10 +393,14 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
         hir::ExprMethodCall(..) => {
-            let def_id = v.tables.type_dependent_defs()[e.hir_id].def_id();
-            match v.tcx.associated_item(def_id).container {
-                ty::ImplContainer(_) => v.handle_const_fn_call(def_id, node_ty),
-                ty::TraitContainer(_) => v.promotable = false
+            if let Some(def) = v.tables.type_dependent_defs().get(e.hir_id) {
+                let def_id = def.def_id();
+                match v.tcx.associated_item(def_id).container {
+                    ty::ImplContainer(_) => v.handle_const_fn_call(def_id, node_ty, e.span),
+                    ty::TraitContainer(_) => v.promotable = false
+                }
+            } else {
+                v.tcx.sess.delay_span_bug(e.span, "no type-dependent def for method call");
             }
         }
         hir::ExprStruct(..) => {
@@ -400,10 +424,9 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
 
-        hir::ExprBlock(_) |
+        hir::ExprBlock(..) |
         hir::ExprIndex(..) |
         hir::ExprField(..) |
-        hir::ExprTupField(..) |
         hir::ExprArray(_) |
         hir::ExprType(..) |
         hir::ExprTup(..) => {}
@@ -465,13 +488,13 @@ impl<'a, 'gcx, 'tcx> euv::Delegate<'tcx> for CheckCrateVisitor<'a, 'gcx> {
     fn consume(&mut self,
                _consume_id: ast::NodeId,
                _consume_span: Span,
-               _cmt: mc::cmt,
+               _cmt: &mc::cmt_,
                _mode: euv::ConsumeMode) {}
 
     fn borrow(&mut self,
               borrow_id: ast::NodeId,
               _borrow_span: Span,
-              cmt: mc::cmt<'tcx>,
+              cmt: &mc::cmt_<'tcx>,
               _loan_region: ty::Region<'tcx>,
               bk: ty::BorrowKind,
               loan_cause: euv::LoanCause) {
@@ -486,7 +509,7 @@ impl<'a, 'gcx, 'tcx> euv::Delegate<'tcx> for CheckCrateVisitor<'a, 'gcx> {
             _ => {}
         }
 
-        let mut cur = &cmt;
+        let mut cur = cmt;
         loop {
             match cur.cat {
                 Categorization::Rvalue(..) => {
@@ -518,11 +541,11 @@ impl<'a, 'gcx, 'tcx> euv::Delegate<'tcx> for CheckCrateVisitor<'a, 'gcx> {
     fn mutate(&mut self,
               _assignment_id: ast::NodeId,
               _assignment_span: Span,
-              _assignee_cmt: mc::cmt,
+              _assignee_cmt: &mc::cmt_,
               _mode: euv::MutateMode) {
     }
 
-    fn matched_pat(&mut self, _: &hir::Pat, _: mc::cmt, _: euv::MatchMode) {}
+    fn matched_pat(&mut self, _: &hir::Pat, _: &mc::cmt_, _: euv::MatchMode) {}
 
-    fn consume_pat(&mut self, _consume_pat: &hir::Pat, _cmt: mc::cmt, _mode: euv::ConsumeMode) {}
+    fn consume_pat(&mut self, _consume_pat: &hir::Pat, _cmt: &mc::cmt_, _mode: euv::ConsumeMode) {}
 }

@@ -79,26 +79,23 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
                 body_ids: _,
             } = *krate;
 
-            root_mod_sig_dep_index = dep_graph.with_task(
+            root_mod_sig_dep_index = dep_graph.input_task(
                 root_mod_def_path_hash.to_dep_node(DepKind::Hir),
                 &hcx,
                 HirItemLike { item_like: (module, attrs, span), hash_bodies: false },
-                identity_fn
             ).1;
-            root_mod_full_dep_index = dep_graph.with_task(
+            root_mod_full_dep_index = dep_graph.input_task(
                 root_mod_def_path_hash.to_dep_node(DepKind::HirBody),
                 &hcx,
                 HirItemLike { item_like: (module, attrs, span), hash_bodies: true },
-                identity_fn
             ).1;
         }
 
         {
-            dep_graph.with_task(
+            dep_graph.input_task(
                 DepNode::new_no_params(DepKind::AllLocalTraitImpls),
                 &hcx,
                 &krate.trait_impls,
-                identity_fn
             );
         }
 
@@ -169,12 +166,11 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
 
         let (_, crate_dep_node_index) = self
             .dep_graph
-            .with_task(DepNode::new_no_params(DepKind::Krate),
+            .input_task(DepNode::new_no_params(DepKind::Krate),
                        &self.hcx,
                        (((node_hashes, upstream_crates), source_file_names),
                         (commandline_args_hash,
-                         crate_disambiguator.to_fingerprint())),
-                       identity_fn);
+                         crate_disambiguator.to_fingerprint())));
 
         let svh = Svh::new(self.dep_graph
                                .fingerprint_of(crate_dep_node_index)
@@ -206,6 +202,7 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
             NodeImplItem(n) => EntryImplItem(parent, dep_node_index, n),
             NodeVariant(n) => EntryVariant(parent, dep_node_index, n),
             NodeField(n) => EntryField(parent, dep_node_index, n),
+            NodeAnonConst(n) => EntryAnonConst(parent, dep_node_index, n),
             NodeExpr(n) => EntryExpr(parent, dep_node_index, n),
             NodeStmt(n) => EntryStmt(parent, dep_node_index, n),
             NodeTy(n) => EntryTy(parent, dep_node_index, n),
@@ -267,18 +264,16 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
 
         let def_path_hash = self.definitions.def_path_hash(dep_node_owner);
 
-        self.current_signature_dep_index = self.dep_graph.with_task(
+        self.current_signature_dep_index = self.dep_graph.input_task(
             def_path_hash.to_dep_node(DepKind::Hir),
             &self.hcx,
             HirItemLike { item_like, hash_bodies: false },
-            identity_fn
         ).1;
 
-        self.current_full_dep_index = self.dep_graph.with_task(
+        self.current_full_dep_index = self.dep_graph.input_task(
             def_path_hash.to_dep_node(DepKind::HirBody),
             &self.hcx,
             HirItemLike { item_like, hash_bodies: true },
-            identity_fn
         ).1;
 
         self.hir_body_nodes.push((def_path_hash, self.current_full_dep_index));
@@ -351,12 +346,16 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         });
     }
 
-    fn visit_generics(&mut self, generics: &'hir Generics) {
-        for ty_param in generics.ty_params() {
-            self.insert(ty_param.id, NodeTyParam(ty_param));
+    fn visit_generic_param(&mut self, param: &'hir GenericParam) {
+        match *param {
+            GenericParam::Lifetime(ref ld) => {
+                self.insert(ld.lifetime.id, NodeLifetime(&ld.lifetime));
+            }
+            GenericParam::Type(ref ty_param) => {
+                self.insert(ty_param.id, NodeTyParam(ty_param));
+            }
         }
-
-        intravisit::walk_generics(self, generics);
+        intravisit::walk_generic_param(self, param);
     }
 
     fn visit_trait_item(&mut self, ti: &'hir TraitItem) {
@@ -393,6 +392,14 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
 
         self.with_parent(pat.id, |this| {
             intravisit::walk_pat(this, pat);
+        });
+    }
+
+    fn visit_anon_const(&mut self, constant: &'hir AnonConst) {
+        self.insert(constant.id, NodeAnonConst(constant));
+
+        self.with_parent(constant.id, |this| {
+            intravisit::walk_anon_const(this, constant);
         });
     }
 
@@ -518,12 +525,6 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
 
         self.visit_nested_impl_item(id);
     }
-}
-
-// We use this with DepGraph::with_task(). Since we are handling only input
-// values here, the "task" computing them just passes them through.
-fn identity_fn<T>(_: &StableHashingContext, item_like: T) -> T {
-    item_like
 }
 
 // This is a wrapper structure that allows determining if span values within

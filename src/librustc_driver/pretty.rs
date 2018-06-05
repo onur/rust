@@ -20,7 +20,7 @@ use {abort_on_err, driver};
 use rustc::ty::{self, TyCtxt, Resolutions, AllArenas};
 use rustc::cfg;
 use rustc::cfg::graphviz::LabelledCFG;
-use rustc::middle::cstore::CrateStore;
+use rustc::middle::cstore::CrateStoreDyn;
 use rustc::session::Session;
 use rustc::session::config::{Input, OutputFilenames};
 use rustc_borrowck as borrowck;
@@ -199,7 +199,7 @@ impl PpSourceMode {
     }
     fn call_with_pp_support_hir<'tcx, A, F>(&self,
                                                sess: &'tcx Session,
-                                               cstore: &'tcx CrateStore,
+                                               cstore: &'tcx CrateStoreDyn,
                                                hir_map: &hir_map::Map<'tcx>,
                                                analysis: &ty::CrateAnalysis,
                                                resolutions: &Resolutions,
@@ -228,8 +228,8 @@ impl PpSourceMode {
             }
             PpmTyped => {
                 let control = &driver::CompileController::basic();
-                let trans = ::get_trans(sess);
-                abort_on_err(driver::phase_3_run_analysis_passes(&*trans,
+                let codegen_backend = ::get_codegen_backend(sess);
+                abort_on_err(driver::phase_3_run_analysis_passes(&*codegen_backend,
                                                                  control,
                                                                  sess,
                                                                  cstore,
@@ -466,11 +466,11 @@ impl<'a> PrinterSupport for HygieneAnnotation<'a> {
 impl<'a> pprust::PpAnn for HygieneAnnotation<'a> {
     fn post(&self, s: &mut pprust::State, node: pprust::AnnNode) -> io::Result<()> {
         match node {
-            pprust::NodeIdent(&ast::Ident { name, ctxt }) => {
+            pprust::NodeIdent(&ast::Ident { name, span }) => {
                 s.s.space()?;
                 // FIXME #16420: this doesn't display the connections
                 // between syntax contexts
-                s.synth_comment(format!("{}{:?}", name.as_u32(), ctxt))
+                s.synth_comment(format!("{}{:?}", name.as_u32(), span.ctxt()))
             }
             pprust::NodeName(&name) => {
                 s.s.space()?;
@@ -582,6 +582,13 @@ impl<'a, 'hir> Iterator for NodesMatchingUII<'a, 'hir> {
         match self {
             &mut NodesMatchingDirect(ref mut iter) => iter.next(),
             &mut NodesMatchingSuffix(ref mut iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            &NodesMatchingDirect(ref iter) => iter.size_hint(),
+            &NodesMatchingSuffix(ref iter) => iter.size_hint(),
         }
     }
 }
@@ -905,7 +912,7 @@ pub fn print_after_parsing(sess: &Session,
 }
 
 pub fn print_after_hir_lowering<'tcx, 'a: 'tcx>(sess: &'a Session,
-                                                cstore: &'tcx CrateStore,
+                                                cstore: &'tcx CrateStoreDyn,
                                                 hir_map: &hir_map::Map<'tcx>,
                                                 analysis: &ty::CrateAnalysis,
                                                 resolutions: &Resolutions,
@@ -1061,7 +1068,7 @@ pub fn print_after_hir_lowering<'tcx, 'a: 'tcx>(sess: &'a Session,
 // with a different callback than the standard driver, so that isn't easy.
 // Instead, we call that function ourselves.
 fn print_with_analysis<'tcx, 'a: 'tcx>(sess: &'a Session,
-                                       cstore: &'a CrateStore,
+                                       cstore: &'a CrateStoreDyn,
                                        hir_map: &hir_map::Map<'tcx>,
                                        analysis: &ty::CrateAnalysis,
                                        resolutions: &Resolutions,
@@ -1082,8 +1089,8 @@ fn print_with_analysis<'tcx, 'a: 'tcx>(sess: &'a Session,
     let mut out = Vec::new();
 
     let control = &driver::CompileController::basic();
-    let trans = ::get_trans(sess);
-    abort_on_err(driver::phase_3_run_analysis_passes(&*trans,
+    let codegen_backend = ::get_codegen_backend(sess);
+    abort_on_err(driver::phase_3_run_analysis_passes(&*codegen_backend,
                                                      control,
                                                      sess,
                                                      cstore,

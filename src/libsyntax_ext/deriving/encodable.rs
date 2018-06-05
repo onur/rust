@@ -148,8 +148,8 @@ fn expand_deriving_encodable_imp(cx: &mut ExtCtxt,
                     ],
                 },
                 explicit_self: borrowed_explicit_self(),
-                args: vec![Ptr(Box::new(Literal(Path::new_local(typaram))),
-                           Borrowed(None, Mutability::Mutable))],
+                args: vec![(Ptr(Box::new(Literal(Path::new_local(typaram))),
+                           Borrowed(None, Mutability::Mutable)), "s")],
                 ret_ty: Literal(Path::new_(
                     pathvec_std!(cx, result::Result),
                     None,
@@ -190,7 +190,7 @@ fn encodable_substructure(cx: &mut ExtCtxt,
         Struct(_, ref fields) => {
             let emit_struct_field = cx.ident_of("emit_struct_field");
             let mut stmts = Vec::new();
-            for (i, &FieldInfo { name, ref self_, span, attrs, .. }) in fields.iter().enumerate() {
+            for (i, &FieldInfo { name, ref self_, span, .. }) in fields.iter().enumerate() {
                 let name = match name {
                     Some(id) => id.name,
                     None => Symbol::intern(&format!("_field{}", i)),
@@ -213,28 +213,18 @@ fn encodable_substructure(cx: &mut ExtCtxt,
                     cx.expr(span, ExprKind::Ret(Some(call)))
                 };
 
-                // This exists for https://github.com/rust-lang/rust/pull/47540
-                //
-                // If we decide to stabilize that flag this can be removed
-                let expr = if attrs.iter().any(|a| a.check_name("rustc_serialize_exclude_null")) {
-                    let is_some = cx.ident_of("is_some");
-                    let condition = cx.expr_method_call(span, self_.clone(), is_some, vec![]);
-                    cx.expr_if(span, condition, call, None)
-                } else {
-                    call
-                };
-                let stmt = cx.stmt_expr(expr);
+                let stmt = cx.stmt_expr(call);
                 stmts.push(stmt);
             }
 
             // unit structs have no fields and need to return Ok()
-            if stmts.is_empty() {
+            let blk = if stmts.is_empty() {
                 let ok = cx.expr_ok(trait_span, cx.expr_tuple(trait_span, vec![]));
-                let ret_ok = cx.expr(trait_span, ExprKind::Ret(Some(ok)));
-                stmts.push(cx.stmt_expr(ret_ok));
-            }
+                cx.lambda1(trait_span, ok, blkarg)
+            } else {
+                cx.lambda_stmts_1(trait_span, stmts, blkarg)
+            };
 
-            let blk = cx.lambda_stmts_1(trait_span, stmts, blkarg);
             cx.expr_method_call(trait_span,
                                 encoder,
                                 cx.ident_of("emit_struct"),
@@ -277,7 +267,7 @@ fn encodable_substructure(cx: &mut ExtCtxt,
             }
 
             let blk = cx.lambda_stmts_1(trait_span, stmts, blkarg);
-            let name = cx.expr_str(trait_span, variant.node.name.name);
+            let name = cx.expr_str(trait_span, variant.node.ident.name);
             let call = cx.expr_method_call(trait_span,
                                            blkencoder,
                                            cx.ident_of("emit_enum_variant"),

@@ -13,12 +13,8 @@
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 
-#![feature(conservative_impl_trait)]
 #![feature(fs_read_write)]
-#![feature(i128_type)]
-#![cfg_attr(stage0, feature(inclusive_range_syntax))]
 #![feature(specialization)]
 
 extern crate graphviz;
@@ -39,9 +35,10 @@ pub use assert_dep_graph::assert_dep_graph;
 pub use persist::dep_graph_tcx_init;
 pub use persist::load_dep_graph;
 pub use persist::load_query_result_cache;
+pub use persist::LoadResult;
+pub use persist::copy_cgu_workproducts_to_incr_comp_cache_dir;
 pub use persist::save_dep_graph;
-pub use persist::save_trans_partition;
-pub use persist::save_work_products;
+pub use persist::save_work_product_index;
 pub use persist::in_incr_comp_dir;
 pub use persist::prepare_session_directory;
 pub use persist::finalize_session_directory;

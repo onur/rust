@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use {AmbiguityError, Resolver, ResolutionError, resolve_error};
+use {AmbiguityError, CrateLint, Resolver, ResolutionError, resolve_error};
 use {Module, ModuleKind, NameBinding, NameBindingKind, PathResult};
 use Namespace::{self, MacroNS};
 use build_reduced_graph::BuildReducedGraphVisitor;
@@ -20,12 +20,11 @@ use rustc::hir::map::{self, DefCollector};
 use rustc::{ty, lint};
 use syntax::ast::{self, Name, Ident};
 use syntax::attr::{self, HasAttrs};
-use syntax::codemap::respan;
 use syntax::errors::DiagnosticBuilder;
 use syntax::ext::base::{self, Annotatable, Determinacy, MultiModifier, MultiDecorator};
 use syntax::ext::base::{MacroKind, SyntaxExtension, Resolver as SyntaxResolver};
 use syntax::ext::expand::{Expansion, ExpansionKind, Invocation, InvocationKind, find_attr_invoc};
-use syntax::ext::hygiene::{Mark, MarkKind};
+use syntax::ext::hygiene::{self, Mark, MarkKind};
 use syntax::ext::placeholders::placeholder;
 use syntax::ext::tt::macro_rules;
 use syntax::feature_gate::{self, emit_feature_err, GateIssue};
@@ -46,9 +45,6 @@ use rustc_data_structures::sync::Lrc;
 pub struct InvocationData<'a> {
     pub module: Cell<Module<'a>>,
     pub def_index: DefIndex,
-    // True if this expansion is in a `const_expr` position, for example `[u32; m!()]`.
-    // c.f. `DefCollector::visit_const_expr`.
-    pub const_expr: bool,
     // The scope in which the invocation path is resolved.
     pub legacy_scope: Cell<LegacyScope<'a>>,
     // The smallest scope that includes this invocation's expansion,
@@ -61,7 +57,6 @@ impl<'a> InvocationData<'a> {
         InvocationData {
             module: Cell::new(graph_root),
             def_index: CRATE_DEF_INDEX,
-            const_expr: false,
             legacy_scope: Cell::new(LegacyScope::Empty),
             expansion: Cell::new(LegacyScope::Empty),
         }
@@ -112,6 +107,14 @@ impl<'a> MacroBinding<'a> {
             MacroBinding::Legacy(_) => panic!("unexpected MacroBinding::Legacy"),
         }
     }
+
+    pub fn def_ignoring_ambiguity(self) -> Def {
+        match self {
+            MacroBinding::Legacy(binding) => Def::Macro(binding.def_id, MacroKind::Bang),
+            MacroBinding::Global(binding) | MacroBinding::Modern(binding) =>
+                binding.def_ignoring_ambiguity(),
+        }
+    }
 }
 
 impl<'a> base::Resolver for Resolver<'a> {
@@ -125,7 +128,6 @@ impl<'a> base::Resolver for Resolver<'a> {
         self.invocations.insert(mark, self.arenas.alloc_invocation_data(InvocationData {
             module: Cell::new(module),
             def_index: module.def_id().unwrap().index,
-            const_expr: false,
             legacy_scope: Cell::new(LegacyScope::Empty),
             expansion: Cell::new(LegacyScope::Empty),
         }));
@@ -137,15 +139,15 @@ impl<'a> base::Resolver for Resolver<'a> {
 
         impl<'a, 'b> Folder for EliminateCrateVar<'a, 'b> {
             fn fold_path(&mut self, mut path: ast::Path) -> ast::Path {
-                let ident = path.segments[0].identifier;
+                let ident = path.segments[0].ident;
                 if ident.name == keywords::DollarCrate.name() {
-                    path.segments[0].identifier.name = keywords::CrateRoot.name();
-                    let module = self.0.resolve_crate_root(ident.ctxt, true);
+                    path.segments[0].ident.name = keywords::CrateRoot.name();
+                    let module = self.0.resolve_crate_root(ident.span.ctxt(), true);
                     if !module.is_local() {
-                        let span = path.segments[0].span;
+                        let span = path.segments[0].ident.span;
                         path.segments.insert(1, match module.kind {
                             ModuleKind::Def(_, name) => ast::PathSegment::from_ident(
-                                ast::Ident::with_empty_ctxt(name), span
+                                ast::Ident::with_empty_ctxt(name).with_span_pos(span)
                             ),
                             _ => unreachable!(),
                         })
@@ -207,10 +209,10 @@ impl<'a> base::Resolver for Resolver<'a> {
     }
 
     // Resolves attribute and derive legacy macros from `#![plugin(..)]`.
-    fn find_legacy_attr_invoc(&mut self, attrs: &mut Vec<ast::Attribute>)
+    fn find_legacy_attr_invoc(&mut self, attrs: &mut Vec<ast::Attribute>, allow_derive: bool)
                               -> Option<ast::Attribute> {
         for i in 0..attrs.len() {
-            let name = unwrap_or!(attrs[i].name(), continue);
+            let name = attrs[i].name();
 
             if self.session.plugin_attributes.borrow().iter()
                     .any(|&(ref attr_nm, _)| name == &**attr_nm) {
@@ -228,9 +230,11 @@ impl<'a> base::Resolver for Resolver<'a> {
             }
         }
 
+        if !allow_derive { return None }
+
         // Check for legacy derives
         for i in 0..attrs.len() {
-            let name = unwrap_or!(attrs[i].name(), continue);
+            let name = attrs[i].name();
 
             if name == "derive" {
                 let result = attrs[i].parse_list(&self.session.parse_sess, |parser| {
@@ -249,7 +253,7 @@ impl<'a> base::Resolver for Resolver<'a> {
                     if traits[j].segments.len() > 1 {
                         continue
                     }
-                    let trait_name = traits[j].segments[0].identifier.name;
+                    let trait_name = traits[j].segments[0].ident.name;
                     let legacy_name = Symbol::intern(&format!("derive_{}", trait_name));
                     if !self.global_macros.contains_key(&legacy_name) {
                         continue
@@ -268,7 +272,7 @@ impl<'a> base::Resolver for Resolver<'a> {
                                 if k > 0 {
                                     tokens.push(TokenTree::Token(path.span, Token::ModSep).into());
                                 }
-                                let tok = Token::Ident(segment.identifier);
+                                let tok = Token::from_ast_ident(segment.ident);
                                 tokens.push(TokenTree::Token(path.span, tok).into());
                             }
                         }
@@ -278,7 +282,7 @@ impl<'a> base::Resolver for Resolver<'a> {
                         }).into();
                     }
                     return Some(ast::Attribute {
-                        path: ast::Path::from_ident(span, Ident::with_empty_ctxt(legacy_name)),
+                        path: ast::Path::from_ident(Ident::new(legacy_name, span)),
                         tokens: TokenStream::empty(),
                         id: attr::mk_attr_id(),
                         style: ast::AttrStyle::Outer,
@@ -327,7 +331,7 @@ impl<'a> base::Resolver for Resolver<'a> {
         for did in self.unused_macros.iter() {
             let id_span = match *self.macro_map[did] {
                 SyntaxExtension::NormalTT { def_info, .. } => def_info,
-                SyntaxExtension::DeclMacro(.., osp) => osp,
+                SyntaxExtension::DeclMacro(.., osp, _) => osp,
                 _ => None,
             };
             if let Some((id, span)) = id_span {
@@ -365,12 +369,12 @@ impl<'a> Resolver<'a> {
         }
 
         let attr_name = match path.segments.len() {
-            1 => path.segments[0].identifier.name,
+            1 => path.segments[0].ident.name,
             _ => return Err(determinacy),
         };
         for path in traits {
             match self.resolve_macro(scope, path, MacroKind::Derive, force) {
-                Ok(ext) => if let SyntaxExtension::ProcMacroDerive(_, ref inert_attrs) = *ext {
+                Ok(ext) => if let SyntaxExtension::ProcMacroDerive(_, ref inert_attrs, _) = *ext {
                     if inert_attrs.contains(&attr_name) {
                         // FIXME(jseyfried) Avoid `mem::replace` here.
                         let dummy_item = placeholder(ExpansionKind::Items, ast::DUMMY_NODE_ID)
@@ -398,6 +402,19 @@ impl<'a> Resolver<'a> {
 
     fn resolve_macro_to_def(&mut self, scope: Mark, path: &ast::Path, kind: MacroKind, force: bool)
                             -> Result<Def, Determinacy> {
+        if kind != MacroKind::Bang && path.segments.len() > 1 {
+            if !self.session.features_untracked().proc_macro_path_invoc {
+                emit_feature_err(
+                    &self.session.parse_sess,
+                    "proc_macro_path_invoc",
+                    path.span,
+                    GateIssue::Language,
+                    "paths of length greater than one in macro invocations are \
+                     currently unstable",
+                );
+            }
+        }
+
         let def = self.resolve_macro_to_def_inner(scope, path, kind, force);
         if def != Err(Determinacy::Undetermined) {
             // Do not report duplicated errors on every undetermined resolution.
@@ -413,7 +430,7 @@ impl<'a> Resolver<'a> {
                                   kind: MacroKind, force: bool)
                                   -> Result<Def, Determinacy> {
         let ast::Path { ref segments, span } = *path;
-        let path: Vec<_> = segments.iter().map(|seg| respan(seg.span, seg.identifier)).collect();
+        let path: Vec<_> = segments.iter().map(|seg| seg.ident).collect();
         let invocation = self.invocations[&scope];
         let module = invocation.module.get();
         self.current_module = if module.is_trait() { module.parent.unwrap() } else { module };
@@ -427,7 +444,7 @@ impl<'a> Resolver<'a> {
                 return Err(Determinacy::Determined);
             }
 
-            let def = match self.resolve_path(&path, Some(MacroNS), false, span) {
+            let def = match self.resolve_path(&path, Some(MacroNS), false, span, CrateLint::No) {
                 PathResult::NonModule(path_res) => match path_res.base_def() {
                     Def::Err => Err(Determinacy::Determined),
                     def @ _ => {
@@ -447,19 +464,16 @@ impl<'a> Resolver<'a> {
                     Err(Determinacy::Determined)
                 },
             };
-            let path = path.iter().map(|p| p.node).collect::<Vec<_>>();
             self.current_module.nearest_item_scope().macro_resolutions.borrow_mut()
                 .push((path.into_boxed_slice(), span));
             return def;
         }
 
-        let legacy_resolution = self.resolve_legacy_scope(&invocation.legacy_scope,
-                                                          path[0].node,
-                                                          false);
+        let legacy_resolution = self.resolve_legacy_scope(&invocation.legacy_scope, path[0], false);
         let result = if let Some(MacroBinding::Legacy(binding)) = legacy_resolution {
             Ok(Def::Macro(binding.def_id, MacroKind::Bang))
         } else {
-            match self.resolve_lexical_macro_path_segment(path[0].node, MacroNS, false, span) {
+            match self.resolve_lexical_macro_path_segment(path[0], MacroNS, false, span) {
                 Ok(binding) => Ok(binding.binding().def_ignoring_ambiguity()),
                 Err(Determinacy::Undetermined) if !force => return Err(Determinacy::Undetermined),
                 Err(_) => {
@@ -470,7 +484,7 @@ impl<'a> Resolver<'a> {
         };
 
         self.current_module.nearest_item_scope().legacy_macro_resolutions.borrow_mut()
-            .push((scope, path[0].node, span, kind));
+            .push((scope, path[0], kind, result.ok()));
 
         result
     }
@@ -517,7 +531,6 @@ impl<'a> Resolver<'a> {
                                 b1: shadower,
                                 b2: binding,
                                 lexical: true,
-                                legacy: false,
                             });
                             return potential_illegal_shadower;
                         }
@@ -534,7 +547,7 @@ impl<'a> Resolver<'a> {
             }
 
             module = match module {
-                Some(module) => self.hygienic_lexical_parent(module, &mut ident.ctxt),
+                Some(module) => self.hygienic_lexical_parent(module, &mut ident.span),
                 None => return potential_illegal_shadower,
             }
         }
@@ -608,8 +621,7 @@ impl<'a> Resolver<'a> {
     pub fn finalize_current_module_macro_resolutions(&mut self) {
         let module = self.current_module;
         for &(ref path, span) in module.macro_resolutions.borrow().iter() {
-            let path = path.iter().map(|p| respan(span, *p)).collect::<Vec<_>>();
-            match self.resolve_path(&path, Some(MacroNS), true, span) {
+            match self.resolve_path(&path, Some(MacroNS), true, span, CrateLint::No) {
                 PathResult::NonModule(_) => {},
                 PathResult::Failed(span, msg, _) => {
                     resolve_error(self, span, ResolutionError::FailedToResolve(&msg));
@@ -618,10 +630,33 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        for &(mark, ident, span, kind) in module.legacy_macro_resolutions.borrow().iter() {
+        for &(mark, ident, kind, def) in module.legacy_macro_resolutions.borrow().iter() {
+            let span = ident.span;
             let legacy_scope = &self.invocations[&mark].legacy_scope;
             let legacy_resolution = self.resolve_legacy_scope(legacy_scope, ident, true);
             let resolution = self.resolve_lexical_macro_path_segment(ident, MacroNS, true, span);
+
+            let check_consistency = |this: &Self, binding: MacroBinding| {
+                if let Some(def) = def {
+                    if this.ambiguity_errors.is_empty() && this.disallowed_shadowing.is_empty() &&
+                       binding.def_ignoring_ambiguity() != def {
+                        // Make sure compilation does not succeed if preferred macro resolution
+                        // has changed after the macro had been expanded. In theory all such
+                        // situations should be reported as ambiguity errors, so this is span-bug.
+                        span_bug!(span, "inconsistent resolution for a macro");
+                    }
+                } else {
+                    // It's possible that the macro was unresolved (indeterminate) and silently
+                    // expanded into a dummy fragment for recovery during expansion.
+                    // Now, post-expansion, the resolution may succeed, but we can't change the
+                    // past and need to report an error.
+                    let msg =
+                        format!("cannot determine resolution for the {} `{}`", kind.descr(), ident);
+                    let msg_note = "import resolution is stuck, try simplifying macro imports";
+                    this.session.struct_span_err(span, &msg).note(msg_note).emit();
+                }
+            };
+
             match (legacy_resolution, resolution) {
                 (Some(MacroBinding::Legacy(legacy_binding)), Ok(MacroBinding::Modern(binding))) => {
                     let msg1 = format!("`{}` could refer to the macro defined here", ident);
@@ -631,24 +666,35 @@ impl<'a> Resolver<'a> {
                         .span_note(binding.span, &msg2)
                         .emit();
                 },
-                (Some(MacroBinding::Global(binding)), Ok(MacroBinding::Global(_))) => {
-                    self.record_use(ident, MacroNS, binding, span);
-                    self.err_if_macro_use_proc_macro(ident.name, span, binding);
-                },
                 (None, Err(_)) => {
-                    let msg = match kind {
-                        MacroKind::Bang =>
-                            format!("cannot find macro `{}!` in this scope", ident),
-                        MacroKind::Attr =>
-                            format!("cannot find attribute macro `{}` in this scope", ident),
-                        MacroKind::Derive =>
-                            format!("cannot find derive macro `{}` in this scope", ident),
-                    };
+                    assert!(def.is_none());
+                    let bang = if kind == MacroKind::Bang { "!" } else { "" };
+                    let msg =
+                        format!("cannot find {} `{}{}` in this scope", kind.descr(), ident, bang);
                     let mut err = self.session.struct_span_err(span, &msg);
-                    self.suggest_macro_name(&ident.name.as_str(), kind, &mut err, span);
+                    self.suggest_macro_name(&ident.as_str(), kind, &mut err, span);
                     err.emit();
                 },
-                _ => {},
+                (Some(MacroBinding::Modern(_)), _) | (_, Ok(MacroBinding::Legacy(_))) => {
+                    span_bug!(span, "impossible macro resolution result");
+                }
+                // OK, unambiguous resolution
+                (Some(binding), Err(_)) | (None, Ok(binding)) |
+                // OK, legacy wins over global even if their definitions are different
+                (Some(binding @ MacroBinding::Legacy(_)), Ok(MacroBinding::Global(_))) |
+                // OK, modern wins over global even if their definitions are different
+                (Some(MacroBinding::Global(_)), Ok(binding @ MacroBinding::Modern(_))) => {
+                    check_consistency(self, binding);
+                }
+                (Some(MacroBinding::Global(binding1)), Ok(MacroBinding::Global(binding2))) => {
+                    if binding1.def() != binding2.def() {
+                        span_bug!(span, "mismatch between same global macro resolutions");
+                    }
+                    check_consistency(self, MacroBinding::Global(binding1));
+
+                    self.record_use(ident, MacroNS, binding1, span);
+                    self.err_if_macro_use_proc_macro(ident.name, span, binding1);
+                },
             };
         }
     }
@@ -684,8 +730,8 @@ impl<'a> Resolver<'a> {
                     false
                 }
             };
-            let ident = Ident::from_str(name);
-            self.lookup_typo_candidate(&vec![respan(span, ident)], MacroNS, is_macro, span)
+            let ident = Ident::new(Symbol::intern(name), span);
+            self.lookup_typo_candidate(&vec![ident], MacroNS, is_macro, span)
         });
 
         if let Some(suggestion) = suggestion {
@@ -706,13 +752,12 @@ impl<'a> Resolver<'a> {
                        invocation: &'a InvocationData<'a>,
                        expansion: &Expansion) {
         let Resolver { ref mut invocations, arenas, graph_root, .. } = *self;
-        let InvocationData { def_index, const_expr, .. } = *invocation;
+        let InvocationData { def_index, .. } = *invocation;
 
         let visit_macro_invoc = &mut |invoc: map::MacroInvocationData| {
             invocations.entry(invoc.mark).or_insert_with(|| {
                 arenas.alloc_invocation_data(InvocationData {
                     def_index: invoc.def_index,
-                    const_expr: invoc.const_expr,
                     module: Cell::new(graph_root),
                     expansion: Cell::new(LegacyScope::Empty),
                     legacy_scope: Cell::new(LegacyScope::Empty),
@@ -723,11 +768,6 @@ impl<'a> Resolver<'a> {
         let mut def_collector = DefCollector::new(&mut self.definitions, mark);
         def_collector.visit_macro_invoc = Some(visit_macro_invoc);
         def_collector.with_parent(def_index, |def_collector| {
-            if const_expr {
-                if let Expansion::Expr(ref expr) = *expansion {
-                    def_collector.visit_const_expr(expr);
-                }
-            }
             expansion.visit_with(def_collector)
         });
     }
@@ -745,7 +785,7 @@ impl<'a> Resolver<'a> {
         let def_id = self.definitions.local_def_id(item.id);
         let ext = Lrc::new(macro_rules::compile(&self.session.parse_sess,
                                                &self.session.features_untracked(),
-                                               item));
+                                               item, hygiene::default_edition()));
         self.macro_map.insert(def_id, ext);
 
         let def = match item.node { ast::ItemKind::MacroDef(ref def) => def, _ => unreachable!() };
@@ -793,14 +833,15 @@ impl<'a> Resolver<'a> {
 
         match *ext {
             // If `ext` is a procedural macro, check if we've already warned about it
-            AttrProcMacro(_) | ProcMacro(_) => if !self.warned_proc_macros.insert(name) { return; },
+            AttrProcMacro(..) | ProcMacro(..) =>
+                if !self.warned_proc_macros.insert(name) { return; },
             _ => return,
         }
 
         let warn_msg = match *ext {
-            AttrProcMacro(_) => "attribute procedural macros cannot be \
-                                 imported with `#[macro_use]`",
-            ProcMacro(_) => "procedural macros cannot be imported with `#[macro_use]`",
+            AttrProcMacro(..) => "attribute procedural macros cannot be \
+                                  imported with `#[macro_use]`",
+            ProcMacro(..) => "procedural macros cannot be imported with `#[macro_use]`",
             _ => return,
         };
 

@@ -11,8 +11,7 @@
 use self::Entry::*;
 use self::VacantEntryState::*;
 
-use alloc::heap::{Heap, Alloc};
-use alloc::allocator::CollectionAllocErr;
+use alloc::CollectionAllocErr;
 use cell::Cell;
 use borrow::Borrow;
 use cmp::max;
@@ -21,12 +20,13 @@ use fmt::{self, Debug};
 use hash::{Hash, Hasher, BuildHasher, SipHasher13};
 use iter::{FromIterator, FusedIterator};
 use mem::{self, replace};
-use ops::{Deref, Index, InPlace, Place, Placer};
-use ptr;
+use ops::{Deref, Index};
 use sys;
 
-use super::table::{self, Bucket, EmptyBucket, FullBucket, FullBucketMut, RawTable, SafeHash};
+use super::table::{self, Bucket, EmptyBucket, Fallibility, FullBucket, FullBucketMut, RawTable,
+                   SafeHash};
 use super::table::BucketState::{Empty, Full};
+use super::table::Fallibility::{Fallible, Infallible};
 
 const MIN_NONZERO_RAW_CAPACITY: usize = 32;     // must be a power of two
 
@@ -35,6 +35,7 @@ const MIN_NONZERO_RAW_CAPACITY: usize = 32;     // must be a power of two
 struct DefaultResizePolicy;
 
 impl DefaultResizePolicy {
+    #[inline]
     fn new() -> DefaultResizePolicy {
         DefaultResizePolicy
     }
@@ -784,11 +785,11 @@ impl<K, V, S> HashMap<K, V, S>
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn reserve(&mut self, additional: usize) {
-        match self.try_reserve(additional) {
+        match self.reserve_internal(additional, Infallible) {
             Err(CollectionAllocErr::CapacityOverflow) => panic!("capacity overflow"),
-            Err(CollectionAllocErr::AllocErr(e)) => Heap.oom(e),
+            Err(CollectionAllocErr::AllocErr) => unreachable!(),
             Ok(()) => { /* yay */ }
-         }
+        }
     }
 
     /// Tries to reserve capacity for at least `additional` more elements to be inserted
@@ -810,17 +811,24 @@ impl<K, V, S> HashMap<K, V, S>
     /// ```
     #[unstable(feature = "try_reserve", reason = "new API", issue="48043")]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), CollectionAllocErr> {
+        self.reserve_internal(additional, Fallible)
+    }
+
+    fn reserve_internal(&mut self, additional: usize, fallibility: Fallibility)
+        -> Result<(), CollectionAllocErr> {
+
         let remaining = self.capacity() - self.len(); // this can't overflow
         if remaining < additional {
-            let min_cap = self.len().checked_add(additional)
+            let min_cap = self.len()
+                .checked_add(additional)
                 .ok_or(CollectionAllocErr::CapacityOverflow)?;
             let raw_cap = self.resize_policy.try_raw_capacity(min_cap)?;
-            self.try_resize(raw_cap)?;
+            self.try_resize(raw_cap, fallibility)?;
         } else if self.table.tag() && remaining <= self.len() {
             // Probe sequence is too long and table is half full,
             // resize early to reduce probing length.
             let new_capacity = self.table.capacity() * 2;
-            self.try_resize(new_capacity)?;
+            self.try_resize(new_capacity, fallibility)?;
         }
         Ok(())
     }
@@ -832,11 +840,21 @@ impl<K, V, S> HashMap<K, V, S>
     ///   2) Ensure `new_raw_cap` is a power of two or zero.
     #[inline(never)]
     #[cold]
-    fn try_resize(&mut self, new_raw_cap: usize) -> Result<(), CollectionAllocErr> {
+    fn try_resize(
+        &mut self,
+        new_raw_cap: usize,
+        fallibility: Fallibility,
+    ) -> Result<(), CollectionAllocErr> {
         assert!(self.table.size() <= new_raw_cap);
         assert!(new_raw_cap.is_power_of_two() || new_raw_cap == 0);
 
-        let mut old_table = replace(&mut self.table, RawTable::try_new(new_raw_cap)?);
+        let mut old_table = replace(
+            &mut self.table,
+            match fallibility {
+                Infallible => RawTable::new(new_raw_cap),
+                Fallible => RawTable::try_new(new_raw_cap)?,
+            }
+        );
         let old_size = old_table.size();
 
         if old_table.size() == 0 {
@@ -897,6 +915,46 @@ impl<K, V, S> HashMap<K, V, S>
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn shrink_to_fit(&mut self) {
         let new_raw_cap = self.resize_policy.raw_capacity(self.len());
+        if self.raw_capacity() != new_raw_cap {
+            let old_table = replace(&mut self.table, RawTable::new(new_raw_cap));
+            let old_size = old_table.size();
+
+            // Shrink the table. Naive algorithm for resizing:
+            for (h, k, v) in old_table.into_iter() {
+                self.insert_hashed_nocheck(h, k, v);
+            }
+
+            debug_assert_eq!(self.table.size(), old_size);
+        }
+    }
+
+    /// Shrinks the capacity of the map with a lower limit. It will drop
+    /// down no lower than the supplied limit while maintaining the internal rules
+    /// and possibly leaving some space in accordance with the resize policy.
+    ///
+    /// Panics if the current capacity is smaller than the supplied
+    /// minimum capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(shrink_to)]
+    /// use std::collections::HashMap;
+    ///
+    /// let mut map: HashMap<i32, i32> = HashMap::with_capacity(100);
+    /// map.insert(1, 2);
+    /// map.insert(3, 4);
+    /// assert!(map.capacity() >= 100);
+    /// map.shrink_to(10);
+    /// assert!(map.capacity() >= 10);
+    /// map.shrink_to(0);
+    /// assert!(map.capacity() >= 2);
+    /// ```
+    #[unstable(feature = "shrink_to", reason = "new API", issue="0")]
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        assert!(self.capacity() >= min_capacity, "Tried to shrink to a larger capacity");
+
+        let new_raw_cap = self.resize_policy.raw_capacity(max(self.len(), min_capacity));
         if self.raw_capacity() != new_raw_cap {
             let old_table = replace(&mut self.table, RawTable::new(new_raw_cap));
             let old_size = old_table.size();
@@ -1184,6 +1242,34 @@ impl<K, V, S> HashMap<K, V, S>
         self.search(k).map(|bucket| bucket.into_refs().1)
     }
 
+    /// Returns the key-value pair corresponding to the supplied key.
+    ///
+    /// The supplied key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: ../../std/cmp/trait.Eq.html
+    /// [`Hash`]: ../../std/hash/trait.Hash.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(map_get_key_value)]
+    /// use std::collections::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// map.insert(1, "a");
+    /// assert_eq!(map.get_key_value(&1), Some((&1, &"a")));
+    /// assert_eq!(map.get_key_value(&2), None);
+    /// ```
+    #[unstable(feature = "map_get_key_value", issue = "49347")]
+    pub fn get_key_value<Q: ?Sized>(&self, k: &Q) -> Option<(&K, &V)>
+        where K: Borrow<Q>,
+              Q: Hash + Eq
+    {
+        self.search(k).map(|bucket| bucket.into_refs())
+    }
+
     /// Returns true if the map contains a value for the specified key.
     ///
     /// The key may be any borrowed form of the map's key type, but
@@ -1313,7 +1399,6 @@ impl<K, V, S> HashMap<K, V, S>
     /// # Examples
     ///
     /// ```
-    /// #![feature(hash_map_remove_entry)]
     /// use std::collections::HashMap;
     ///
     /// # fn main() {
@@ -1323,7 +1408,7 @@ impl<K, V, S> HashMap<K, V, S>
     /// assert_eq!(map.remove(&1), None);
     /// # }
     /// ```
-    #[unstable(feature = "hash_map_remove_entry", issue = "46344")]
+    #[stable(feature = "hash_map_remove_entry", since = "1.27.0")]
     pub fn remove_entry<Q: ?Sized>(&mut self, k: &Q) -> Option<(K, V)>
         where K: Borrow<Q>,
               Q: Hash + Eq
@@ -1974,80 +2059,6 @@ impl<'a, K, V> fmt::Debug for Drain<'a, K, V>
     }
 }
 
-/// A place for insertion to a `Entry`.
-///
-/// See [`HashMap::entry`](struct.HashMap.html#method.entry) for details.
-#[must_use = "places do nothing unless written to with `<-` syntax"]
-#[unstable(feature = "collection_placement",
-           reason = "struct name and placement protocol is subject to change",
-           issue = "30172")]
-pub struct EntryPlace<'a, K: 'a, V: 'a> {
-    bucket: FullBucketMut<'a, K, V>,
-}
-
-#[unstable(feature = "collection_placement",
-           reason = "struct name and placement protocol is subject to change",
-           issue = "30172")]
-impl<'a, K: 'a + Debug, V: 'a + Debug> Debug for EntryPlace<'a, K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("EntryPlace")
-            .field("key", self.bucket.read().0)
-            .field("value", self.bucket.read().1)
-            .finish()
-    }
-}
-
-#[unstable(feature = "collection_placement",
-           reason = "struct name and placement protocol is subject to change",
-           issue = "30172")]
-impl<'a, K, V> Drop for EntryPlace<'a, K, V> {
-    fn drop(&mut self) {
-        // Inplacement insertion failed. Only key need to drop.
-        // The value is failed to insert into map.
-        unsafe { self.bucket.remove_key() };
-    }
-}
-
-#[unstable(feature = "collection_placement",
-           reason = "placement protocol is subject to change",
-           issue = "30172")]
-impl<'a, K, V> Placer<V> for Entry<'a, K, V> {
-    type Place = EntryPlace<'a, K, V>;
-
-    fn make_place(self) -> EntryPlace<'a, K, V> {
-        let b = match self {
-            Occupied(mut o) => {
-                unsafe { ptr::drop_in_place(o.elem.read_mut().1); }
-                o.elem
-            }
-            Vacant(v) => {
-                unsafe { v.insert_key() }
-            }
-        };
-        EntryPlace { bucket: b }
-    }
-}
-
-#[unstable(feature = "collection_placement",
-           reason = "placement protocol is subject to change",
-           issue = "30172")]
-unsafe impl<'a, K, V> Place<V> for EntryPlace<'a, K, V> {
-    fn pointer(&mut self) -> *mut V {
-        self.bucket.read_mut().1
-    }
-}
-
-#[unstable(feature = "collection_placement",
-           reason = "placement protocol is subject to change",
-           issue = "30172")]
-impl<'a, K, V> InPlace<V> for EntryPlace<'a, K, V> {
-    type Owner = ();
-
-    unsafe fn finalize(self) {
-        mem::forget(self);
-    }
-}
-
 impl<'a, K, V> Entry<'a, K, V> {
     #[stable(feature = "rust1", since = "1.0.0")]
     /// Ensures a value is in the entry by inserting the default if empty, and returns
@@ -2135,8 +2146,8 @@ impl<'a, K, V> Entry<'a, K, V> {
     /// assert_eq!(map["poneyland"], 43);
     /// ```
     #[stable(feature = "entry_and_modify", since = "1.26.0")]
-    pub fn and_modify<F>(self, mut f: F) -> Self
-        where F: FnMut(&mut V)
+    pub fn and_modify<F>(self, f: F) -> Self
+        where F: FnOnce(&mut V)
     {
         match self {
             Occupied(mut entry) => {
@@ -2470,26 +2481,6 @@ impl<'a, K: 'a, V: 'a> VacantEntry<'a, K, V> {
         };
         b.into_mut_refs().1
     }
-
-    // Only used for InPlacement insert. Avoid unnecessary value copy.
-    // The value remains uninitialized.
-    unsafe fn insert_key(self) -> FullBucketMut<'a, K, V> {
-        match self.elem {
-            NeqElem(mut bucket, disp) => {
-                if disp >= DISPLACEMENT_THRESHOLD {
-                    bucket.table_mut().set_tag(true);
-                }
-                let uninit = mem::uninitialized();
-                robin_hood(bucket, disp, self.hash, self.key, uninit)
-            },
-            NoElem(mut bucket, disp) => {
-                if disp >= DISPLACEMENT_THRESHOLD {
-                    bucket.table_mut().set_tag(true);
-                }
-                bucket.put_key(self.hash, self.key)
-            },
-        }
-    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -2754,7 +2745,6 @@ mod test_map {
     use super::RandomState;
     use cell::RefCell;
     use rand::{thread_rng, Rng};
-    use panic;
     use realstd::collections::CollectionAllocErr::*;
     use realstd::mem::size_of;
     use realstd::usize;
@@ -3641,59 +3631,6 @@ mod test_map {
     }
 
     #[test]
-    fn test_placement_in() {
-        let mut map = HashMap::new();
-        map.extend((0..10).map(|i| (i, i)));
-
-        map.entry(100) <- 100;
-        assert_eq!(map[&100], 100);
-
-        map.entry(0) <- 10;
-        assert_eq!(map[&0], 10);
-
-        assert_eq!(map.len(), 11);
-    }
-
-    #[test]
-    fn test_placement_panic() {
-        let mut map = HashMap::new();
-        map.extend((0..10).map(|i| (i, i)));
-
-        fn mkpanic() -> usize { panic!() }
-
-        // modify existing key
-        // when panic happens, previous key is removed.
-        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| { map.entry(0) <- mkpanic(); }));
-        assert_eq!(map.len(), 9);
-        assert!(!map.contains_key(&0));
-
-        // add new key
-        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| { map.entry(100) <- mkpanic(); }));
-        assert_eq!(map.len(), 9);
-        assert!(!map.contains_key(&100));
-    }
-
-    #[test]
-    fn test_placement_drop() {
-        // correctly drop
-        struct TestV<'a>(&'a mut bool);
-        impl<'a> Drop for TestV<'a> {
-            fn drop(&mut self) {
-                if !*self.0 { panic!("value double drop!"); } // no double drop
-                *self.0 = false;
-            }
-        }
-
-        fn makepanic<'a>() -> TestV<'a> { panic!() }
-
-        let mut can_drop = true;
-        let mut hm = HashMap::new();
-        hm.insert(0, TestV(&mut can_drop));
-        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| { hm.entry(0) <- makepanic(); }));
-        assert_eq!(hm.len(), 0);
-    }
-
-    #[test]
     fn test_try_reserve() {
 
         let mut empty_bytes: HashMap<u8,u8> = HashMap::new();
@@ -3716,7 +3653,7 @@ mod test_map {
             if let Err(CapacityOverflow) = empty_bytes.try_reserve(max_no_ovf) {
             } else { panic!("isize::MAX + 1 should trigger a CapacityOverflow!") }
         } else {
-            if let Err(AllocErr(_)) = empty_bytes.try_reserve(max_no_ovf) {
+            if let Err(AllocErr) = empty_bytes.try_reserve(max_no_ovf) {
             } else { panic!("isize::MAX + 1 should trigger an OOM!") }
         }
     }

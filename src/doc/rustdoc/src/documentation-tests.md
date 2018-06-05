@@ -138,31 +138,31 @@ To keep each code block testable, we want the whole program in each block, but
 we don't want the reader to see every line every time.  Here's what we put in
 our source code:
 
-```text
-    First, we set `x` to five:
+``````markdown
+First, we set `x` to five:
 
-    ```
-    let x = 5;
-    # let y = 6;
-    # println!("{}", x + y);
-    ```
-
-    Next, we set `y` to six:
-
-    ```
-    # let x = 5;
-    let y = 6;
-    # println!("{}", x + y);
-    ```
-
-    Finally, we print the sum of `x` and `y`:
-
-    ```
-    # let x = 5;
-    # let y = 6;
-    println!("{}", x + y);
-    ```
 ```
+let x = 5;
+# let y = 6;
+# println!("{}", x + y);
+```
+
+Next, we set `y` to six:
+
+```
+# let x = 5;
+let y = 6;
+# println!("{}", x + y);
+```
+
+Finally, we print the sum of `x` and `y`:
+
+```
+# let x = 5;
+# let y = 6;
+println!("{}", x + y);
+```
+``````
 
 By repeating all parts of the example, you can ensure that your example still
 compiles, while only showing the parts that are relevant to that part of your
@@ -268,10 +268,10 @@ not actually pass as a test.
 # fn foo() {}
 ```
 
-`compile_fail` tells `rustdoc` that the compilation should fail. If it
-compiles, then the test will fail. However please note that code failing
-with the current Rust release may work in a future release, as new features
-are added.
+The `no_run` attribute will compile your code, but not run it. This is
+important for examples such as "Here's how to retrieve a web page,"
+which you would want to ensure compiles, but might be run in a test
+environment that has no network access.
 
 ```text
 /// ```compile_fail
@@ -280,7 +280,7 @@ are added.
 /// ```
 ```
 
-The `no_run` attribute will compile your code, but not run it. This is
-important for examples such as "Here's how to retrieve a web page,"
-which you would want to ensure compiles, but might be run in a test
-environment that has no network access.
+`compile_fail` tells `rustdoc` that the compilation should fail. If it
+compiles, then the test will fail. However please note that code failing
+with the current Rust release may work in a future release, as new features
+are added.

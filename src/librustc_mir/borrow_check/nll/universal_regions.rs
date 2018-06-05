@@ -22,13 +22,13 @@
 //! The code in this file doesn't *do anything* with those results; it
 //! just returns them for other code to use.
 
-use rustc::hir::{BodyOwnerKind, HirId};
+use rustc::hir::{self, BodyOwnerKind, HirId};
 use rustc::hir::def_id::DefId;
 use rustc::infer::{InferCtxt, NLLRegionVariableOrigin};
 use rustc::infer::region_constraints::GenericKind;
 use rustc::infer::outlives::bounds::{self, OutlivesBound};
 use rustc::infer::outlives::free_region_map::FreeRegionRelations;
-use rustc::ty::{self, RegionVid, Ty, TyCtxt};
+use rustc::ty::{self, RegionVid, Ty, TyCtxt, ClosureSubsts, GeneratorSubsts};
 use rustc::ty::fold::TypeFoldable;
 use rustc::ty::subst::Substs;
 use rustc::util::nodemap::FxHashMap;
@@ -116,7 +116,7 @@ pub enum DefiningTy<'tcx> {
     /// The MIR is a generator. The signature is that generators take
     /// no parameters and return the result of
     /// `ClosureSubsts::generator_return_ty`.
-    Generator(DefId, ty::ClosureSubsts<'tcx>, ty::GeneratorInterior<'tcx>),
+    Generator(DefId, ty::GeneratorSubsts<'tcx>, hir::GeneratorMovability),
 
     /// The MIR is a fn item with the given def-id and substs. The signature
     /// of the function can be bound then with the `fn_sig` query.
@@ -259,18 +259,18 @@ impl<'tcx> UniversalRegions<'tcx> {
 
     /// True if `r` is a member of this set of universal regions.
     pub fn is_universal_region(&self, r: RegionVid) -> bool {
-        (FIRST_GLOBAL_INDEX..self.num_universals).contains(r.index())
+        (FIRST_GLOBAL_INDEX..self.num_universals).contains(&r.index())
     }
 
     /// Classifies `r` as a universal region, returning `None` if this
     /// is not a member of this set of universal regions.
     pub fn region_classification(&self, r: RegionVid) -> Option<RegionClassification> {
         let index = r.index();
-        if (FIRST_GLOBAL_INDEX..self.first_extern_index).contains(index) {
+        if (FIRST_GLOBAL_INDEX..self.first_extern_index).contains(&index) {
             Some(RegionClassification::Global)
-        } else if (self.first_extern_index..self.first_local_index).contains(index) {
+        } else if (self.first_extern_index..self.first_local_index).contains(&index) {
             Some(RegionClassification::External)
-        } else if (self.first_local_index..self.num_universals).contains(index) {
+        } else if (self.first_local_index..self.num_universals).contains(&index) {
             Some(RegionClassification::Local)
         } else {
             None
@@ -509,7 +509,7 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
 
         let yield_ty = match defining_ty {
             DefiningTy::Generator(def_id, substs, _) => {
-                Some(substs.generator_yield_ty(def_id, self.infcx.tcx))
+                Some(substs.yield_ty(def_id, self.infcx.tcx))
             }
             _ => None,
         };
@@ -550,8 +550,8 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
 
                 match defining_ty.sty  {
                     ty::TyClosure(def_id, substs) => DefiningTy::Closure(def_id, substs),
-                    ty::TyGenerator(def_id, substs, interior) => {
-                        DefiningTy::Generator(def_id, substs, interior)
+                    ty::TyGenerator(def_id, substs, movability) => {
+                        DefiningTy::Generator(def_id, substs, movability)
                     }
                     ty::TyFnDef(def_id, substs) => DefiningTy::FnDef(def_id, substs),
                     _ => span_bug!(
@@ -587,7 +587,8 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
         let closure_base_def_id = tcx.closure_base_def_id(self.mir_def_id);
         let identity_substs = Substs::identity_for_item(gcx, closure_base_def_id);
         let fr_substs = match defining_ty {
-            DefiningTy::Closure(_, substs) | DefiningTy::Generator(_, substs, _) => {
+            DefiningTy::Closure(_, ClosureSubsts { ref substs }) |
+            DefiningTy::Generator(_, GeneratorSubsts { ref substs }, _) => {
                 // In the case of closures, we rely on the fact that
                 // the first N elements in the ClosureSubsts are
                 // inherited from the `closure_base_def_id`.
@@ -595,9 +596,9 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
                 // `identity_substs`, we will get only those regions
                 // that correspond to early-bound regions declared on
                 // the `closure_base_def_id`.
-                assert!(substs.substs.len() >= identity_substs.len());
-                assert_eq!(substs.substs.regions().count(), identity_substs.regions().count());
-                substs.substs
+                assert!(substs.len() >= identity_substs.len());
+                assert_eq!(substs.regions().count(), identity_substs.regions().count());
+                substs
             }
 
             DefiningTy::FnDef(_, substs) | DefiningTy::Const(_, substs) => substs,
@@ -648,10 +649,10 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
                 )
             }
 
-            DefiningTy::Generator(def_id, substs, interior) => {
+            DefiningTy::Generator(def_id, substs, movability) => {
                 assert_eq!(self.mir_def_id, def_id);
-                let output = substs.generator_return_ty(def_id, tcx);
-                let generator_ty = tcx.mk_generator(def_id, substs, interior);
+                let output = substs.return_ty(def_id, tcx);
+                let generator_ty = tcx.mk_generator(def_id, substs, movability);
                 let inputs_and_output = self.infcx.tcx.intern_type_list(&[generator_ty, output]);
                 ty::Binder::dummy(inputs_and_output)
             }
@@ -668,7 +669,7 @@ impl<'cx, 'gcx, 'tcx> UniversalRegionsBuilder<'cx, 'gcx, 'tcx> {
                 assert_eq!(self.mir_def_id, def_id);
                 let ty = tcx.type_of(def_id);
                 let ty = indices.fold_to_region_vids(tcx, &ty);
-                ty::Binder::dummy(tcx.mk_type_list(iter::once(ty)))
+                ty::Binder::dummy(tcx.intern_type_list(&[ty]))
             }
         }
     }
@@ -777,6 +778,11 @@ impl<'cx, 'gcx, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'cx, 'gcx, 'tcx> {
     where
         T: TypeFoldable<'tcx>,
     {
+        debug!(
+            "replace_bound_regions_with_nll_infer_vars(value={:?}, all_outlive_scope={:?})",
+            value,
+            all_outlive_scope,
+        );
         let (value, _map) = self.tcx.replace_late_bound_regions(value, |br| {
             let liberated_region = self.tcx.mk_region(ty::ReFree(ty::FreeRegion {
                 scope: all_outlive_scope,
@@ -784,6 +790,7 @@ impl<'cx, 'gcx, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'cx, 'gcx, 'tcx> {
             }));
             let region_vid = self.next_nll_region_var(origin);
             indices.insert_late_bound_region(liberated_region, region_vid.to_region_vid());
+            debug!("liberated_region={:?} => {:?}", liberated_region, region_vid);
             region_vid
         });
         value

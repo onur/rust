@@ -46,7 +46,8 @@ use lint;
 use rustc::hir;
 use rustc::session::Session;
 use rustc::traits;
-use rustc::ty::{self, Ty, TypeFoldable};
+use rustc::ty::{self, Ty, TypeFoldable, TypeAndMut};
+use rustc::ty::adjustment::AllowTwoPhase;
 use rustc::ty::cast::{CastKind, CastTy};
 use rustc::ty::subst::Substs;
 use rustc::middle::lang_items;
@@ -318,7 +319,7 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
                                          fcx.resolve_type_vars_if_possible(&self.expr_ty),
                                          tstr);
         match self.expr_ty.sty {
-            ty::TyRef(_, ty::TypeAndMut { mutbl: mt, .. }) => {
+            ty::TyRef(_, _, mt) => {
                 let mtstr = match mt {
                     hir::MutMutable => "mut ",
                     hir::MutImmutable => "",
@@ -434,7 +435,8 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
                     let f = self.expr_ty.fn_sig(fcx.tcx);
                     let res = fcx.try_coerce(self.expr,
                                              self.expr_ty,
-                                             fcx.tcx.mk_fn_ptr(f));
+                                             fcx.tcx.mk_fn_ptr(f),
+                                             AllowTwoPhase::No);
                     if !res.is_ok() {
                         return Err(CastError::NonScalar);
                     }
@@ -484,11 +486,7 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
                     ty::TypeVariants::TyInfer(t) => {
                         match t {
                             ty::InferTy::IntVar(_) |
-                            ty::InferTy::FloatVar(_) |
-                            ty::InferTy::FreshIntTy(_) |
-                            ty::InferTy::FreshFloatTy(_) => {
-                                Err(CastError::NeedDeref)
-                            }
+                            ty::InferTy::FloatVar(_) => Err(CastError::NeedDeref),
                             _ => Err(CastError::NeedViaPtr),
                         }
                     }
@@ -513,8 +511,8 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
 
     fn check_ptr_ptr_cast(&self,
                           fcx: &FnCtxt<'a, 'gcx, 'tcx>,
-                          m_expr: &'tcx ty::TypeAndMut<'tcx>,
-                          m_cast: &'tcx ty::TypeAndMut<'tcx>)
+                          m_expr: ty::TypeAndMut<'tcx>,
+                          m_cast: ty::TypeAndMut<'tcx>)
                           -> Result<CastKind, CastError> {
         debug!("check_ptr_ptr_cast m_expr={:?} m_cast={:?}", m_expr, m_cast);
         // ptr-ptr cast. vtables must match.
@@ -554,7 +552,7 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
 
     fn check_fptr_ptr_cast(&self,
                            fcx: &FnCtxt<'a, 'gcx, 'tcx>,
-                           m_cast: &'tcx ty::TypeAndMut<'tcx>)
+                           m_cast: ty::TypeAndMut<'tcx>)
                            -> Result<CastKind, CastError> {
         // fptr-ptr cast. must be to thin ptr
 
@@ -567,7 +565,7 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
 
     fn check_ptr_addr_cast(&self,
                            fcx: &FnCtxt<'a, 'gcx, 'tcx>,
-                           m_expr: &'tcx ty::TypeAndMut<'tcx>)
+                           m_expr: ty::TypeAndMut<'tcx>)
                            -> Result<CastKind, CastError> {
         // ptr-addr cast. must be from thin ptr
 
@@ -580,8 +578,8 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
 
     fn check_ref_cast(&self,
                       fcx: &FnCtxt<'a, 'gcx, 'tcx>,
-                      m_expr: &'tcx ty::TypeAndMut<'tcx>,
-                      m_cast: &'tcx ty::TypeAndMut<'tcx>)
+                      m_expr: ty::TypeAndMut<'tcx>,
+                      m_cast: ty::TypeAndMut<'tcx>)
                       -> Result<CastKind, CastError> {
         // array-ptr-cast.
 
@@ -605,7 +603,7 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
 
     fn check_addr_ptr_cast(&self,
                            fcx: &FnCtxt<'a, 'gcx, 'tcx>,
-                           m_cast: &'tcx ty::TypeAndMut<'tcx>)
+                           m_cast: TypeAndMut<'tcx>)
                            -> Result<CastKind, CastError> {
         // ptr-addr cast. pointer must be thin.
         match fcx.pointer_kind(m_cast.ty, self.span)? {
@@ -616,7 +614,7 @@ impl<'a, 'gcx, 'tcx> CastCheck<'tcx> {
     }
 
     fn try_coercion_cast(&self, fcx: &FnCtxt<'a, 'gcx, 'tcx>) -> bool {
-        fcx.try_coerce(self.expr, self.expr_ty, self.cast_ty).is_ok()
+        fcx.try_coerce(self.expr, self.expr_ty, self.cast_ty, AllowTwoPhase::No).is_ok()
     }
 }
 

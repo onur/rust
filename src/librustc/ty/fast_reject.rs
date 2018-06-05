@@ -28,7 +28,7 @@ pub type SimplifiedType = SimplifiedTypeGen<DefId>;
 /// because we sometimes need to use SimplifiedTypeGen values as stable sorting
 /// keys (in which case we use a DefPathHash as id-type) but in the general case
 /// the non-stable but fast to construct DefId-version is the better choice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, RustcEncodable, RustcDecodable)]
 pub enum SimplifiedTypeGen<D>
     where D: Copy + Debug + Ord + Eq + Hash
 {
@@ -80,11 +80,11 @@ pub fn simplify_type<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
         ty::TyDynamic(ref trait_info, ..) => {
             trait_info.principal().map(|p| TraitSimplifiedType(p.def_id()))
         }
-        ty::TyRef(_, mt) => {
+        ty::TyRef(_, ty, _) => {
             // since we introduce auto-refs during method lookup, we
             // just treat &T and T as equivalent from the point of
             // view of possibly unifying
-            simplify_type(tcx, mt.ty, can_simplify_params)
+            simplify_type(tcx, ty, can_simplify_params)
         }
         ty::TyFnDef(def_id, _) |
         ty::TyClosure(def_id, _) => {

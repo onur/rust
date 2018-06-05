@@ -597,21 +597,6 @@ See [RFC 911] for more details on the design of `const fn`s.
 [RFC 911]: https://github.com/rust-lang/rfcs/blob/master/text/0911-const-fn.md
 "##,
 
-E0016: r##"
-Blocks in constants may only contain items (such as constant, function
-definition, etc...) and a tail expression. Erroneous code example:
-
-```compile_fail,E0016
-const FOO: i32 = { let x = 0; x }; // 'x' isn't an item!
-```
-
-To avoid it, you have to replace the non-item object:
-
-```
-const FOO: i32 = { const X : i32 = 0; X };
-```
-"##,
-
 E0017: r##"
 References in statics and constants may only refer to immutable values.
 Erroneous code example:
@@ -2247,7 +2232,7 @@ let mut b = || {
     yield (); // ...is still in scope here, when the yield occurs.
     println!("{}", a);
 };
-b.resume();
+unsafe { b.resume() };
 ```
 
 At present, it is not permitted to have a yield that occurs while a
@@ -2265,7 +2250,7 @@ let mut b = || {
     yield ();
     println!("{}", a);
 };
-b.resume();
+unsafe { b.resume() };
 ```
 
 This is a very simple case, of course. In more complex cases, we may
@@ -2283,7 +2268,7 @@ let mut b = || {
     yield x; // ...when this yield occurs.
   }
 };
-b.resume();
+unsafe { b.resume() };
 ```
 
 Such cases can sometimes be resolved by iterating "by value" (or using
@@ -2298,7 +2283,7 @@ let mut b = || {
     yield x; // <-- Now yield is OK.
   }
 };
-b.resume();
+unsafe { b.resume() };
 ```
 
 If taking ownership is not an option, using indices can work too:
@@ -2314,7 +2299,7 @@ let mut b = || {
     yield x; // <-- Now yield is OK.
   }
 };
-b.resume();
+unsafe { b.resume() };
 
 // (*) -- Unfortunately, these temporaries are currently required.
 // See <https://github.com/rust-lang/rust/issues/43122>.

@@ -105,7 +105,7 @@ impl<T: Write> TerseFormatter<T> {
         for &(ref f, ref stdout) in &state.not_failures {
             successes.push(f.name.to_string());
             if !stdout.is_empty() {
-                stdouts.push_str(&format!("---- {} stdout ----\n\t", f.name));
+                stdouts.push_str(&format!("---- {} stdout ----\n", f.name));
                 let output = String::from_utf8_lossy(stdout);
                 stdouts.push_str(&output);
                 stdouts.push_str("\n");
@@ -131,7 +131,7 @@ impl<T: Write> TerseFormatter<T> {
         for &(ref f, ref stdout) in &state.failures {
             failures.push(f.name.to_string());
             if !stdout.is_empty() {
-                fail_out.push_str(&format!("---- {} stdout ----\n\t", f.name));
+                fail_out.push_str(&format!("---- {} stdout ----\n", f.name));
                 let output = String::from_utf8_lossy(stdout);
                 fail_out.push_str(&output);
                 fail_out.push_str("\n");
@@ -195,8 +195,7 @@ impl<T: Write> OutputFormatter for TerseFormatter<T> {
     fn write_timeout(&mut self, desc: &TestDesc) -> io::Result<()> {
         self.write_plain(&format!(
             "test {} has been running for over {} seconds\n",
-            desc.name,
-            TEST_WARN_TIMEOUT_S
+            desc.name, TEST_WARN_TIMEOUT_S
         ))
     }
 
@@ -231,11 +230,7 @@ impl<T: Write> OutputFormatter for TerseFormatter<T> {
         } else {
             format!(
                 ". {} passed; {} failed; {} ignored; {} measured; {} filtered out\n\n",
-                state.passed,
-                state.failed,
-                state.ignored,
-                state.measured,
-                state.filtered_out
+                state.passed, state.failed, state.ignored, state.measured, state.filtered_out
             )
         };
 

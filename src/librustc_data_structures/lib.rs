@@ -19,22 +19,15 @@
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://www.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 
 #![feature(collections_range)]
-#![feature(nonzero)]
 #![feature(unboxed_closures)]
 #![feature(fn_traits)]
 #![feature(unsize)]
-#![feature(i128_type)]
-#![feature(i128)]
-#![feature(conservative_impl_trait)]
 #![feature(specialization)]
 #![feature(optin_builtin_traits)]
-#![feature(underscore_lifetimes)]
 #![feature(macro_vis_matcher)]
 #![feature(allow_internal_unstable)]
-#![feature(universal_impl_trait)]
 
 #![cfg_attr(unix, feature(libc))]
 #![cfg_attr(test, feature(test))]
@@ -50,6 +43,13 @@ extern crate parking_lot;
 #[macro_use]
 extern crate cfg_if;
 extern crate stable_deref_trait;
+extern crate rustc_rayon as rayon;
+extern crate rustc_rayon_core as rayon_core;
+extern crate rustc_hash;
+
+// See librustc_cratesio_shim/Cargo.toml for a comment explaining this.
+#[allow(unused_extern_crates)]
+extern crate rustc_cratesio_shim;
 
 pub use rustc_serialize::hex::ToHex;
 
@@ -75,6 +75,16 @@ pub mod control_flow_graph;
 pub mod flock;
 pub mod sync;
 pub mod owning_ref;
+pub mod tiny_list;
+pub mod sorted_map;
+
+pub struct OnDrop<F: Fn()>(pub F);
+
+impl<F: Fn()> Drop for OnDrop<F> {
+      fn drop(&mut self) {
+            (self.0)();
+      }
+}
 
 // See comments in src/librustc/lib.rs
 #[doc(hidden)]

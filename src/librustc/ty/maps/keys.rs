@@ -11,7 +11,7 @@
 //! Defines the set of legal keys that can be used in queries.
 
 use hir::def_id::{CrateNum, DefId, LOCAL_CRATE, DefIndex};
-use traits::query::{CanonicalProjectionGoal, CanonicalTyGoal};
+use traits::query::{CanonicalPredicateGoal, CanonicalProjectionGoal, CanonicalTyGoal};
 use ty::{self, Ty, TyCtxt};
 use ty::subst::Substs;
 use ty::fast_reject::SimplifiedType;
@@ -145,7 +145,25 @@ impl<'tcx> Key for ty::PolyTraitRef<'tcx>{
     }
 }
 
+impl<'tcx> Key for (mir::interpret::ConstValue<'tcx>, Ty<'tcx>) {
+    fn map_crate(&self) -> CrateNum {
+        LOCAL_CRATE
+    }
+    fn default_span(&self, _: TyCtxt) -> Span {
+        DUMMY_SP
+    }
+}
+
 impl<'tcx> Key for Ty<'tcx> {
+    fn map_crate(&self) -> CrateNum {
+        LOCAL_CRATE
+    }
+    fn default_span(&self, _: TyCtxt) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl<'tcx> Key for ty::ParamEnv<'tcx> {
     fn map_crate(&self) -> CrateNum {
         LOCAL_CRATE
     }
@@ -183,6 +201,16 @@ impl<'tcx> Key for CanonicalProjectionGoal<'tcx> {
 }
 
 impl<'tcx> Key for CanonicalTyGoal<'tcx> {
+    fn map_crate(&self) -> CrateNum {
+        LOCAL_CRATE
+    }
+
+    fn default_span(&self, _tcx: TyCtxt) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl<'tcx> Key for CanonicalPredicateGoal<'tcx> {
     fn map_crate(&self) -> CrateNum {
         LOCAL_CRATE
     }

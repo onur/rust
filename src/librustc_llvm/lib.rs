@@ -16,7 +16,6 @@
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
 
 #![feature(box_syntax)]
 #![feature(concat_idents)]
@@ -139,7 +138,7 @@ pub fn SetFunctionCallConv(fn_: ValueRef, cc: CallConv) {
     }
 }
 
-// Externally visible symbols that might appear in multiple translation units need to appear in
+// Externally visible symbols that might appear in multiple codegen units need to appear in
 // their own comdat section so that the duplicates can be discarded at link time. This can for
 // example happen for generics when using multiple codegen units. This function simply uses the
 // value's name as the comdat value to make sure that it is in a 1-to-1 relationship to the

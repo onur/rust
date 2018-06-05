@@ -17,12 +17,14 @@
 // persisting to incr. comp. caches.
 
 use hir::def_id::{DefId, CrateNum};
+use infer::canonical::{CanonicalVarInfo, CanonicalVarInfos};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_serialize::{Decodable, Decoder, Encoder, Encodable, opaque};
 use std::hash::Hash;
 use std::intrinsics;
 use ty::{self, Ty, TyCtxt};
 use ty::subst::Substs;
+use mir::interpret::Allocation;
 
 /// The shorthand encoding uses an enum's variant index `usize`
 /// and is offset by this value so it never matches a real variant.
@@ -240,12 +242,34 @@ pub fn decode_existential_predicate_slice<'a, 'tcx, D>(decoder: &mut D)
 }
 
 #[inline]
+pub fn decode_canonical_var_infos<'a, 'tcx, D>(decoder: &mut D)
+    -> Result<CanonicalVarInfos<'tcx>, D::Error>
+    where D: TyDecoder<'a, 'tcx>,
+          'tcx: 'a,
+{
+    let len = decoder.read_usize()?;
+    let interned: Result<Vec<CanonicalVarInfo>, _> = (0..len).map(|_| Decodable::decode(decoder))
+                                                             .collect();
+    Ok(decoder.tcx()
+              .intern_canonical_var_infos(interned?.as_slice()))
+}
+
+#[inline]
 pub fn decode_const<'a, 'tcx, D>(decoder: &mut D)
                                  -> Result<&'tcx ty::Const<'tcx>, D::Error>
     where D: TyDecoder<'a, 'tcx>,
           'tcx: 'a,
 {
     Ok(decoder.tcx().mk_const(Decodable::decode(decoder)?))
+}
+
+#[inline]
+pub fn decode_allocation<'a, 'tcx, D>(decoder: &mut D)
+                                 -> Result<&'tcx Allocation, D::Error>
+    where D: TyDecoder<'a, 'tcx>,
+          'tcx: 'a,
+{
+    Ok(decoder.tcx().intern_const_alloc(Decodable::decode(decoder)?))
 }
 
 #[macro_export]
@@ -262,6 +286,7 @@ macro_rules! implement_ty_decoder {
     ($DecoderName:ident <$($typaram:tt),*>) => {
         mod __ty_decoder_impl {
             use super::$DecoderName;
+            use $crate::infer::canonical::CanonicalVarInfos;
             use $crate::ty;
             use $crate::ty::codec::*;
             use $crate::ty::subst::Substs;
@@ -364,10 +389,27 @@ macro_rules! implement_ty_decoder {
                 }
             }
 
+            impl<$($typaram),*> SpecializedDecoder<CanonicalVarInfos<'tcx>>
+                for $DecoderName<$($typaram),*> {
+                fn specialized_decode(&mut self)
+                    -> Result<CanonicalVarInfos<'tcx>, Self::Error> {
+                    decode_canonical_var_infos(self)
+                }
+            }
+
             impl<$($typaram),*> SpecializedDecoder<&'tcx $crate::ty::Const<'tcx>>
             for $DecoderName<$($typaram),*> {
                 fn specialized_decode(&mut self) -> Result<&'tcx ty::Const<'tcx>, Self::Error> {
                     decode_const(self)
+                }
+            }
+
+            impl<$($typaram),*> SpecializedDecoder<&'tcx $crate::mir::interpret::Allocation>
+            for $DecoderName<$($typaram),*> {
+                fn specialized_decode(
+                    &mut self
+                ) -> Result<&'tcx $crate::mir::interpret::Allocation, Self::Error> {
+                    decode_allocation(self)
                 }
             }
         }

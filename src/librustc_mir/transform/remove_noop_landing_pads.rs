@@ -47,9 +47,11 @@ impl RemoveNoopLandingPads {
     {
         for stmt in &mir[bb].statements {
             match stmt.kind {
+                StatementKind::ReadForMatch(_) |
                 StatementKind::StorageLive(_) |
                 StatementKind::StorageDead(_) |
                 StatementKind::EndRegion(_) |
+                StatementKind::UserAssertTy(..) |
                 StatementKind::Nop => {
                     // These are all nops in a landing pad (there's some
                     // borrowck interaction between EndRegion and storage
@@ -77,7 +79,7 @@ impl RemoveNoopLandingPads {
             TerminatorKind::SwitchInt { .. } |
             TerminatorKind::FalseEdges { .. } |
             TerminatorKind::FalseUnwind { .. } => {
-                terminator.successors().iter().all(|succ| {
+                terminator.successors().all(|succ| {
                     nop_landing_pads.contains(succ.index())
                 })
             },

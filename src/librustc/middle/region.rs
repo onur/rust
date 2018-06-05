@@ -11,8 +11,10 @@
 //! This file builds up the `ScopeTree`, which describes
 //! the parent links in the region hierarchy.
 //!
-//! Most of the documentation on regions can be found in
-//! `middle/infer/region_constraints/README.md`
+//! For more information about how MIR-based region-checking works,
+//! see the [rustc guide].
+//!
+//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/mir-borrowck.html
 
 use ich::{StableHashingContext, NodeIdHashingMode};
 use util::nodemap::{FxHashMap, FxHashSet};
@@ -20,6 +22,7 @@ use ty;
 
 use std::fmt;
 use std::mem;
+use rustc_data_structures::small_vec::SmallVec;
 use rustc_data_structures::sync::Lrc;
 use syntax::codemap;
 use syntax::ast;
@@ -351,8 +354,8 @@ pub struct ScopeTree {
     /// the result of `g()` occurs after the yield (and therefore
     /// doesn't). If we want to infer that, we can look at the
     /// postorder traversal:
-    /// ```
-    /// `foo` `f` Call#1 `y` Yield `bar` `g` Call#3 Call#2 Call#0
+    /// ```plain,ignore
+    ///     `foo` `f` Call#1 `y` Yield `bar` `g` Call#3 Call#2 Call#0
     /// ```
     ///
     /// In which we can easily see that `Call#1` occurs before the yield,
@@ -539,18 +542,6 @@ impl<'tcx> ScopeTree {
         assert!(previous.is_none());
     }
 
-    fn closure_is_enclosed_by(&self,
-                              mut sub_closure: hir::ItemLocalId,
-                              sup_closure: hir::ItemLocalId) -> bool {
-        loop {
-            if sub_closure == sup_closure { return true; }
-            match self.closure_tree.get(&sub_closure) {
-                Some(&s) => { sub_closure = s; }
-                None => { return false; }
-            }
-        }
-    }
-
     fn record_var_scope(&mut self, var: hir::ItemLocalId, lifetime: Scope) {
         debug!("record_var_scope(sub={:?}, sup={:?})", var, lifetime);
         assert!(var != lifetime.item_local_id());
@@ -675,95 +666,47 @@ impl<'tcx> ScopeTree {
                                    -> Scope {
         if scope_a == scope_b { return scope_a; }
 
-        // [1] The initial values for `a_buf` and `b_buf` are not used.
-        // The `ancestors_of` function will return some prefix that
-        // is re-initialized with new values (or else fallback to a
-        // heap-allocated vector).
-        let mut a_buf: [Scope; 32] = [scope_a /* [1] */; 32];
-        let mut a_vec: Vec<Scope> = vec![];
-        let mut b_buf: [Scope; 32] = [scope_b /* [1] */; 32];
-        let mut b_vec: Vec<Scope> = vec![];
-        let parent_map = &self.parent_map;
-        let a_ancestors = ancestors_of(parent_map, scope_a, &mut a_buf, &mut a_vec);
-        let b_ancestors = ancestors_of(parent_map, scope_b, &mut b_buf, &mut b_vec);
-        let mut a_index = a_ancestors.len() - 1;
-        let mut b_index = b_ancestors.len() - 1;
+        // Process the lists in tandem from the innermost scope, recording the
+        // scopes seen so far. The first scope that comes up for a second time
+        // is the nearest common ancestor.
+        //
+        // Note: another way to compute the nearest common ancestor is to get
+        // the full scope chain for both scopes and then compare the chains to
+        // find the first scope in a common tail. But getting a parent scope
+        // requires a hash table lookup, and we often have very long scope
+        // chains (10s or 100s of scopes) that only differ by a few elements at
+        // the start. So this algorithm is faster.
 
-        // Here, [ab]_ancestors is a vector going from narrow to broad.
-        // The end of each vector will be the item where the scope is
-        // defined; if there are any common ancestors, then the tails of
-        // the vector will be the same.  So basically we want to walk
-        // backwards from the tail of each vector and find the first point
-        // where they diverge.  If one vector is a suffix of the other,
-        // then the corresponding scope is a superscope of the other.
+        let mut ma = Some(&scope_a);
+        let mut mb = Some(&scope_b);
 
-        if a_ancestors[a_index] != b_ancestors[b_index] {
-            // In this case, the two regions belong to completely
-            // different functions.  Compare those fn for lexical
-            // nesting. The reasoning behind this is subtle.  See the
-            // "Modeling closures" section of the README in
-            // infer::region_constraints for more details.
-            let a_root_scope = a_ancestors[a_index];
-            let b_root_scope = a_ancestors[a_index];
-            return match (a_root_scope.data(), b_root_scope.data()) {
-                (ScopeData::Destruction(a_root_id),
-                 ScopeData::Destruction(b_root_id)) => {
-                    if self.closure_is_enclosed_by(a_root_id, b_root_id) {
-                        // `a` is enclosed by `b`, hence `b` is the ancestor of everything in `a`
-                        scope_b
-                    } else if self.closure_is_enclosed_by(b_root_id, a_root_id) {
-                        // `b` is enclosed by `a`, hence `a` is the ancestor of everything in `b`
-                        scope_a
-                    } else {
-                        // neither fn encloses the other
-                        bug!()
-                    }
-                }
-                _ => {
-                    // root ids are always Node right now
-                    bug!()
-                }
-            };
-        }
+        // A HashSet<Scope> is a more obvious choice for these, but SmallVec is
+        // faster because the set size is normally small so linear search is
+        // as good or better than a hash table lookup, plus the size is usually
+        // small enough to avoid a heap allocation.
+        let mut seen_a: SmallVec<[&Scope; 32]> = SmallVec::new();
+        let mut seen_b: SmallVec<[&Scope; 32]> = SmallVec::new();
 
         loop {
-            // Loop invariant: a_ancestors[a_index] == b_ancestors[b_index]
-            // for all indices between a_index and the end of the array
-            if a_index == 0 { return scope_a; }
-            if b_index == 0 { return scope_b; }
-            a_index -= 1;
-            b_index -= 1;
-            if a_ancestors[a_index] != b_ancestors[b_index] {
-                return a_ancestors[a_index + 1];
-            }
-        }
-
-        fn ancestors_of<'a, 'tcx>(parent_map: &FxHashMap<Scope, Scope>,
-                                  scope: Scope,
-                                  buf: &'a mut [Scope; 32],
-                                  vec: &'a mut Vec<Scope>)
-                                  -> &'a [Scope] {
-            // debug!("ancestors_of(scope={:?})", scope);
-            let mut scope = scope;
-
-            let mut i = 0;
-            while i < 32 {
-                buf[i] = scope;
-                match parent_map.get(&scope) {
-                    Some(&superscope) => scope = superscope,
-                    _ => return &buf[..i+1]
+            if let Some(a) = ma {
+                if seen_b.iter().any(|s| *s == a) {
+                    return *a;
                 }
-                i += 1;
+                seen_a.push(a);
+                ma = self.parent_map.get(&a);
             }
 
-            *vec = Vec::with_capacity(64);
-            vec.extend_from_slice(buf);
-            loop {
-                vec.push(scope);
-                match parent_map.get(&scope) {
-                    Some(&superscope) => scope = superscope,
-                    _ => return &*vec
+            if let Some(b) = mb {
+                if seen_a.iter().any(|s| *s == b) {
+                    return *b;
                 }
+                seen_b.push(b);
+                mb = self.parent_map.get(&b);
+            }
+
+            if ma.is_none() && mb.is_none() {
+                // No nearest common ancestor found.
+                bug!();
             }
         }
     }
@@ -1264,7 +1207,7 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'a, 'tcx>,
             hir::ExprCast(ref subexpr, _) => {
                 record_rvalue_scope_if_borrow_expr(visitor, &subexpr, blk_id)
             }
-            hir::ExprBlock(ref block) => {
+            hir::ExprBlock(ref block, _) => {
                 if let Some(ref subexpr) = block.expr {
                     record_rvalue_scope_if_borrow_expr(
                         visitor, &subexpr, blk_id);
@@ -1296,7 +1239,7 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'a, 'tcx>,
         loop {
             // Note: give all the expressions matching `ET` with the
             // extended temporary lifetime, not just the innermost rvalue,
-            // because in trans if we must compile e.g. `*rvalue()`
+            // because in codegen if we must compile e.g. `*rvalue()`
             // into a temporary, we request the temporary scope of the
             // outer expression.
             visitor.scope_tree.record_rvalue_scope(expr.hir_id.local_id, blk_scope);
@@ -1305,7 +1248,6 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'a, 'tcx>,
                 hir::ExprAddrOf(_, ref subexpr) |
                 hir::ExprUnary(hir::UnDeref, ref subexpr) |
                 hir::ExprField(ref subexpr, _) |
-                hir::ExprTupField(ref subexpr, _) |
                 hir::ExprIndex(ref subexpr, _) => {
                     expr = &subexpr;
                 }

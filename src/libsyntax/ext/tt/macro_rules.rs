@@ -10,6 +10,7 @@
 
 use {ast, attr};
 use syntax_pos::{Span, DUMMY_SP};
+use edition::Edition;
 use ext::base::{DummyResult, ExtCtxt, MacResult, SyntaxExtension};
 use ext::base::{NormalTT, TTMacroExpander};
 use ext::expand::{Expansion, ExpansionKind};
@@ -26,6 +27,7 @@ use parse::token::Token::*;
 use symbol::Symbol;
 use tokenstream::{TokenStream, TokenTree};
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
@@ -53,7 +55,7 @@ impl<'a> ParserAnyMacro<'a> {
         }
 
         // Make sure we don't have any tokens left to parse so we don't silently drop anything.
-        let path = ast::Path::from_ident(site_span, macro_ident);
+        let path = ast::Path::from_ident(macro_ident.with_span_pos(site_span));
         parser.ensure_complete_parse(&path, kind.name(), site_span);
         expansion
     }
@@ -141,12 +143,12 @@ fn generic_extension<'cx>(cx: &'cx mut ExtCtxt,
                 }
 
                 let directory = Directory {
-                    path: cx.current_expansion.module.directory.clone(),
+                    path: Cow::from(cx.current_expansion.module.directory.as_path()),
                     ownership: cx.current_expansion.directory_ownership,
                 };
                 let mut p = Parser::new(cx.parse_sess(), tts, Some(directory), true, false);
                 p.root_module_name = cx.current_expansion.module.mod_path.last()
-                    .map(|id| id.name.as_str().to_string());
+                    .map(|id| id.as_str().to_string());
 
                 p.process_potential_macro_variable();
                 // Let the context choose how to interpret the result.
@@ -183,7 +185,8 @@ fn generic_extension<'cx>(cx: &'cx mut ExtCtxt,
 // Holy self-referential!
 
 /// Converts a `macro_rules!` invocation into a syntax extension.
-pub fn compile(sess: &ParseSess, features: &Features, def: &ast::Item) -> SyntaxExtension {
+pub fn compile(sess: &ParseSess, features: &Features, def: &ast::Item, edition: Edition)
+               -> SyntaxExtension {
     let lhs_nm = ast::Ident::with_empty_ctxt(Symbol::gensym("lhs"));
     let rhs_nm = ast::Ident::with_empty_ctxt(Symbol::gensym("rhs"));
 
@@ -298,10 +301,11 @@ pub fn compile(sess: &ParseSess, features: &Features, def: &ast::Item) -> Syntax
             def_info: Some((def.id, def.span)),
             allow_internal_unstable,
             allow_internal_unsafe,
-            unstable_feature
+            unstable_feature,
+            edition,
         }
     } else {
-        SyntaxExtension::DeclMacro(expander, Some((def.id, def.span)))
+        SyntaxExtension::DeclMacro(expander, Some((def.id, def.span)), edition)
     }
 }
 
@@ -647,7 +651,7 @@ fn check_matcher_core(sess: &ParseSess,
                     let msg = format!("invalid fragment specifier `{}`", bad_frag);
                     sess.span_diagnostic.struct_span_err(token.span(), &msg)
                         .help("valid fragment specifiers are `ident`, `block`, `stmt`, `expr`, \
-                              `pat`, `ty`, `path`, `meta`, `tt`, `item` and `vis`")
+                              `pat`, `ty`, `literal`, `path`, `meta`, `tt`, `item` and `vis`")
                         .emit();
                     // (This eliminates false positives and duplicates
                     // from error messages.)
@@ -726,7 +730,7 @@ fn check_matcher_core(sess: &ParseSess,
         'each_last: for token in &last.tokens {
             if let TokenTree::MetaVarDecl(_, ref name, ref frag_spec) = *token {
                 for next_token in &suffix_first.tokens {
-                    match is_in_follow(next_token, &frag_spec.name.as_str()) {
+                    match is_in_follow(next_token, &frag_spec.as_str()) {
                         Err((msg, help)) => {
                             sess.span_diagnostic.struct_span_err(next_token.span(), &msg)
                                 .help(help).emit();
@@ -764,7 +768,7 @@ fn check_matcher_core(sess: &ParseSess,
 
 fn token_can_be_followed_by_any(tok: &quoted::TokenTree) -> bool {
     if let quoted::TokenTree::MetaVarDecl(_, _, frag_spec) = *tok {
-        frag_can_be_followed_by_any(&frag_spec.name.as_str())
+        frag_can_be_followed_by_any(&frag_spec.as_str())
     } else {
         // (Non NT's can always be followed by anthing in matchers.)
         true
@@ -784,6 +788,7 @@ fn frag_can_be_followed_by_any(frag: &str) -> bool {
         "item"     | // always terminated by `}` or `;`
         "block"    | // exactly one token tree
         "ident"    | // exactly one token tree
+        "literal"  | // exactly one token tree
         "meta"     | // exactly one token tree
         "lifetime" | // exactly one token tree
         "tt" =>   // exactly one token tree
@@ -831,7 +836,7 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
             "pat" => match *tok {
                 TokenTree::Token(_, ref tok) => match *tok {
                     FatArrow | Comma | Eq | BinOp(token::Or) => Ok(true),
-                    Ident(i) if i.name == "if" || i.name == "in" => Ok(true),
+                    Ident(i, false) if i.name == "if" || i.name == "in" => Ok(true),
                     _ => Ok(false)
                 },
                 _ => Ok(false),
@@ -840,7 +845,7 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
                 TokenTree::Token(_, ref tok) => match *tok {
                     OpenDelim(token::DelimToken::Brace) | OpenDelim(token::DelimToken::Bracket) |
                     Comma | FatArrow | Colon | Eq | Gt | Semi | BinOp(token::Or) => Ok(true),
-                    Ident(i) if i.name == "as" || i.name == "where" => Ok(true),
+                    Ident(i, false) if i.name == "as" || i.name == "where" => Ok(true),
                     _ => Ok(false)
                 },
                 TokenTree::MetaVarDecl(_, _, frag) if frag.name == "block" => Ok(true),
@@ -848,6 +853,10 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
             },
             "ident" | "lifetime" => {
                 // being a single token, idents and lifetimes are harmless
+                Ok(true)
+            },
+            "literal" => {
+                // literals may be of a single token, or two tokens (negative numbers)
                 Ok(true)
             },
             "meta" | "tt" => {
@@ -860,7 +869,7 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
                 match *tok {
                     TokenTree::Token(_, ref tok) => match *tok {
                         Comma => Ok(true),
-                        Ident(i) if i.name != "priv" => Ok(true),
+                        Ident(i, is_raw) if is_raw || i.name != "priv" => Ok(true),
                         ref tok => Ok(tok.can_begin_type())
                     },
                     TokenTree::MetaVarDecl(_, _, frag) if frag.name == "ident"
@@ -873,7 +882,7 @@ fn is_in_follow(tok: &quoted::TokenTree, frag: &str) -> Result<bool, (String, &'
             _ => Err((format!("invalid fragment specifier `{}`", frag),
                      "valid fragment specifiers are `ident`, `block`, \
                       `stmt`, `expr`, `pat`, `ty`, `path`, `meta`, `tt`, \
-                      `item` and `vis`"))
+                      `literal`, `item` and `vis`"))
         }
     }
 }
@@ -884,7 +893,7 @@ fn has_legal_fragment_specifier(sess: &ParseSess,
                                 tok: &quoted::TokenTree) -> Result<(), String> {
     debug!("has_legal_fragment_specifier({:?})", tok);
     if let quoted::TokenTree::MetaVarDecl(_, _, ref frag_spec) = *tok {
-        let frag_name = frag_spec.name.as_str();
+        let frag_name = frag_spec.as_str();
         let frag_span = tok.span();
         if !is_legal_fragment_specifier(sess, features, attrs, &frag_name, frag_span) {
             return Err(frag_name.to_string());
@@ -899,14 +908,14 @@ fn is_legal_fragment_specifier(sess: &ParseSess,
                                frag_name: &str,
                                frag_span: Span) -> bool {
     match frag_name {
-        "item" | "block" | "stmt" | "expr" | "pat" |
+        "item" | "block" | "stmt" | "expr" | "pat" | "lifetime" |
         "path" | "ty" | "ident" | "meta" | "tt" | "" => true,
-        "lifetime" => {
-            if !features.macro_lifetime_matcher &&
+        "literal" => {
+            if !features.macro_literal_matcher &&
                !attr::contains_name(attrs, "allow_internal_unstable") {
-                let explain = feature_gate::EXPLAIN_LIFETIME_MATCHER;
+                let explain = feature_gate::EXPLAIN_LITERAL_MATCHER;
                 emit_feature_err(sess,
-                                 "macro_lifetime_matcher",
+                                 "macro_literal_matcher",
                                  frag_span,
                                  GateIssue::Language,
                                  explain);

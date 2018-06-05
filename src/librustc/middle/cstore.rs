@@ -22,26 +22,24 @@
 //! are *mostly* used as a part of that interface, but these should
 //! probably get a better home if someone can find one.
 
-use hir;
 use hir::def;
 use hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use hir::map as hir_map;
 use hir::map::definitions::{Definitions, DefKey, DefPathTable};
 use hir::svh::Svh;
-use ich;
 use ty::{self, TyCtxt};
 use session::{Session, CrateDisambiguator};
 use session::search_paths::PathKind;
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use syntax::ast;
+use syntax::edition::Edition;
 use syntax::ext::base::SyntaxExtension;
 use syntax::symbol::Symbol;
 use syntax_pos::Span;
-use rustc_back::target::Target;
-use rustc_data_structures::sync::{MetadataRef, Lrc};
+use rustc_target::spec::Target;
+use rustc_data_structures::sync::{self, MetadataRef, Lrc};
 
 pub use self::NativeLibraryKind::*;
 
@@ -132,7 +130,13 @@ pub struct NativeLibrary {
     pub kind: NativeLibraryKind,
     pub name: Symbol,
     pub cfg: Option<ast::MetaItem>,
+    pub foreign_module: Option<DefId>,
+}
+
+#[derive(Clone, Hash, RustcEncodable, RustcDecodable)]
+pub struct ForeignModule {
     pub foreign_items: Vec<DefId>,
+    pub def_id: DefId,
 }
 
 pub enum LoadedMacro {
@@ -142,23 +146,34 @@ pub enum LoadedMacro {
 
 #[derive(Copy, Clone, Debug)]
 pub struct ExternCrate {
-    /// def_id of an `extern crate` in the current crate that caused
-    /// this crate to be loaded; note that there could be multiple
-    /// such ids
-    pub def_id: DefId,
+    pub src: ExternCrateSource,
 
     /// span of the extern crate that caused this to be loaded
     pub span: Span,
+
+    /// Number of links to reach the extern;
+    /// used to select the extern with the shortest path
+    pub path_len: usize,
 
     /// If true, then this crate is the crate named by the extern
     /// crate referenced above. If false, then this crate is a dep
     /// of the crate.
     pub direct: bool,
+}
 
-    /// Number of links to reach the extern crate `def_id`
-    /// declaration; used to select the extern crate with the shortest
-    /// path
-    pub path_len: usize,
+#[derive(Copy, Clone, Debug)]
+pub enum ExternCrateSource {
+    /// Crate is loaded by `extern crate`.
+    Extern(
+        /// def_id of the item in the current crate that caused
+        /// this crate to be loaded; note that there could be multiple
+        /// such ids
+        DefId,
+    ),
+    // Crate is loaded by `use`.
+    Use,
+    /// Crate is implicitly loaded by an absolute or an `extern::` path.
+    Path,
 }
 
 pub struct EncodedMetadata {
@@ -192,26 +207,6 @@ pub trait MetadataLoader {
                           -> Result<MetadataRef, String>;
 }
 
-#[derive(Clone)]
-pub struct ExternConstBody<'tcx> {
-    pub body: &'tcx hir::Body,
-
-    // It would require a lot of infrastructure to enable stable-hashing Bodies
-    // from other crates, so we hash on export and just store the fingerprint
-    // with them.
-    pub fingerprint: ich::Fingerprint,
-}
-
-#[derive(Clone)]
-pub struct ExternBodyNestedBodies {
-    pub nested_bodies: Lrc<BTreeMap<hir::BodyId, hir::Body>>,
-
-    // It would require a lot of infrastructure to enable stable-hashing Bodies
-    // from other crates, so we hash on export and just store the fingerprint
-    // with them.
-    pub fingerprint: ich::Fingerprint,
-}
-
 /// A store of Rust crates, through with their metadata
 /// can be accessed.
 ///
@@ -241,6 +236,7 @@ pub trait CrateStore {
     fn crate_name_untracked(&self, cnum: CrateNum) -> Symbol;
     fn crate_disambiguator_untracked(&self, cnum: CrateNum) -> CrateDisambiguator;
     fn crate_hash_untracked(&self, cnum: CrateNum) -> Svh;
+    fn crate_edition_untracked(&self, cnum: CrateNum) -> Edition;
     fn struct_field_names_untracked(&self, def: DefId) -> Vec<ast::Name>;
     fn item_children_untracked(&self, did: DefId, sess: &Session) -> Vec<def::Export>;
     fn load_macro_untracked(&self, did: DefId, sess: &Session) -> LoadedMacro;
@@ -260,6 +256,8 @@ pub trait CrateStore {
                                  -> EncodedMetadata;
     fn metadata_encoding_version(&self) -> &[u8];
 }
+
+pub type CrateStoreDyn = CrateStore + sync::Sync;
 
 // FIXME: find a better place for this?
 pub fn validate_crate_name(sess: Option<&Session>, s: &str, sp: Option<Span>) {
@@ -313,6 +311,7 @@ impl CrateStore for DummyCrateStore {
         bug!("crate_disambiguator")
     }
     fn crate_hash_untracked(&self, cnum: CrateNum) -> Svh { bug!("crate_hash") }
+    fn crate_edition_untracked(&self, cnum: CrateNum) -> Edition { bug!("crate_edition_untracked") }
 
     // resolve
     fn def_key(&self, def: DefId) -> DefKey { bug!("def_key") }
@@ -351,9 +350,23 @@ impl CrateStore for DummyCrateStore {
 }
 
 pub trait CrateLoader {
-    fn process_item(&mut self, item: &ast::Item, defs: &Definitions);
+    fn process_extern_crate(&mut self, item: &ast::Item, defs: &Definitions) -> CrateNum;
+
+    fn process_path_extern(
+        &mut self,
+        name: Symbol,
+        span: Span,
+    ) -> CrateNum;
+
+    fn process_use_extern(
+        &mut self,
+        name: Symbol,
+        span: Span,
+        id: ast::NodeId,
+        defs: &Definitions,
+    ) -> CrateNum;
+
     fn postprocess(&mut self, krate: &ast::Crate);
-    fn resolve_crate_from_path(&mut self, name: Symbol, span: Span) -> CrateNum;
 }
 
 // This method is used when generating the command line to pass through to
@@ -395,7 +408,7 @@ pub fn used_crates(tcx: TyCtxt, prefer: LinkagePreference)
         .collect::<Vec<_>>();
     let mut ordering = tcx.postorder_cnums(LOCAL_CRATE);
     Lrc::make_mut(&mut ordering).reverse();
-    libs.sort_by_key(|&(a, _)| {
+    libs.sort_by_cached_key(|&(a, _)| {
         ordering.iter().position(|x| *x == a)
     });
     libs

@@ -24,16 +24,17 @@ use rustc_lint;
 use rustc::hir;
 use rustc::hir::intravisit;
 use rustc::session::{self, CompileIncomplete, config};
-use rustc::session::config::{OutputType, OutputTypes, Externs};
+use rustc::session::config::{OutputType, OutputTypes, Externs, CodegenOptions};
 use rustc::session::search_paths::{SearchPaths, PathKind};
 use rustc_metadata::dynamic_lib::DynamicLibrary;
 use tempdir::TempDir;
-use rustc_driver::{self, driver, Compilation};
+use rustc_driver::{self, driver, target_features, Compilation};
 use rustc_driver::driver::phase_2_configure_and_expand;
 use rustc_metadata::cstore::CStore;
 use rustc_resolve::MakeGlobMap;
 use syntax::ast;
 use syntax::codemap::CodeMap;
+use syntax::edition::Edition;
 use syntax::feature_gate::UnstableFeatures;
 use syntax::with_globals;
 use syntax_pos::{BytePos, DUMMY_SP, Pos, Span, FileName};
@@ -45,7 +46,12 @@ use html::markdown;
 
 #[derive(Clone, Default)]
 pub struct TestOptions {
+    /// Whether to disable the default `extern crate my_crate;` when creating doctests.
     pub no_crate_inject: bool,
+    /// Whether to emit compilation warnings when compiling doctests. Setting this will suppress
+    /// the default `#![allow(unused)]`.
+    pub display_warnings: bool,
+    /// Additional crate-level attributes to add to doctests.
     pub attrs: Vec<String>,
 }
 
@@ -57,7 +63,9 @@ pub fn run(input_path: &Path,
            crate_name: Option<String>,
            maybe_sysroot: Option<PathBuf>,
            display_warnings: bool,
-           linker: Option<PathBuf>)
+           linker: Option<PathBuf>,
+           edition: Edition,
+           cg: CodegenOptions)
            -> isize {
     let input = config::Input::File(input_path.to_owned());
 
@@ -66,78 +74,91 @@ pub fn run(input_path: &Path,
             || Some(env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf())),
         search_paths: libs.clone(),
         crate_types: vec![config::CrateTypeDylib],
+        cg: cg.clone(),
         externs: externs.clone(),
         unstable_features: UnstableFeatures::from_environment(),
         lint_cap: Some(::rustc::lint::Level::Allow),
         actually_rustdoc: true,
+        debugging_opts: config::DebuggingOptions {
+            ..config::basic_debugging_options()
+        },
+        edition,
         ..config::basic_options().clone()
     };
+    driver::spawn_thread_pool(sessopts, |sessopts| {
+        let codemap = Lrc::new(CodeMap::new(sessopts.file_path_mapping()));
+        let handler =
+            errors::Handler::with_tty_emitter(ColorConfig::Auto,
+                                            true, false,
+                                            Some(codemap.clone()));
 
-    let codemap = Lrc::new(CodeMap::new(sessopts.file_path_mapping()));
-    let handler =
-        errors::Handler::with_tty_emitter(ColorConfig::Auto,
-                                          true, false,
-                                          Some(codemap.clone()));
+        let mut sess = session::build_session_(
+            sessopts, Some(input_path.to_owned()), handler, codemap.clone(),
+        );
+        let codegen_backend = rustc_driver::get_codegen_backend(&sess);
+        let cstore = CStore::new(codegen_backend.metadata_loader());
+        rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
 
-    let mut sess = session::build_session_(
-        sessopts, Some(input_path.to_owned()), handler, codemap.clone(),
-    );
-    let trans = rustc_driver::get_trans(&sess);
-    let cstore = CStore::new(trans.metadata_loader());
-    rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
-    sess.parse_sess.config =
-        config::build_configuration(&sess, config::parse_cfgspecs(cfgs.clone()));
+        let mut cfg = config::build_configuration(&sess, config::parse_cfgspecs(cfgs.clone()));
+        target_features::add_configuration(&mut cfg, &sess, &*codegen_backend);
+        sess.parse_sess.config = cfg;
 
-    let krate = panictry!(driver::phase_1_parse_input(&driver::CompileController::basic(),
-                                                      &sess,
-                                                      &input));
-    let driver::ExpansionResult { defs, mut hir_forest, .. } = {
-        phase_2_configure_and_expand(
-            &sess,
-            &cstore,
-            krate,
-            None,
-            "rustdoc-test",
-            None,
-            MakeGlobMap::No,
-            |_| Ok(()),
-        ).expect("phase_2_configure_and_expand aborted in rustdoc!")
-    };
-
-    let crate_name = crate_name.unwrap_or_else(|| {
-        ::rustc_trans_utils::link::find_crate_name(None, &hir_forest.krate().attrs, &input)
-    });
-    let opts = scrape_test_config(hir_forest.krate());
-    let mut collector = Collector::new(crate_name,
-                                       cfgs,
-                                       libs,
-                                       externs,
-                                       false,
-                                       opts,
-                                       maybe_sysroot,
-                                       Some(codemap),
-                                       None,
-                                       linker);
-
-    {
-        let map = hir::map::map_crate(&sess, &cstore, &mut hir_forest, &defs);
-        let krate = map.krate();
-        let mut hir_collector = HirCollector {
-            sess: &sess,
-            collector: &mut collector,
-            map: &map
+        let krate = panictry!(driver::phase_1_parse_input(&driver::CompileController::basic(),
+                                                        &sess,
+                                                        &input));
+        let driver::ExpansionResult { defs, mut hir_forest, .. } = {
+            phase_2_configure_and_expand(
+                &sess,
+                &cstore,
+                krate,
+                None,
+                "rustdoc-test",
+                None,
+                MakeGlobMap::No,
+                |_| Ok(()),
+            ).expect("phase_2_configure_and_expand aborted in rustdoc!")
         };
-        hir_collector.visit_testable("".to_string(), &krate.attrs, |this| {
-            intravisit::walk_crate(this, krate);
+
+        let crate_name = crate_name.unwrap_or_else(|| {
+            ::rustc_codegen_utils::link::find_crate_name(None, &hir_forest.krate().attrs, &input)
         });
-    }
+        let mut opts = scrape_test_config(hir_forest.krate());
+        opts.display_warnings |= display_warnings;
+        let mut collector = Collector::new(
+            crate_name,
+            cfgs,
+            libs,
+            cg,
+            externs,
+            false,
+            opts,
+            maybe_sysroot,
+            Some(codemap),
+             None,
+            linker,
+            edition
+        );
 
-    test_args.insert(0, "rustdoctest".to_string());
+        {
+            let map = hir::map::map_crate(&sess, &cstore, &mut hir_forest, &defs);
+            let krate = map.krate();
+            let mut hir_collector = HirCollector {
+                sess: &sess,
+                collector: &mut collector,
+                map: &map
+            };
+            hir_collector.visit_testable("".to_string(), &krate.attrs, |this| {
+                intravisit::walk_crate(this, krate);
+            });
+        }
 
-    testing::test_main(&test_args,
-                       collector.tests.into_iter().collect(),
-                       testing::Options::new().display_output(display_warnings));
-    0
+        test_args.insert(0, "rustdoctest".to_string());
+
+        testing::test_main(&test_args,
+                        collector.tests.into_iter().collect(),
+                        testing::Options::new().display_output(display_warnings));
+        0
+    })
 }
 
 // Look for #![doc(test(no_crate_inject))], used by crates in the std facade
@@ -146,6 +167,7 @@ fn scrape_test_config(krate: &::rustc::hir::Crate) -> TestOptions {
 
     let mut opts = TestOptions {
         no_crate_inject: false,
+        display_warnings: false,
         attrs: Vec::new(),
     };
 
@@ -174,11 +196,10 @@ fn scrape_test_config(krate: &::rustc::hir::Crate) -> TestOptions {
 
 fn run_test(test: &str, cratename: &str, filename: &FileName, line: usize,
             cfgs: Vec<String>, libs: SearchPaths,
-            externs: Externs,
+            cg: CodegenOptions, externs: Externs,
             should_panic: bool, no_run: bool, as_test_harness: bool,
             compile_fail: bool, mut error_codes: Vec<String>, opts: &TestOptions,
-            maybe_sysroot: Option<PathBuf>,
-            linker: Option<PathBuf>) {
+            maybe_sysroot: Option<PathBuf>, linker: Option<PathBuf>, edition: Edition) {
     // the test harness wants its own `main` & top level functions, so
     // never wrap the test in `fn main() { ... }`
     let (test, line_offset) = make_test(test, Some(cratename), as_test_harness, opts);
@@ -200,106 +221,117 @@ fn run_test(test: &str, cratename: &str, filename: &FileName, line: usize,
         cg: config::CodegenOptions {
             prefer_dynamic: true,
             linker,
-            .. config::basic_codegen_options()
+            ..cg
         },
         test: as_test_harness,
         unstable_features: UnstableFeatures::from_environment(),
+        debugging_opts: config::DebuggingOptions {
+            ..config::basic_debugging_options()
+        },
+        edition,
         ..config::basic_options().clone()
     };
 
-    // Shuffle around a few input and output handles here. We're going to pass
-    // an explicit handle into rustc to collect output messages, but we also
-    // want to catch the error message that rustc prints when it fails.
-    //
-    // We take our thread-local stderr (likely set by the test runner) and replace
-    // it with a sink that is also passed to rustc itself. When this function
-    // returns the output of the sink is copied onto the output of our own thread.
-    //
-    // The basic idea is to not use a default Handler for rustc, and then also
-    // not print things by default to the actual stderr.
-    struct Sink(Arc<Mutex<Vec<u8>>>);
-    impl Write for Sink {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            Write::write(&mut *self.0.lock().unwrap(), data)
+    let (libdir, outdir) = driver::spawn_thread_pool(sessopts, |sessopts| {
+        // Shuffle around a few input and output handles here. We're going to pass
+        // an explicit handle into rustc to collect output messages, but we also
+        // want to catch the error message that rustc prints when it fails.
+        //
+        // We take our thread-local stderr (likely set by the test runner) and replace
+        // it with a sink that is also passed to rustc itself. When this function
+        // returns the output of the sink is copied onto the output of our own thread.
+        //
+        // The basic idea is to not use a default Handler for rustc, and then also
+        // not print things by default to the actual stderr.
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                Write::write(&mut *self.0.lock().unwrap(), data)
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
-    }
-    struct Bomb(Arc<Mutex<Vec<u8>>>, Box<Write+Send>);
-    impl Drop for Bomb {
-        fn drop(&mut self) {
-            let _ = self.1.write_all(&self.0.lock().unwrap());
-        }
-    }
-    let data = Arc::new(Mutex::new(Vec::new()));
-    let codemap = Lrc::new(CodeMap::new_doctest(
-        sessopts.file_path_mapping(), filename.clone(), line as isize - line_offset as isize
-    ));
-    let emitter = errors::emitter::EmitterWriter::new(box Sink(data.clone()),
-                                                      Some(codemap.clone()),
-                                                      false,
-                                                      false);
-    let old = io::set_panic(Some(box Sink(data.clone())));
-    let _bomb = Bomb(data.clone(), old.unwrap_or(box io::stdout()));
-
-    // Compile the code
-    let diagnostic_handler = errors::Handler::with_emitter(true, false, box emitter);
-
-    let mut sess = session::build_session_(
-        sessopts, None, diagnostic_handler, codemap,
-    );
-    let trans = rustc_driver::get_trans(&sess);
-    let cstore = CStore::new(trans.metadata_loader());
-    rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
-
-    let outdir = Mutex::new(TempDir::new("rustdoctest").ok().expect("rustdoc needs a tempdir"));
-    let libdir = sess.target_filesearch(PathKind::All).get_lib_path();
-    let mut control = driver::CompileController::basic();
-    sess.parse_sess.config =
-        config::build_configuration(&sess, config::parse_cfgspecs(cfgs.clone()));
-    let out = Some(outdir.lock().unwrap().path().to_path_buf());
-
-    if no_run {
-        control.after_analysis.stop = Compilation::Stop;
-    }
-
-    let res = panic::catch_unwind(AssertUnwindSafe(|| {
-        driver::compile_input(
-            trans,
-            &sess,
-            &cstore,
-            &None,
-            &input,
-            &out,
-            &None,
-            None,
-            &control
-        )
-    }));
-
-    let compile_result = match res {
-        Ok(Ok(())) | Ok(Err(CompileIncomplete::Stopped)) => Ok(()),
-        Err(_) | Ok(Err(CompileIncomplete::Errored(_))) => Err(())
-    };
-
-    match (compile_result, compile_fail) {
-        (Ok(()), true) => {
-            panic!("test compiled while it wasn't supposed to")
-        }
-        (Ok(()), false) => {}
-        (Err(()), true) => {
-            if error_codes.len() > 0 {
-                let out = String::from_utf8(data.lock().unwrap().to_vec()).unwrap();
-                error_codes.retain(|err| !out.contains(err));
+        struct Bomb(Arc<Mutex<Vec<u8>>>, Box<Write+Send>);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                let _ = self.1.write_all(&self.0.lock().unwrap());
             }
         }
-        (Err(()), false) => {
-            panic!("couldn't compile the test")
-        }
-    }
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let codemap = Lrc::new(CodeMap::new_doctest(
+            sessopts.file_path_mapping(), filename.clone(), line as isize - line_offset as isize
+        ));
+        let emitter = errors::emitter::EmitterWriter::new(box Sink(data.clone()),
+                                                        Some(codemap.clone()),
+                                                        false,
+                                                        false);
+        let old = io::set_panic(Some(box Sink(data.clone())));
+        let _bomb = Bomb(data.clone(), old.unwrap_or(box io::stdout()));
 
-    if error_codes.len() > 0 {
-        panic!("Some expected error codes were not found: {:?}", error_codes);
-    }
+        // Compile the code
+        let diagnostic_handler = errors::Handler::with_emitter(true, false, box emitter);
+
+        let mut sess = session::build_session_(
+            sessopts, None, diagnostic_handler, codemap,
+        );
+        let codegen_backend = rustc_driver::get_codegen_backend(&sess);
+        let cstore = CStore::new(codegen_backend.metadata_loader());
+        rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
+
+        let outdir = Mutex::new(TempDir::new("rustdoctest").ok().expect("rustdoc needs a tempdir"));
+        let libdir = sess.target_filesearch(PathKind::All).get_lib_path();
+        let mut control = driver::CompileController::basic();
+
+        let mut cfg = config::build_configuration(&sess, config::parse_cfgspecs(cfgs.clone()));
+        target_features::add_configuration(&mut cfg, &sess, &*codegen_backend);
+        sess.parse_sess.config = cfg;
+
+        let out = Some(outdir.lock().unwrap().path().to_path_buf());
+
+        if no_run {
+            control.after_analysis.stop = Compilation::Stop;
+        }
+
+        let res = panic::catch_unwind(AssertUnwindSafe(|| {
+            driver::compile_input(
+                codegen_backend,
+                &sess,
+                &cstore,
+                &None,
+                &input,
+                &out,
+                &None,
+                None,
+                &control
+            )
+        }));
+
+        let compile_result = match res {
+            Ok(Ok(())) | Ok(Err(CompileIncomplete::Stopped)) => Ok(()),
+            Err(_) | Ok(Err(CompileIncomplete::Errored(_))) => Err(())
+        };
+
+        match (compile_result, compile_fail) {
+            (Ok(()), true) => {
+                panic!("test compiled while it wasn't supposed to")
+            }
+            (Ok(()), false) => {}
+            (Err(()), true) => {
+                if error_codes.len() > 0 {
+                    let out = String::from_utf8(data.lock().unwrap().to_vec()).unwrap();
+                    error_codes.retain(|err| !out.contains(err));
+                }
+            }
+            (Err(()), false) => {
+                panic!("couldn't compile the test")
+            }
+        }
+
+        if error_codes.len() > 0 {
+            panic!("Some expected error codes were not found: {:?}", error_codes);
+        }
+
+        (libdir, outdir)
+    });
 
     if no_run { return }
 
@@ -347,7 +379,7 @@ pub fn make_test(s: &str,
     let mut line_offset = 0;
     let mut prog = String::new();
 
-    if opts.attrs.is_empty() {
+    if opts.attrs.is_empty() && !opts.display_warnings {
         // If there aren't any attributes supplied by #![doc(test(attr(...)))], then allow some
         // lints that are commonly triggered in doctests. The crate-level test attributes are
         // commonly used to make tests fail in case they trigger warnings, so having this there in
@@ -406,16 +438,15 @@ pub fn make_test(s: &str,
 
 // FIXME(aburka): use a real parser to deal with multiline attributes
 fn partition_source(s: &str) -> (String, String) {
-    use std_unicode::str::UnicodeStr;
-
     let mut after_header = false;
     let mut before = String::new();
     let mut after = String::new();
 
     for line in s.lines() {
         let trimline = line.trim();
-        let header = trimline.is_whitespace() ||
+        let header = trimline.chars().all(|c| c.is_whitespace()) ||
             trimline.starts_with("#![") ||
+            trimline.starts_with("#[macro_use] extern crate") ||
             trimline.starts_with("extern crate");
         if !header || after_header {
             after_header = true;
@@ -457,6 +488,7 @@ pub struct Collector {
 
     cfgs: Vec<String>,
     libs: SearchPaths,
+    cg: CodegenOptions,
     externs: Externs,
     use_headers: bool,
     cratename: String,
@@ -466,18 +498,20 @@ pub struct Collector {
     codemap: Option<Lrc<CodeMap>>,
     filename: Option<PathBuf>,
     linker: Option<PathBuf>,
+    edition: Edition,
 }
 
 impl Collector {
-    pub fn new(cratename: String, cfgs: Vec<String>, libs: SearchPaths, externs: Externs,
-               use_headers: bool, opts: TestOptions, maybe_sysroot: Option<PathBuf>,
-               codemap: Option<Lrc<CodeMap>>, filename: Option<PathBuf>,
-               linker: Option<PathBuf>) -> Collector {
+    pub fn new(cratename: String, cfgs: Vec<String>, libs: SearchPaths, cg: CodegenOptions,
+               externs: Externs, use_headers: bool, opts: TestOptions,
+               maybe_sysroot: Option<PathBuf>, codemap: Option<Lrc<CodeMap>>,
+               filename: Option<PathBuf>, linker: Option<PathBuf>, edition: Edition) -> Collector {
         Collector {
             tests: Vec::new(),
             names: Vec::new(),
             cfgs,
             libs,
+            cg,
             externs,
             use_headers,
             cratename,
@@ -487,6 +521,7 @@ impl Collector {
             codemap,
             filename,
             linker,
+            edition,
         }
     }
 
@@ -501,11 +536,13 @@ impl Collector {
         let name = self.generate_name(line, &filename);
         let cfgs = self.cfgs.clone();
         let libs = self.libs.clone();
+        let cg = self.cg.clone();
         let externs = self.externs.clone();
         let cratename = self.cratename.to_string();
         let opts = self.opts.clone();
         let maybe_sysroot = self.maybe_sysroot.clone();
         let linker = self.linker.clone();
+        let edition = self.edition;
         debug!("Creating test {}: {}", name, test);
         self.tests.push(testing::TestDescAndFn {
             desc: testing::TestDesc {
@@ -528,6 +565,7 @@ impl Collector {
                                  line,
                                  cfgs,
                                  libs,
+                                 cg,
                                  externs,
                                  should_panic,
                                  no_run,
@@ -536,7 +574,8 @@ impl Collector {
                                  error_codes,
                                  &opts,
                                  maybe_sysroot,
-                                 linker)
+                                 linker,
+                                 edition)
                     }))
                 } {
                     Ok(()) => (),
@@ -645,8 +684,10 @@ impl<'a, 'hir> HirCollector<'a, 'hir> {
         // the collapse-docs pass won't combine sugared/raw doc attributes, or included files with
         // anything else, this will combine them for us
         if let Some(doc) = attrs.collapsed_doc_value() {
-            markdown::find_testable_code(&doc, self.collector,
-                                         attrs.span.unwrap_or(DUMMY_SP));
+            markdown::find_testable_code(&doc,
+                                         self.collector,
+                                         attrs.span.unwrap_or(DUMMY_SP),
+                                         Some(self.sess));
         }
 
         nested(self);
@@ -702,7 +743,7 @@ impl<'a, 'hir> intravisit::Visitor<'hir> for HirCollector<'a, 'hir> {
     }
 
     fn visit_struct_field(&mut self, f: &'hir hir::StructField) {
-        self.visit_testable(f.name.to_string(), &f.attrs, |this| {
+        self.visit_testable(f.ident.to_string(), &f.attrs, |this| {
             intravisit::walk_struct_field(this, f);
         });
     }
@@ -772,6 +813,7 @@ assert_eq!(2+2, 4);
         //adding it anyway
         let opts = TestOptions {
             no_crate_inject: true,
+            display_warnings: false,
             attrs: vec![],
         };
         let input =
@@ -817,6 +859,24 @@ assert_eq!(2+2, 4);";
         let expected =
 "#![allow(unused)]
 extern crate asdf;
+fn main() {
+use asdf::qwop;
+assert_eq!(2+2, 4);
+}".to_string();
+        let output = make_test(input, Some("asdf"), false, &opts);
+        assert_eq!(output, (expected, 2));
+    }
+
+    #[test]
+    fn make_test_manual_extern_crate_with_macro_use() {
+        let opts = TestOptions::default();
+        let input =
+"#[macro_use] extern crate asdf;
+use asdf::qwop;
+assert_eq!(2+2, 4);";
+        let expected =
+"#![allow(unused)]
+#[macro_use] extern crate asdf;
 fn main() {
 use asdf::qwop;
 assert_eq!(2+2, 4);
@@ -922,6 +982,21 @@ assert_eq!(2+2, 4);";
 //Ceci n'est pas une `fn main`
 assert_eq!(2+2, 4);".to_string();
         let output = make_test(input, None, true, &opts);
+        assert_eq!(output, (expected.clone(), 1));
+    }
+
+    #[test]
+    fn make_test_display_warnings() {
+        //if the user is asking to display doctest warnings, suppress the default allow(unused)
+        let mut opts = TestOptions::default();
+        opts.display_warnings = true;
+        let input =
+"assert_eq!(2+2, 4);";
+        let expected =
+"fn main() {
+assert_eq!(2+2, 4);
+}".to_string();
+        let output = make_test(input, None, false, &opts);
         assert_eq!(output, (expected.clone(), 1));
     }
 }

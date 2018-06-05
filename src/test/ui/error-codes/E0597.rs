@@ -18,3 +18,5 @@ fn main() {
     x.x = Some(&y);
     //~^ `y` does not live long enough [E0597]
 }
+
+impl<'a> Drop for Foo<'a> { fn drop(&mut self) { } }

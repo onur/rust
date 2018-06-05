@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use alloc::boxed::FnBox;
+use boxed::FnBox;
 use cmp;
 use ffi::CStr;
 use io;
@@ -209,6 +209,7 @@ pub mod guard {
     pub type Guard = Range<usize>;
     pub unsafe fn current() -> Option<Guard> { None }
     pub unsafe fn init() -> Option<Guard> { None }
+    pub unsafe fn deinit() {}
 }
 
 
@@ -222,8 +223,8 @@ pub mod guard {
 #[cfg_attr(test, allow(dead_code))]
 pub mod guard {
     use libc;
-    use libc::mmap;
-    use libc::{PROT_NONE, MAP_PRIVATE, MAP_ANON, MAP_FAILED, MAP_FIXED};
+    use libc::{mmap, mprotect};
+    use libc::{PROT_NONE, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANON, MAP_FAILED, MAP_FIXED};
     use ops::Range;
     use sys::os;
 
@@ -284,10 +285,10 @@ pub mod guard {
         ret
     }
 
-    pub unsafe fn init() -> Option<Guard> {
-        PAGE_SIZE = os::page_size();
-
-        let mut stackaddr = get_stack_start()?;
+    // Precondition: PAGE_SIZE is initialized.
+    unsafe fn get_stack_start_aligned() -> Option<*mut libc::c_void> {
+        assert!(PAGE_SIZE != 0);
+        let stackaddr = get_stack_start()?;
 
         // Ensure stackaddr is page aligned! A parent process might
         // have reset RLIMIT_STACK to be non-page aligned. The
@@ -296,10 +297,17 @@ pub mod guard {
         // page-aligned, calculate the fix such that stackaddr <
         // new_page_aligned_stackaddr < stackaddr + stacksize
         let remainder = (stackaddr as usize) % PAGE_SIZE;
-        if remainder != 0 {
-            stackaddr = ((stackaddr as usize) + PAGE_SIZE - remainder)
-                as *mut libc::c_void;
-        }
+        Some(if remainder == 0 {
+            stackaddr
+        } else {
+            ((stackaddr as usize) + PAGE_SIZE - remainder) as *mut libc::c_void
+        })
+    }
+
+    pub unsafe fn init() -> Option<Guard> {
+        PAGE_SIZE = os::page_size();
+
+        let stackaddr = get_stack_start_aligned()?;
 
         if cfg!(target_os = "linux") {
             // Linux doesn't allocate the whole stack right away, and
@@ -318,11 +326,20 @@ pub mod guard {
             // Reallocate the last page of the stack.
             // This ensures SIGBUS will be raised on
             // stack overflow.
-            let result = mmap(stackaddr, PAGE_SIZE, PROT_NONE,
+            // Systems which enforce strict PAX MPROTECT do not allow
+            // to mprotect() a mapping with less restrictive permissions
+            // than the initial mmap() used, so we mmap() here with
+            // read/write permissions and only then mprotect() it to
+            // no permissions at all. See issue #50313.
+            let result = mmap(stackaddr, PAGE_SIZE, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-
             if result != stackaddr || result == MAP_FAILED {
                 panic!("failed to allocate a guard page");
+            }
+
+            let result = mprotect(stackaddr, PAGE_SIZE, PROT_NONE);
+            if result != 0 {
+                panic!("failed to protect the guard page");
             }
 
             let guardaddr = stackaddr as usize;
@@ -333,6 +350,26 @@ pub mod guard {
             };
 
             Some(guardaddr..guardaddr + offset * PAGE_SIZE)
+        }
+    }
+
+    pub unsafe fn deinit() {
+        if !cfg!(target_os = "linux") {
+            if let Some(stackaddr) = get_stack_start_aligned() {
+                // Remove the protection on the guard page.
+                // FIXME: we cannot unmap the page, because when we mmap()
+                // above it may be already mapped by the OS, which we can't
+                // detect from mmap()'s return value. If we unmap this page,
+                // it will lead to failure growing stack size on platforms like
+                // macOS. Instead, just restore the page to a writable state.
+                // This ain't Linux, so we probably don't need to care about
+                // execstack.
+                let result = mprotect(stackaddr, PAGE_SIZE, PROT_READ | PROT_WRITE);
+
+                if result != 0 {
+                    panic!("unable to reset the guard page");
+                }
+            }
         }
     }
 

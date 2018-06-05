@@ -239,8 +239,8 @@ pub fn check_dirty_clean_annotations<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
         intravisit::walk_crate(&mut all_attrs, krate);
 
         // Note that we cannot use the existing "unused attribute"-infrastructure
-        // here, since that is running before trans. This is also the reason why
-        // all trans-specific attributes are `Whitelisted` in syntax::feature_gate.
+        // here, since that is running before codegen. This is also the reason why
+        // all codegen-specific attributes are `Whitelisted` in syntax::feature_gate.
         all_attrs.report_unchecked_attrs(&dirty_clean_visitor.checked_attrs);
     })
 }
@@ -453,16 +453,20 @@ impl<'a, 'tcx> DirtyCleanVisitor<'a, 'tcx> {
         out
     }
 
-    fn dep_nodes(&self, labels: &Labels, def_id: DefId) -> Vec<DepNode> {
-        let mut out = Vec::with_capacity(labels.len());
+    fn dep_nodes<'l>(
+        &self,
+        labels: &'l Labels,
+        def_id: DefId
+    ) -> impl Iterator<Item = DepNode> + 'l {
         let def_path_hash = self.tcx.def_path_hash(def_id);
-        for label in labels.iter() {
-            match DepNode::from_label_string(label, def_path_hash) {
-                Ok(dep_node) => out.push(dep_node),
-                Err(()) => unreachable!(),
-            }
-        }
-        out
+        labels
+            .iter()
+            .map(move |label| {
+                match DepNode::from_label_string(label, def_path_hash) {
+                    Ok(dep_node) => dep_node,
+                    Err(()) => unreachable!(),
+                }
+            })
     }
 
     fn dep_node_str(&self, dep_node: &DepNode) -> String {

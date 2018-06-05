@@ -56,22 +56,21 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+use core::char::{decode_utf16, REPLACEMENT_CHARACTER};
 use core::fmt;
 use core::hash;
 use core::iter::{FromIterator, FusedIterator};
-use core::ops::{self, Add, AddAssign, Index, IndexMut};
+use core::ops::Bound::{Excluded, Included, Unbounded};
+use core::ops::{self, Add, AddAssign, Index, IndexMut, RangeBounds};
 use core::ptr;
 use core::str::pattern::Pattern;
-use std_unicode::lossy;
-use std_unicode::char::{decode_utf16, REPLACEMENT_CHARACTER};
+use core::str::lossy;
 
+use alloc::CollectionAllocErr;
 use borrow::{Cow, ToOwned};
-use range::RangeArgument;
-use Bound::{Excluded, Included, Unbounded};
+use boxed::Box;
 use str::{self, from_boxed_utf8_unchecked, FromStr, Utf8Error, Chars};
 use vec::Vec;
-use boxed::Box;
-use super::allocator::CollectionAllocErr;
 
 /// A UTF-8 encoded, growable string.
 ///
@@ -381,7 +380,8 @@ impl String {
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn new() -> String {
+    #[rustc_const_unstable(feature = "const_string_new")]
+    pub const fn new() -> String {
         String { vec: Vec::new() }
     }
 
@@ -1015,6 +1015,34 @@ impl String {
         self.vec.shrink_to_fit()
     }
 
+    /// Shrinks the capacity of this `String` with a lower bound.
+    ///
+    /// The capacity will remain at least as large as both the length
+    /// and the supplied value.
+    ///
+    /// Panics if the current capacity is smaller than the supplied
+    /// minimum capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(shrink_to)]
+    /// let mut s = String::from("foo");
+    ///
+    /// s.reserve(100);
+    /// assert!(s.capacity() >= 100);
+    ///
+    /// s.shrink_to(10);
+    /// assert!(s.capacity() >= 10);
+    /// s.shrink_to(0);
+    /// assert!(s.capacity() >= 3);
+    /// ```
+    #[inline]
+    #[unstable(feature = "shrink_to", reason = "new API", issue="0")]
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        self.vec.shrink_to(min_capacity)
+    }
+
     /// Appends the given [`char`] to the end of this `String`.
     ///
     /// [`char`]: ../../std/primitive.char.html
@@ -1177,8 +1205,6 @@ impl String {
     /// # Examples
     ///
     /// ```
-    /// #![feature(string_retain)]
-    ///
     /// let mut s = String::from("f_o_ob_ar");
     ///
     /// s.retain(|c| c != '_');
@@ -1186,7 +1212,7 @@ impl String {
     /// assert_eq!(s, "foobar");
     /// ```
     #[inline]
-    #[unstable(feature = "string_retain", issue = "43874")]
+    #[stable(feature = "string_retain", since = "1.26.0")]
     pub fn retain<F>(&mut self, mut f: F)
         where F: FnMut(char) -> bool
     {
@@ -1458,7 +1484,7 @@ impl String {
     /// ```
     #[stable(feature = "drain", since = "1.6.0")]
     pub fn drain<R>(&mut self, range: R) -> Drain
-        where R: RangeArgument<usize>
+        where R: RangeBounds<usize>
     {
         // Memory safety
         //
@@ -1467,12 +1493,12 @@ impl String {
         // Because the range removal happens in Drop, if the Drain iterator is leaked,
         // the removal will not happen.
         let len = self.len();
-        let start = match range.start() {
+        let start = match range.start_bound() {
             Included(&n) => n,
             Excluded(&n) => n + 1,
             Unbounded => 0,
         };
-        let end = match range.end() {
+        let end = match range.end_bound() {
             Included(&n) => n + 1,
             Excluded(&n) => n,
             Unbounded => len,
@@ -1492,12 +1518,9 @@ impl String {
         }
     }
 
-    /// Creates a splicing iterator that removes the specified range in the string,
+    /// Removes the specified range in the string,
     /// and replaces it with the given string.
     /// The given string doesn't need to be the same length as the range.
-    ///
-    /// Note: Unlike [`Vec::splice`], the replacement happens eagerly, and this
-    /// method does not return the removed chars.
     ///
     /// # Panics
     ///
@@ -1512,29 +1535,28 @@ impl String {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(splice)]
     /// let mut s = String::from("α is alpha, β is beta");
     /// let beta_offset = s.find('β').unwrap_or(s.len());
     ///
     /// // Replace the range up until the β from the string
-    /// s.splice(..beta_offset, "Α is capital alpha; ");
+    /// s.replace_range(..beta_offset, "Α is capital alpha; ");
     /// assert_eq!(s, "Α is capital alpha; β is beta");
     /// ```
-    #[unstable(feature = "splice", reason = "recently added", issue = "44643")]
-    pub fn splice<R>(&mut self, range: R, replace_with: &str)
-        where R: RangeArgument<usize>
+    #[stable(feature = "splice", since = "1.27.0")]
+    pub fn replace_range<R>(&mut self, range: R, replace_with: &str)
+        where R: RangeBounds<usize>
     {
         // Memory safety
         //
-        // The String version of Splice does not have the memory safety issues
+        // Replace_range does not have the memory safety issues of a vector Splice.
         // of the vector version. The data is just plain bytes.
 
-        match range.start() {
+        match range.start_bound() {
              Included(&n) => assert!(self.is_char_boundary(n)),
              Excluded(&n) => assert!(self.is_char_boundary(n + 1)),
              Unbounded => {},
         };
-        match range.end() {
+        match range.end_bound() {
              Included(&n) => assert!(self.is_char_boundary(n + 1)),
              Excluded(&n) => assert!(self.is_char_boundary(n)),
              Unbounded => {},
@@ -1562,6 +1584,7 @@ impl String {
     /// let b = s.into_boxed_str();
     /// ```
     #[stable(feature = "box_str", since = "1.4.0")]
+    #[inline]
     pub fn into_boxed_str(self) -> Box<str> {
         let slice = self.vec.into_boxed_slice();
         unsafe { from_boxed_utf8_unchecked(slice) }
@@ -1576,7 +1599,6 @@ impl FromUtf8Error {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(from_utf8_error_as_bytes)]
     /// // some invalid bytes, in a vector
     /// let bytes = vec![0, 159];
     ///
@@ -1584,7 +1606,7 @@ impl FromUtf8Error {
     ///
     /// assert_eq!(&[0, 159], value.unwrap_err().as_bytes());
     /// ```
-    #[unstable(feature = "from_utf8_error_as_bytes", reason = "recently added", issue = "40895")]
+    #[stable(feature = "from_utf8_error_as_bytes", since = "1.26.0")]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..]
     }
@@ -2215,6 +2237,14 @@ impl<'a> From<String> for Cow<'a, str> {
     #[inline]
     fn from(s: String) -> Cow<'a, str> {
         Cow::Owned(s)
+    }
+}
+
+#[stable(feature = "cow_from_string_ref", since = "1.28.0")]
+impl<'a> From<&'a String> for Cow<'a, str> {
+    #[inline]
+    fn from(s: &'a String) -> Cow<'a, str> {
+        Cow::Borrowed(s.as_str())
     }
 }
 

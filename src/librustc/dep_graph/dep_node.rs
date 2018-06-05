@@ -60,7 +60,7 @@
 //! user of the `DepNode` API of having to know how to compute the expected
 //! fingerprint for a given set of node parameters.
 
-use mir::interpret::{GlobalId};
+use mir::interpret::{GlobalId, ConstValue};
 use hir::def_id::{CrateNum, DefId, DefIndex, CRATE_DEF_INDEX};
 use hir::map::DefPathHash;
 use hir::{HirId, ItemLocalId};
@@ -70,7 +70,8 @@ use rustc_data_structures::stable_hasher::{StableHasher, HashStable};
 use std::fmt;
 use std::hash::Hash;
 use syntax_pos::symbol::InternedString;
-use traits::query::{CanonicalProjectionGoal, CanonicalTyGoal};
+use traits::query::{CanonicalProjectionGoal,
+                    CanonicalTyGoal, CanonicalPredicateGoal};
 use ty::{TyCtxt, Instance, InstanceDef, ParamEnv, ParamEnvAnd, PolyTraitRef, Ty};
 use ty::subst::Substs;
 
@@ -500,6 +501,7 @@ define_dep_nodes!( <'tcx>
     [] GenericsOfItem(DefId),
     [] PredicatesOfItem(DefId),
     [] InferredOutlivesOf(DefId),
+    [] InferredOutlivesCrate(CrateNum),
     [] SuperPredicatesOfItem(DefId),
     [] TraitDefOfItem(DefId),
     [] AdtDefOfItem(DefId),
@@ -555,16 +557,17 @@ define_dep_nodes!( <'tcx>
     [input] DefSpan(DefId),
     [] LookupStability(DefId),
     [] LookupDeprecationEntry(DefId),
-    [] ItemBodyNestedBodies(DefId),
     [] ConstIsRvaluePromotableToStatic(DefId),
     [] RvaluePromotableMap(DefId),
     [] ImplParent(DefId),
     [] TraitOfItem(DefId),
     [] IsReachableNonGeneric(DefId),
+    [] IsUnreachableLocalDefinition(DefId),
     [] IsMirAvailable(DefId),
     [] ItemAttrs(DefId),
-    [] TransFnAttrs(DefId),
+    [] CodegenFnAttrs(DefId),
     [] FnArgNames(DefId),
+    [] RenderedConst(DefId),
     [] DylibDepFormats(CrateNum),
     [] IsPanicRuntime(CrateNum),
     [] IsCompilerBuiltins(CrateNum),
@@ -579,6 +582,9 @@ define_dep_nodes!( <'tcx>
     [] GetPanicStrategy(CrateNum),
     [] IsNoBuiltins(CrateNum),
     [] ImplDefaultness(DefId),
+    [] CheckItemWellFormed(DefId),
+    [] CheckTraitItemWellFormed(DefId),
+    [] CheckImplItemWellFormed(DefId),
     [] ReachableNonGenerics(CrateNum),
     [] NativeLibraries(CrateNum),
     [] PluginRegistrarFn(CrateNum),
@@ -586,10 +592,12 @@ define_dep_nodes!( <'tcx>
     [input] CrateDisambiguator(CrateNum),
     [input] CrateHash(CrateNum),
     [input] OriginalCrateName(CrateNum),
+    [input] ExtraFileName(CrateNum),
 
     [] ImplementationsOfTrait { krate: CrateNum, trait_id: DefId },
     [] AllTraitImplementations(CrateNum),
 
+    [] DllimportForeignItems(CrateNum),
     [] IsDllimportForeignItem(DefId),
     [] IsStaticallyIncludedForeignItem(DefId),
     [] NativeLibraryKind(DefId),
@@ -608,36 +616,36 @@ define_dep_nodes!( <'tcx>
     [input] GetLangItems,
     [] DefinedLangItems(CrateNum),
     [] MissingLangItems(CrateNum),
-    [] ExternConstBody(DefId),
     [] VisibleParentMap,
     [input] MissingExternCrateItem(CrateNum),
     [input] UsedCrateSource(CrateNum),
     [input] PostorderCnums,
-    [] HasCloneClosures(CrateNum),
-    [] HasCopyClosures(CrateNum),
 
-    // This query is not expected to have inputs -- as a result, it's
-    // not a good candidate for "replay" because it's essentially a
-    // pure function of its input (and hence the expectation is that
-    // no caller would be green **apart** from just this
-    // query). Making it anonymous avoids hashing the result, which
+    // These queries are not expected to have inputs -- as a result, they
+    // are not good candidates for "replay" because they are essentially
+    // pure functions of their input (and hence the expectation is that
+    // no caller would be green **apart** from just these
+    // queries). Making them anonymous avoids hashing the result, which
     // may save a bit of time.
     [anon] EraseRegionsTy { ty: Ty<'tcx> },
+    [anon] ConstValueToAllocation { val: ConstValue<'tcx>, ty: Ty<'tcx> },
 
     [input] Freevars(DefId),
     [input] MaybeUnusedTraitImport(DefId),
     [input] MaybeUnusedExternCrates,
     [eval_always] StabilityIndex,
+    [eval_always] AllTraits,
     [input] AllCrateNums,
     [] ExportedSymbols(CrateNum),
-    [eval_always] CollectAndPartitionTranslationItems,
-    [] IsTranslatedItem(DefId),
+    [eval_always] CollectAndPartitionMonoItems,
+    [] IsCodegenedItem(DefId),
     [] CodegenUnit(InternedString),
     [] CompileCodegenUnit(InternedString),
     [input] OutputFilenames,
     [] NormalizeProjectionTy(CanonicalProjectionGoal<'tcx>),
     [] NormalizeTyAfterErasingRegions(ParamEnvAnd<'tcx, Ty<'tcx>>),
     [] DropckOutlives(CanonicalTyGoal<'tcx>),
+    [] EvaluateObligation(CanonicalPredicateGoal<'tcx>),
 
     [] SubstituteNormalizeAndTestPredicates { key: (DefId, &'tcx Substs<'tcx>) },
 
@@ -645,9 +653,17 @@ define_dep_nodes!( <'tcx>
 
     [] InstanceDefSizeEstimate { instance_def: InstanceDef<'tcx> },
 
-    [] GetSymbolExportLevel(DefId),
+    [] WasmCustomSections(CrateNum),
 
     [input] Features,
+
+    [] ProgramClausesFor(DefId),
+    [] ProgramClausesForEnv(ParamEnv<'tcx>),
+    [] WasmImportModuleMap(CrateNum),
+    [] ForeignModules(CrateNum),
+
+    [] UpstreamMonomorphizations(CrateNum),
+    [] UpstreamMonomorphizationsFor(DefId),
 );
 
 trait DepNodeParams<'a, 'gcx: 'tcx + 'a, 'tcx: 'a> : fmt::Debug {

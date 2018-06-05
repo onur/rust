@@ -122,12 +122,10 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
 
         match *match_pair.pattern.kind {
             PatternKind::Constant { value } => {
-                // if the places match, the type should match
-                assert_eq!(match_pair.pattern.ty, switch_ty);
-
+                let switch_ty = ty::ParamEnv::empty().and(switch_ty);
                 indices.entry(value)
                        .or_insert_with(|| {
-                           options.push(value.val.to_raw_bits().expect("switching on int"));
+                           options.push(value.unwrap_bits(self.hir.tcx(), switch_ty));
                            options.len() - 1
                        });
                 true
@@ -196,15 +194,16 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 let mut values = Vec::with_capacity(used_variants);
                 let tcx = self.hir.tcx();
                 for (idx, discr) in adt_def.discriminants(tcx).enumerate() {
-                    target_blocks.place_back() <- if variants.contains(idx) {
+                    target_blocks.push(if variants.contains(idx) {
                         values.push(discr.val);
-                        *(targets.place_back() <- self.cfg.start_new_block())
+                        targets.push(self.cfg.start_new_block());
+                        *targets.last().unwrap()
                     } else {
                         if otherwise_block.is_none() {
                             otherwise_block = Some(self.cfg.start_new_block());
                         }
                         otherwise_block.unwrap()
-                    };
+                    });
                 }
                 if let Some(otherwise_block) = otherwise_block {
                     targets.push(otherwise_block);
@@ -275,7 +274,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                     // array, so we can call `<[u8]>::eq` rather than having to find an
                     // `<[u8; N]>::eq`.
                     let unsize = |ty: Ty<'tcx>| match ty.sty {
-                        ty::TyRef(region, tam) => match tam.ty.sty {
+                        ty::TyRef(region, rty, _) => match rty.sty {
                             ty::TyArray(inner_ty, n) => Some((region, inner_ty, n)),
                             _ => None,
                         },
@@ -314,7 +313,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                         },
                     }
                     let eq_def_id = self.hir.tcx().lang_items().eq_trait().unwrap();
-                    let (mty, method) = self.hir.trait_method(eq_def_id, "eq", ty, &[ty]);
+                    let (mty, method) = self.hir.trait_method(eq_def_id, "eq", ty, &[ty.into()]);
 
                     // take the argument by reference
                     let region_scope = self.topmost_scope();

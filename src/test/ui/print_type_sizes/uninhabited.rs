@@ -9,8 +9,9 @@
 // except according to those terms.
 
 // compile-flags: -Z print-type-sizes
-// must-compile-successfully
+// compile-pass
 
+#![feature(never_type)]
 #![feature(start)]
 
 #[start]

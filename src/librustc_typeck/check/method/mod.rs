@@ -19,6 +19,7 @@ use namespace::Namespace;
 use rustc::ty::subst::Substs;
 use rustc::traits;
 use rustc::ty::{self, Ty, ToPredicate, ToPolyTraitRef, TraitRef, TypeFoldable};
+use rustc::ty::GenericParamDefKind;
 use rustc::ty::subst::Subst;
 use rustc::infer::{self, InferOk};
 
@@ -31,12 +32,17 @@ use rustc_data_structures::sync::Lrc;
 
 pub use self::MethodError::*;
 pub use self::CandidateSource::*;
+pub use self::suggest::TraitInfo;
 
 mod confirm;
 pub mod probe;
 mod suggest;
 
 use self::probe::{IsSuggestion, ProbeScope};
+
+pub fn provide(providers: &mut ty::maps::Providers) {
+    suggest::provide(providers);
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MethodCallee<'tcx> {
@@ -108,15 +114,15 @@ pub enum CandidateSource {
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     /// Determines whether the type `self_ty` supports a method name `method_name` or not.
     pub fn method_exists(&self,
-                         span: Span,
-                         method_name: ast::Name,
+                         method_name: ast::Ident,
                          self_ty: Ty<'tcx>,
                          call_expr_id: ast::NodeId,
                          allow_private: bool)
                          -> bool {
         let mode = probe::Mode::MethodCall;
-        match self.probe_for_name(span, mode, method_name, IsSuggestion(false),
-                                  self_ty, call_expr_id, ProbeScope::TraitsInScope) {
+        match self.probe_for_name(method_name.span, mode, method_name.name,
+                                  IsSuggestion(false), self_ty, call_expr_id,
+                                  ProbeScope::TraitsInScope) {
             Ok(..) => true,
             Err(NoMatch(..)) => false,
             Err(Ambiguity(..)) => true,
@@ -171,14 +177,16 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                         .unwrap().insert(import_def_id);
         }
 
-        self.tcx.check_stability(pick.item.def_id, call_expr.id, span);
+        self.tcx.check_stability(pick.item.def_id, Some(call_expr.id), span);
 
-        let result = self.confirm_method(span,
-                                         self_expr,
-                                         call_expr,
-                                         self_ty,
-                                         pick.clone(),
-                                         segment);
+        let result = self.confirm_method(
+            span,
+            self_expr,
+            call_expr,
+            self_ty,
+            pick.clone(),
+            segment,
+        );
 
         if result.illegal_sized_bound {
             // We probe again, taking all traits into account (not only those in scope).
@@ -248,17 +256,18 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                trait_def_id);
 
         // Construct a trait-reference `self_ty : Trait<input_tys>`
-        let substs = Substs::for_item(self.tcx,
-                                      trait_def_id,
-                                      |def, _| self.region_var_for_def(span, def),
-                                      |def, _substs| {
-            if def.index == 0 {
-                self_ty
-            } else if let Some(ref input_types) = opt_input_types {
-                input_types[def.index as usize - 1]
-            } else {
-                self.type_var_for_def(ty::UniverseIndex::ROOT, span, def)
+        let substs = Substs::for_item(self.tcx, trait_def_id, |param, _| {
+            match param.kind {
+                GenericParamDefKind::Lifetime => {}
+                GenericParamDefKind::Type {..} => {
+                    if param.index == 0 {
+                        return self_ty.into();
+                    } else if let Some(ref input_types) = opt_input_types {
+                        return input_types[param.index as usize - 1].into();
+                    }
+                }
             }
+            self.var_for_def(span, param)
         });
 
         let trait_ref = ty::TraitRef::new(trait_def_id, substs);
@@ -272,8 +281,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                      poly_trait_ref.to_predicate());
 
         // Now we want to know if this can be matched
-        let mut selcx = traits::SelectionContext::new(self);
-        if !selcx.evaluate_obligation(&obligation) {
+        if !self.predicate_may_hold(&obligation) {
             debug!("--> Cannot match obligation");
             return None; // Cannot be matched, no such method resolution is possible.
         }
@@ -284,8 +292,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         let method_item = self.associated_item(trait_def_id, m_name, Namespace::Value).unwrap();
         let def_id = method_item.def_id;
         let generics = tcx.generics_of(def_id);
-        assert_eq!(generics.types.len(), 0);
-        assert_eq!(generics.regions.len(), 0);
+        assert_eq!(generics.params.len(), 0);
 
         debug!("lookup_in_trait_adjusted: method_item={:?}", method_item);
         let mut obligations = vec![];
@@ -331,7 +338,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                                            &bounds));
 
         // Also add an obligation for the method type being well-formed.
-        let method_ty = tcx.mk_fn_ptr(ty::Binder(fn_sig));
+        let method_ty = tcx.mk_fn_ptr(ty::Binder::bind(fn_sig));
         debug!("lookup_in_trait_adjusted: matched method method_ty={:?} obligation={:?}",
                method_ty,
                obligation);
@@ -371,7 +378,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         }
 
         let def = pick.item.def();
-        self.tcx.check_stability(def.def_id(), expr_id, span);
+        self.tcx.check_stability(def.def_id(), Some(expr_id), span);
 
         Ok(def)
     }

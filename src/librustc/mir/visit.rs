@@ -10,7 +10,7 @@
 
 use hir::def_id::DefId;
 use ty::subst::Substs;
-use ty::{ClosureSubsts, Region, Ty, GeneratorInterior};
+use ty::{CanonicalTy, ClosureSubsts, GeneratorSubsts, Region, Ty};
 use mir::*;
 use syntax_pos::Span;
 
@@ -92,9 +92,9 @@ macro_rules! make_mir_visitor {
                 self.super_basic_block_data(block, data);
             }
 
-            fn visit_visibility_scope_data(&mut self,
-                                           scope_data: & $($mutability)* VisibilityScopeData) {
-                self.super_visibility_scope_data(scope_data);
+            fn visit_source_scope_data(&mut self,
+                                           scope_data: & $($mutability)* SourceScopeData) {
+                self.super_source_scope_data(scope_data);
             }
 
             fn visit_statement(&mut self,
@@ -142,6 +142,13 @@ macro_rules! make_mir_visitor {
                              operand: & $($mutability)* Operand<'tcx>,
                              location: Location) {
                 self.super_operand(operand, location);
+            }
+
+            fn visit_user_assert_ty(&mut self,
+                                    c_ty: & $($mutability)* CanonicalTy<'tcx>,
+                                    local: & $($mutability)* Local,
+                                    location: Location) {
+                self.super_user_assert_ty(c_ty, local, location);
             }
 
             fn visit_place(&mut self,
@@ -236,10 +243,10 @@ macro_rules! make_mir_visitor {
                 self.super_closure_substs(substs);
             }
 
-            fn visit_generator_interior(&mut self,
-                                    interior: & $($mutability)* GeneratorInterior<'tcx>,
+            fn visit_generator_substs(&mut self,
+                                      substs: & $($mutability)* GeneratorSubsts<'tcx>,
                                     _: Location) {
-                self.super_generator_interior(interior);
+                self.super_generator_substs(substs);
             }
 
             fn visit_local_decl(&mut self,
@@ -254,9 +261,9 @@ macro_rules! make_mir_visitor {
                             _location: Location) {
             }
 
-            fn visit_visibility_scope(&mut self,
-                                      scope: & $($mutability)* VisibilityScope) {
-                self.super_visibility_scope(scope);
+            fn visit_source_scope(&mut self,
+                                      scope: & $($mutability)* SourceScope) {
+                self.super_source_scope(scope);
             }
 
             // The `super_xxx` methods comprise the default behavior and are
@@ -267,7 +274,7 @@ macro_rules! make_mir_visitor {
                 if let Some(yield_ty) = &$($mutability)* mir.yield_ty {
                     self.visit_ty(yield_ty, TyContext::YieldTy(SourceInfo {
                         span: mir.span,
-                        scope: ARGUMENT_VISIBILITY_SCOPE,
+                        scope: OUTERMOST_SOURCE_SCOPE,
                     }));
                 }
 
@@ -282,13 +289,13 @@ macro_rules! make_mir_visitor {
                     self.visit_basic_block_data(bb, data);
                 }
 
-                for scope in &$($mutability)* mir.visibility_scopes {
-                    self.visit_visibility_scope_data(scope);
+                for scope in &$($mutability)* mir.source_scopes {
+                    self.visit_source_scope_data(scope);
                 }
 
                 self.visit_ty(&$($mutability)* mir.return_ty(), TyContext::ReturnTy(SourceInfo {
                     span: mir.span,
-                    scope: ARGUMENT_VISIBILITY_SCOPE,
+                    scope: OUTERMOST_SOURCE_SCOPE,
                 }));
 
                 for local in mir.local_decls.indices() {
@@ -320,16 +327,16 @@ macro_rules! make_mir_visitor {
                 }
             }
 
-            fn super_visibility_scope_data(&mut self,
-                                           scope_data: & $($mutability)* VisibilityScopeData) {
-                let VisibilityScopeData {
+            fn super_source_scope_data(&mut self,
+                                           scope_data: & $($mutability)* SourceScopeData) {
+                let SourceScopeData {
                     ref $($mutability)* span,
                     ref $($mutability)* parent_scope,
                 } = *scope_data;
 
                 self.visit_span(span);
                 if let Some(ref $($mutability)* parent_scope) = *parent_scope {
-                    self.visit_visibility_scope(parent_scope);
+                    self.visit_source_scope(parent_scope);
                 }
             }
 
@@ -347,6 +354,11 @@ macro_rules! make_mir_visitor {
                     StatementKind::Assign(ref $($mutability)* place,
                                           ref $($mutability)* rvalue) => {
                         self.visit_assign(block, place, rvalue, location);
+                    }
+                    StatementKind::ReadForMatch(ref $($mutability)* place) => {
+                        self.visit_place(place,
+                                         PlaceContext::Inspect,
+                                         location);
                     }
                     StatementKind::EndRegion(_) => {}
                     StatementKind::Validate(_, ref $($mutability)* places) => {
@@ -375,6 +387,10 @@ macro_rules! make_mir_visitor {
                         for input in & $($mutability)* inputs[..] {
                             self.visit_operand(input, location);
                         }
+                    }
+                    StatementKind::UserAssertTy(ref $($mutability)* c_ty,
+                                                ref $($mutability)* local) => {
+                        self.visit_user_assert_ty(c_ty, local, location);
                     }
                     StatementKind::Nop => {}
                 }
@@ -500,17 +516,13 @@ macro_rules! make_mir_visitor {
             fn super_assert_message(&mut self,
                                     msg: & $($mutability)* AssertMessage<'tcx>,
                                     location: Location) {
-                match *msg {
-                    AssertMessage::BoundsCheck {
+                use mir::interpret::EvalErrorKind::*;
+                if let BoundsCheck {
                         ref $($mutability)* len,
                         ref $($mutability)* index
-                    } => {
-                        self.visit_operand(len, location);
-                        self.visit_operand(index, location);
-                    }
-                    AssertMessage::Math(_) => {},
-                    AssertMessage::GeneratorResumedAfterReturn => {},
-                    AssertMessage::GeneratorResumedAfterPanic => {},
+                    } = *msg {
+                    self.visit_operand(len, location);
+                    self.visit_operand(index, location);
                 }
             }
 
@@ -588,11 +600,10 @@ macro_rules! make_mir_visitor {
                                 self.visit_closure_substs(closure_substs, location);
                             }
                             AggregateKind::Generator(ref $($mutability)* def_id,
-                                                   ref $($mutability)* closure_substs,
-                                                   ref $($mutability)* interior) => {
+                                                     ref $($mutability)* generator_substs,
+                                                     _movability) => {
                                 self.visit_def_id(def_id, location);
-                                self.visit_closure_substs(closure_substs, location);
-                                self.visit_generator_interior(interior, location);
+                                self.visit_generator_substs(generator_substs, location);
                             }
                         }
 
@@ -617,6 +628,13 @@ macro_rules! make_mir_visitor {
                         self.visit_constant(constant, location);
                     }
                 }
+            }
+
+            fn super_user_assert_ty(&mut self,
+                                    _c_ty: & $($mutability)* CanonicalTy<'tcx>,
+                                    local: & $($mutability)* Local,
+                                    location: Location) {
+                self.visit_local(local, PlaceContext::Validate, location);
             }
 
             fn super_place(&mut self,
@@ -697,8 +715,8 @@ macro_rules! make_mir_visitor {
                     ref $($mutability)* ty,
                     name: _,
                     ref $($mutability)* source_info,
+                    ref $($mutability)* visibility_scope,
                     internal: _,
-                    ref $($mutability)* syntactic_scope,
                     is_user_variable: _,
                 } = *local_decl;
 
@@ -707,11 +725,11 @@ macro_rules! make_mir_visitor {
                     source_info: *source_info,
                 });
                 self.visit_source_info(source_info);
-                self.visit_visibility_scope(syntactic_scope);
+                self.visit_source_scope(visibility_scope);
             }
 
-            fn super_visibility_scope(&mut self,
-                                      _scope: & $($mutability)* VisibilityScope) {
+            fn super_source_scope(&mut self,
+                                      _scope: & $($mutability)* SourceScope) {
             }
 
             fn super_branch(&mut self,
@@ -757,7 +775,7 @@ macro_rules! make_mir_visitor {
                 } = *source_info;
 
                 self.visit_span(span);
-                self.visit_visibility_scope(scope);
+                self.visit_source_scope(scope);
             }
 
             fn super_ty(&mut self, _ty: & $($mutability)* Ty<'tcx>) {
@@ -772,8 +790,8 @@ macro_rules! make_mir_visitor {
             fn super_substs(&mut self, _substs: & $($mutability)* &'tcx Substs<'tcx>) {
             }
 
-            fn super_generator_interior(&mut self,
-                                    _interior: & $($mutability)* GeneratorInterior<'tcx>) {
+            fn super_generator_substs(&mut self,
+                                      _substs: & $($mutability)* GeneratorSubsts<'tcx>) {
             }
 
             fn super_closure_substs(&mut self,

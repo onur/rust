@@ -15,6 +15,7 @@ use rustc::session::Session;
 
 use syntax::ext::base::{SyntaxExtension, NamedSyntaxExtension, NormalTT, IdentTT};
 use syntax::ext::base::MacroExpanderFn;
+use syntax::ext::hygiene;
 use syntax::symbol::Symbol;
 use syntax::ast;
 use syntax::feature_gate::AttributeType;
@@ -107,7 +108,8 @@ impl<'a> Registry<'a> {
                 def_info: _,
                 allow_internal_unstable,
                 allow_internal_unsafe,
-                unstable_feature
+                unstable_feature,
+                edition,
             } => {
                 let nid = ast::CRATE_NODE_ID;
                 NormalTT {
@@ -115,7 +117,8 @@ impl<'a> Registry<'a> {
                     def_info: Some((nid, self.krate_span)),
                     allow_internal_unstable,
                     allow_internal_unsafe,
-                    unstable_feature
+                    unstable_feature,
+                    edition,
                 }
             }
             IdentTT(ext, _, allow_internal_unstable) => {
@@ -128,8 +131,6 @@ impl<'a> Registry<'a> {
     /// This can be used in place of `register_syntax_extension` to register legacy custom derives
     /// (i.e. attribute syntax extensions whose name begins with `derive_`). Legacy custom
     /// derives defined by this function do not trigger deprecation warnings when used.
-    #[unstable(feature = "rustc_private", issue = "27812")]
-    #[rustc_deprecated(since = "1.15.0", reason = "replaced by macros 1.1 (RFC 1861)")]
     pub fn register_custom_derive(&mut self, name: ast::Name, extension: SyntaxExtension) {
         assert!(name.as_str().starts_with("derive_"));
         self.whitelisted_custom_derives.push(name);
@@ -152,6 +153,7 @@ impl<'a> Registry<'a> {
             allow_internal_unstable: false,
             allow_internal_unsafe: false,
             unstable_feature: None,
+            edition: hygiene::default_edition(),
         });
     }
 

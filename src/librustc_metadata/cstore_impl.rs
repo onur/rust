@@ -12,6 +12,7 @@ use cstore;
 use encoder;
 use link_args;
 use native_libs;
+use foreign_modules;
 use schema;
 
 use rustc::ty::maps::QueryConfig;
@@ -37,6 +38,7 @@ use std::sync::Arc;
 use syntax::ast;
 use syntax::attr;
 use syntax::codemap;
+use syntax::edition::Edition;
 use syntax::ext::base::SyntaxExtension;
 use syntax::parse::filemap_to_stream;
 use syntax::symbol::Symbol;
@@ -50,7 +52,7 @@ macro_rules! provide {
         pub fn provide_extern<$lt>(providers: &mut Providers<$lt>) {
             $(fn $name<'a, $lt:$lt, T>($tcx: TyCtxt<'a, $lt, $lt>, def_id_arg: T)
                                     -> <ty::queries::$name<$lt> as
-                                        QueryConfig>::Value
+                                        QueryConfig<$lt>>::Value
                 where T: IntoArgs,
             {
                 #[allow(unused_variables)]
@@ -141,7 +143,6 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     mir_const_qualif => {
         (cdata.mir_const_qualif(def_id.index), Lrc::new(IdxSetBuf::new_empty(0)))
     }
-    typeck_tables_of => { cdata.item_body_tables(def_id.index, tcx) }
     fn_sig => { cdata.fn_sig(def_id.index, tcx) }
     inherent_impls => { Lrc::new(cdata.get_inherent_implementations_for_type(def_id.index)) }
     is_const_fn => { cdata.is_const_fn(def_id.index) }
@@ -160,31 +161,34 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     // This is only used by rustdoc anyway, which shouldn't have
     // incremental recompilation ever enabled.
     fn_arg_names => { cdata.get_fn_arg_names(def_id.index) }
+    rendered_const => { cdata.get_rendered_const(def_id.index) }
     impl_parent => { cdata.get_parent_impl(def_id.index) }
     trait_of_item => { cdata.get_trait_of_item(def_id.index) }
-    item_body_nested_bodies => { cdata.item_body_nested_bodies(def_id.index) }
     const_is_rvalue_promotable_to_static => {
         cdata.const_is_rvalue_promotable_to_static(def_id.index)
     }
     is_mir_available => { cdata.is_item_mir_available(def_id.index) }
 
     dylib_dependency_formats => { Lrc::new(cdata.get_dylib_dependency_formats()) }
-    is_panic_runtime => { cdata.is_panic_runtime(tcx.sess) }
-    is_compiler_builtins => { cdata.is_compiler_builtins(tcx.sess) }
-    has_global_allocator => { cdata.has_global_allocator() }
-    is_sanitizer_runtime => { cdata.is_sanitizer_runtime(tcx.sess) }
-    is_profiler_runtime => { cdata.is_profiler_runtime(tcx.sess) }
-    panic_strategy => { cdata.panic_strategy() }
-    extern_crate => { Lrc::new(cdata.extern_crate.get()) }
-    is_no_builtins => { cdata.is_no_builtins(tcx.sess) }
+    is_panic_runtime => { cdata.root.panic_runtime }
+    is_compiler_builtins => { cdata.root.compiler_builtins }
+    has_global_allocator => { cdata.root.has_global_allocator }
+    is_sanitizer_runtime => { cdata.root.sanitizer_runtime }
+    is_profiler_runtime => { cdata.root.profiler_runtime }
+    panic_strategy => { cdata.root.panic_strategy }
+    extern_crate => {
+        let r = Lrc::new(*cdata.extern_crate.lock());
+        r
+    }
+    is_no_builtins => { cdata.root.no_builtins }
     impl_defaultness => { cdata.get_impl_defaultness(def_id.index) }
     reachable_non_generics => {
         let reachable_non_generics = tcx
             .exported_symbols(cdata.cnum)
             .iter()
-            .filter_map(|&(exported_symbol, _)| {
+            .filter_map(|&(exported_symbol, export_level)| {
                 if let ExportedSymbol::NonGeneric(def_id) = exported_symbol {
-                    return Some(def_id)
+                    return Some((def_id, export_level))
                 } else {
                     None
                 }
@@ -194,6 +198,7 @@ provide! { <'tcx> tcx, def_id, other, cdata,
         Lrc::new(reachable_non_generics)
     }
     native_libraries => { Lrc::new(cdata.get_native_libraries(tcx.sess)) }
+    foreign_modules => { Lrc::new(cdata.get_foreign_modules(tcx.sess)) }
     plugin_registrar_fn => {
         cdata.root.plugin_registrar_fn.map(|index| {
             DefId { krate: def_id.krate, index }
@@ -204,9 +209,12 @@ provide! { <'tcx> tcx, def_id, other, cdata,
             DefId { krate: def_id.krate, index }
         })
     }
-    crate_disambiguator => { cdata.disambiguator() }
-    crate_hash => { cdata.hash() }
-    original_crate_name => { cdata.name() }
+    crate_disambiguator => { cdata.root.disambiguator }
+    crate_hash => { cdata.root.hash }
+    original_crate_name => { cdata.root.name }
+
+    extra_filename => { cdata.root.extra_filename.clone() }
+
 
     implementations_of_trait => {
         let mut result = vec![];
@@ -221,11 +229,11 @@ provide! { <'tcx> tcx, def_id, other, cdata,
         Lrc::new(result)
     }
 
-    is_dllimport_foreign_item => {
-        cdata.is_dllimport_foreign_item(def_id.index)
-    }
     visibility => { cdata.get_visibility(def_id.index) }
-    dep_kind => { cdata.dep_kind.get() }
+    dep_kind => {
+        let r = *cdata.dep_kind.lock();
+        r
+    }
     crate_name => { cdata.name }
     item_children => {
         let mut result = vec![];
@@ -235,22 +243,15 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     defined_lang_items => { Lrc::new(cdata.get_lang_items()) }
     missing_lang_items => { Lrc::new(cdata.get_missing_lang_items()) }
 
-    extern_const_body => {
-        debug!("item_body({:?}): inlining item", def_id);
-        cdata.extern_const_body(tcx, def_id.index)
-    }
-
     missing_extern_crate_item => {
-        match cdata.extern_crate.get() {
+        let r = match *cdata.extern_crate.borrow() {
             Some(extern_crate) if !extern_crate.direct => true,
             _ => false,
-        }
+        };
+        r
     }
 
     used_crate_source => { Lrc::new(cdata.source.clone()) }
-
-    has_copy_closures => { cdata.has_copy_closures(tcx.sess) }
-    has_clone_closures => { cdata.has_clone_closures(tcx.sess) }
 
     exported_symbols => {
         let cnum = cdata.cnum;
@@ -262,8 +263,10 @@ provide! { <'tcx> tcx, def_id, other, cdata,
             return Arc::new(Vec::new())
         }
 
-        Arc::new(cdata.exported_symbols())
+        Arc::new(cdata.exported_symbols(tcx))
     }
+
+    wasm_custom_sections => { Lrc::new(cdata.wasm_custom_sections()) }
 }
 
 pub fn provide<'tcx>(providers: &mut Providers<'tcx>) {
@@ -297,12 +300,27 @@ pub fn provide<'tcx>(providers: &mut Providers<'tcx>) {
             tcx.native_libraries(id.krate)
                 .iter()
                 .filter(|lib| native_libs::relevant_lib(&tcx.sess, lib))
-                .find(|l| l.foreign_items.contains(&id))
+                .find(|lib| {
+                    let fm_id = match lib.foreign_module {
+                        Some(id) => id,
+                        None => return false,
+                    };
+                    tcx.foreign_modules(id.krate)
+                        .iter()
+                        .find(|m| m.def_id == fm_id)
+                        .expect("failed to find foreign module")
+                        .foreign_items
+                        .contains(&id)
+                })
                 .map(|l| l.kind)
         },
         native_libraries: |tcx, cnum| {
             assert_eq!(cnum, LOCAL_CRATE);
             Lrc::new(native_libs::collect(tcx))
+        },
+        foreign_modules: |tcx, cnum| {
+            assert_eq!(cnum, LOCAL_CRATE);
+            Lrc::new(foreign_modules::collect(tcx))
         },
         link_args: |tcx, cnum| {
             assert_eq!(cnum, LOCAL_CRATE);
@@ -419,13 +437,16 @@ impl CrateStore for cstore::CStore {
 
     fn dep_kind_untracked(&self, cnum: CrateNum) -> DepKind
     {
-        self.get_crate_data(cnum).dep_kind.get()
+        let data = self.get_crate_data(cnum);
+        let r = *data.dep_kind.lock();
+        r
     }
 
     fn export_macros_untracked(&self, cnum: CrateNum) {
         let data = self.get_crate_data(cnum);
-        if data.dep_kind.get() == DepKind::UnexportedMacrosOnly {
-            data.dep_kind.set(DepKind::MacrosOnly)
+        let mut dep_kind = data.dep_kind.lock();
+        if *dep_kind == DepKind::UnexportedMacrosOnly {
+            *dep_kind = DepKind::MacrosOnly;
         }
     }
 
@@ -436,12 +457,17 @@ impl CrateStore for cstore::CStore {
 
     fn crate_disambiguator_untracked(&self, cnum: CrateNum) -> CrateDisambiguator
     {
-        self.get_crate_data(cnum).disambiguator()
+        self.get_crate_data(cnum).root.disambiguator
     }
 
     fn crate_hash_untracked(&self, cnum: CrateNum) -> hir::svh::Svh
     {
-        self.get_crate_data(cnum).hash()
+        self.get_crate_data(cnum).root.hash
+    }
+
+    fn crate_edition_untracked(&self, cnum: CrateNum) -> Edition
+    {
+        self.get_crate_data(cnum).root.edition
     }
 
     /// Returns the `DefKey` for a given `DefId`. This indicates the
@@ -492,7 +518,8 @@ impl CrateStore for cstore::CStore {
             return LoadedMacro::ProcMacro(proc_macros[id.index.to_proc_macro_index()].1.clone());
         } else if data.name == "proc_macro" &&
                   self.get_crate_data(id.krate).item_name(id.index) == "quote" {
-            let ext = SyntaxExtension::ProcMacro(Box::new(::proc_macro::__internal::Quoter));
+            let ext = SyntaxExtension::ProcMacro(Box::new(::proc_macro::__internal::Quoter),
+                                                 data.root.edition);
             return LoadedMacro::ProcMacro(Lrc::new(ext));
         }
 
@@ -515,7 +542,7 @@ impl CrateStore for cstore::CStore {
             .insert(local_span, (name.to_string(), data.get_span(id.index, sess)));
 
         LoadedMacro::MacroDef(ast::Item {
-            ident: ast::Ident::from_str(&name),
+            ident: ast::Ident::from_str(&name.as_str()),
             id: ast::DUMMY_NODE_ID,
             span: local_span,
             attrs: attrs.iter().cloned().collect(),
@@ -523,7 +550,7 @@ impl CrateStore for cstore::CStore {
                 tokens: body.into(),
                 legacy: def.legacy,
             }),
-            vis: codemap::respan(local_span.empty(), ast::VisibilityKind::Inherited),
+            vis: codemap::respan(local_span.shrink_to_lo(), ast::VisibilityKind::Inherited),
             tokens: None,
         })
     }

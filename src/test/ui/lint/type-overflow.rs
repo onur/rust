@@ -8,9 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// must-compile-successfully
-
-#![feature(i128_type)]
+// compile-pass
 
 fn main() {
     let error = 255i8; //~WARNING literal out of range for i8

@@ -16,22 +16,22 @@
 //! other phases of the compiler, which are generally required to hold in order
 //! to compile the program at all.
 //!
-//! Most lints can be written as `LintPass` instances. These run just before
-//! translation to LLVM bytecode. The `LintPass`es built into rustc are defined
+//! Most lints can be written as `LintPass` instances. These run after
+//! all other analyses. The `LintPass`es built into rustc are defined
 //! within `builtin.rs`, which has further comments on how to add such a lint.
 //! rustc can also load user-defined lint plugins via the plugin mechanism.
 //!
 //! Some of rustc's lints are defined elsewhere in the compiler and work by
 //! calling `add_lint()` on the overall `Session` object. This works when
 //! it happens before the main lint pass, which emits the lints stored by
-//! `add_lint()`. To emit lints after the main lint pass (from trans, for
+//! `add_lint()`. To emit lints after the main lint pass (from codegen, for
 //! example) requires more effort. See `emit_lint` and `GatherNodeLevels`
 //! in `context.rs`.
 
 pub use self::Level::*;
 pub use self::LintSource::*;
 
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{self, Lrc};
 
 use errors::{DiagnosticBuilder, DiagnosticId};
 use hir::def_id::{CrateNum, LOCAL_CRATE};
@@ -42,7 +42,7 @@ use session::{Session, DiagnosticMessageId};
 use std::hash;
 use syntax::ast;
 use syntax::codemap::MultiSpan;
-use syntax::epoch::Epoch;
+use syntax::edition::Edition;
 use syntax::symbol::Symbol;
 use syntax::visit as ast_visit;
 use syntax_pos::Span;
@@ -77,8 +77,9 @@ pub struct Lint {
     /// e.g. "imports that are never used"
     pub desc: &'static str,
 
-    /// Deny lint after this epoch
-    pub epoch_deny: Option<Epoch>,
+    /// Starting at the given edition, default to the given lint level. If this is `None`, then use
+    /// `default_level`.
+    pub edition_lint_opts: Option<(Edition, Level)>,
 }
 
 impl Lint {
@@ -88,32 +89,32 @@ impl Lint {
     }
 
     pub fn default_level(&self, session: &Session) -> Level {
-        if let Some(epoch_deny) = self.epoch_deny {
-            if session.epoch() >= epoch_deny {
-                return Level::Deny
-            }
-        }
-        self.default_level
+        self.edition_lint_opts
+            .filter(|(e, _)| *e <= session.edition())
+            .map(|(_, l)| l)
+            .unwrap_or(self.default_level)
     }
 }
 
 /// Declare a static item of type `&'static Lint`.
 #[macro_export]
 macro_rules! declare_lint {
-    ($vis: vis $NAME: ident, $Level: ident, $desc: expr, $epoch: expr) => (
-        $vis static $NAME: &$crate::lint::Lint = &$crate::lint::Lint {
-            name: stringify!($NAME),
-            default_level: $crate::lint::$Level,
-            desc: $desc,
-            epoch_deny: Some($epoch)
-        };
-    );
     ($vis: vis $NAME: ident, $Level: ident, $desc: expr) => (
         $vis static $NAME: &$crate::lint::Lint = &$crate::lint::Lint {
             name: stringify!($NAME),
             default_level: $crate::lint::$Level,
             desc: $desc,
-            epoch_deny: None,
+            edition_lint_opts: None,
+        };
+    );
+    ($vis: vis $NAME: ident, $Level: ident, $desc: expr,
+     $lint_edition: expr => $edition_level: ident $(,)?
+    ) => (
+        $vis static $NAME: &$crate::lint::Lint = &$crate::lint::Lint {
+            name: stringify!($NAME),
+            default_level: $crate::lint::$Level,
+            desc: $desc,
+            edition_lint_opts: Some(($lint_edition, $crate::lint::Level::$edition_level)),
         };
     );
 }
@@ -121,8 +122,7 @@ macro_rules! declare_lint {
 /// Declare a static `LintArray` and return it as an expression.
 #[macro_export]
 macro_rules! lint_array {
-    ($( $lint:expr ),*,) => { lint_array!( $( $lint ),* ) };
-    ($( $lint:expr ),*) => {{
+    ($( $lint:expr ),* $(,)?) => {{
          static ARRAY: LintArray = &[ $( &$lint ),* ];
          ARRAY
     }}
@@ -236,7 +236,7 @@ pub trait LateLintPass<'a, 'tcx>: LintPass {
 }
 
 pub trait EarlyLintPass: LintPass {
-    fn check_ident(&mut self, _: &EarlyContext, _: Span, _: ast::Ident) { }
+    fn check_ident(&mut self, _: &EarlyContext, _: ast::Ident) { }
     fn check_crate(&mut self, _: &EarlyContext, _: &ast::Crate) { }
     fn check_crate_post(&mut self, _: &EarlyContext, _: &ast::Crate) { }
     fn check_mod(&mut self, _: &EarlyContext, _: &ast::Mod, _: Span, _: ast::NodeId) { }
@@ -287,8 +287,9 @@ pub trait EarlyLintPass: LintPass {
 }
 
 /// A lint pass boxed up as a trait object.
-pub type EarlyLintPassObject = Box<dyn EarlyLintPass + 'static>;
-pub type LateLintPassObject = Box<dyn for<'a, 'tcx> LateLintPass<'a, 'tcx> + 'static>;
+pub type EarlyLintPassObject = Box<dyn EarlyLintPass + sync::Send + sync::Sync + 'static>;
+pub type LateLintPassObject = Box<dyn for<'a, 'tcx> LateLintPass<'a, 'tcx> + sync::Send
+                                                                           + sync::Sync + 'static>;
 
 /// Identifies a lint known to the compiler.
 #[derive(Clone, Copy, Debug)]
@@ -498,15 +499,21 @@ pub fn struct_lint_level<'a>(sess: &'a Session,
 
     // Check for future incompatibility lints and issue a stronger warning.
     let lints = sess.lint_store.borrow();
-    if let Some(future_incompatible) = lints.future_incompatible(LintId::of(lint)) {
-        let future = if let Some(epoch) = future_incompatible.epoch {
-            format!("the {} epoch", epoch)
+    let lint_id = LintId::of(lint);
+    if let Some(future_incompatible) = lints.future_incompatible(lint_id) {
+        const STANDARD_MESSAGE: &str =
+            "this was previously accepted by the compiler but is being phased out; \
+             it will become a hard error";
+
+        let explanation = if lint_id == LintId::of(::lint::builtin::UNSTABLE_NAME_COLLISIONS) {
+            "once this method is added to the standard library, \
+             the ambiguity may cause an error or change in behavior!"
+                .to_owned()
+        } else if let Some(edition) = future_incompatible.edition {
+            format!("{} in the {} edition!", STANDARD_MESSAGE, edition)
         } else {
-            "a future release".to_owned()
+            format!("{} in a future release!", STANDARD_MESSAGE)
         };
-        let explanation = format!("this was previously accepted by the compiler \
-                                   but is being phased out; \
-                                   it will become a hard error in {}!", future);
         let citation = format!("for more information, see {}",
                                future_incompatible.reference);
         err.warn(&explanation);

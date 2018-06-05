@@ -10,25 +10,27 @@
 
 //! This query borrow-checks the MIR to (further) ensure it is not broken.
 
-use borrow_check::nll::region_infer::{RegionCausalInfo, RegionInferenceContext};
+use borrow_check::nll::region_infer::RegionInferenceContext;
 use rustc::hir;
 use rustc::hir::def_id::DefId;
 use rustc::hir::map::definitions::DefPathData;
 use rustc::infer::InferCtxt;
 use rustc::ty::{self, ParamEnv, TyCtxt};
 use rustc::ty::maps::Providers;
-use rustc::mir::{AssertMessage, BasicBlock, BorrowKind, Location, Place};
-use rustc::mir::{Mir, Mutability, Operand, Projection, ProjectionElem, Rvalue};
-use rustc::mir::{Field, Statement, StatementKind, Terminator, TerminatorKind};
-use rustc::mir::ClosureRegionRequirements;
+use rustc::lint::builtin::UNUSED_MUT;
+use rustc::mir::{AggregateKind, BasicBlock, BorrowCheckResult, BorrowKind};
+use rustc::mir::{ClearCrossCrate, Local, Location, Place, Mir, Mutability, Operand};
+use rustc::mir::{Projection, ProjectionElem, Rvalue, Field, Statement, StatementKind};
+use rustc::mir::{Terminator, TerminatorKind};
 
+use rustc_data_structures::control_flow_graph::dominators::Dominators;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::indexed_set::IdxSetBuf;
 use rustc_data_structures::indexed_vec::Idx;
+use rustc_data_structures::small_vec::SmallVec;
 
 use std::rc::Rc;
 
-use syntax::ast;
 use syntax_pos::Span;
 
 use dataflow::{do_dataflow, DebugFormatted};
@@ -37,21 +39,28 @@ use dataflow::MoveDataParamEnv;
 use dataflow::{DataflowResultsConsumer};
 use dataflow::{MaybeInitializedPlaces, MaybeUninitializedPlaces};
 use dataflow::{EverInitializedPlaces, MovingOutStatements};
-use dataflow::{BorrowData, Borrows, ReserveOrActivateIndex};
+use dataflow::Borrows;
 use dataflow::indexes::BorrowIndex;
 use dataflow::move_paths::{IllegalMoveOriginKind, MoveError};
 use dataflow::move_paths::{HasMoveData, LookupResult, MoveData, MovePathIndex};
 use util::borrowck_errors::{BorrowckErrors, Origin};
+use util::collect_writes::FindAssignments;
 
-use std::iter;
-
+use self::borrow_set::{BorrowSet, BorrowData};
 use self::flows::Flows;
+use self::location::LocationTable;
 use self::prefixes::PrefixSet;
 use self::MutateMode::{JustWrite, WriteAndRead};
 
+use self::path_utils::*;
+
+crate mod borrow_set;
 mod error_reporting;
 mod flows;
+mod location;
+crate mod place_ext;
 mod prefixes;
+mod path_utils;
 
 pub(crate) mod nll;
 
@@ -65,12 +74,15 @@ pub fn provide(providers: &mut Providers) {
 fn mir_borrowck<'a, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     def_id: DefId,
-) -> Option<ClosureRegionRequirements<'tcx>> {
+) -> BorrowCheckResult<'tcx> {
     let input_mir = tcx.mir_validated(def_id);
     debug!("run query mir_borrowck: {}", tcx.item_path_str(def_id));
 
-    if !tcx.has_attr(def_id, "rustc_mir_borrowck") && !tcx.use_mir() {
-        return None;
+    if !tcx.has_attr(def_id, "rustc_mir_borrowck") && !tcx.use_mir_borrowck() {
+        return BorrowCheckResult {
+            closure_requirements: None,
+            used_mut_upvars: SmallVec::new(),
+        };
     }
 
     let opt_closure_req = tcx.infer_ctxt().enter(|infcx| {
@@ -86,7 +98,7 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
     infcx: &InferCtxt<'a, 'gcx, 'tcx>,
     input_mir: &Mir<'gcx>,
     def_id: DefId,
-) -> Option<ClosureRegionRequirements<'gcx>> {
+) -> BorrowCheckResult<'gcx> {
     let tcx = infcx.tcx;
     let attributes = tcx.get_attrs(def_id);
     let param_env = tcx.param_env(def_id);
@@ -94,19 +106,14 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         .as_local_node_id(def_id)
         .expect("do_mir_borrowck: non-local DefId");
 
-    // Make our own copy of the MIR. This copy will be modified (in place) to
-    // contain non-lexical lifetimes. It will have a lifetime tied
-    // to the inference context.
+    // Replace all regions with fresh inference variables. This
+    // requires first making our own copy of the MIR. This copy will
+    // be modified (in place) to contain non-lexical lifetimes. It
+    // will have a lifetime tied to the inference context.
     let mut mir: Mir<'tcx> = input_mir.clone();
-    let free_regions = if !tcx.nll() {
-        None
-    } else {
-        let mir = &mut mir;
-
-        // Replace all regions with fresh inference variables.
-        Some(nll::replace_regions_in_mir(infcx, def_id, param_env, mir))
-    };
-    let mir = &mir;
+    let free_regions = nll::replace_regions_in_mir(infcx, def_id, param_env, &mut mir);
+    let mir = &mir; // no further changes
+    let location_table = &LocationTable::new(mir);
 
     let move_data: MoveData<'tcx> = match MoveData::gather_moves(mir, tcx) {
         Ok(move_data) => move_data,
@@ -188,22 +195,21 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         |bd, i| DebugFormatted::new(&bd.move_data().inits[i]),
     ));
 
+    let borrow_set = Rc::new(BorrowSet::build(tcx, mir));
+
     // If we are in non-lexical mode, compute the non-lexical lifetimes.
-    let (opt_regioncx, opt_closure_req) = if let Some(free_regions) = free_regions {
-        let (regioncx, opt_closure_req) = nll::compute_regions(
-            infcx,
-            def_id,
-            free_regions,
-            mir,
-            param_env,
-            &mut flow_inits,
-            &mdpe.move_data,
-        );
-        (Some(Rc::new(regioncx)), opt_closure_req)
-    } else {
-        assert!(!tcx.nll());
-        (None, None)
-    };
+    let (regioncx, polonius_output, opt_closure_req) = nll::compute_regions(
+        infcx,
+        def_id,
+        free_regions,
+        mir,
+        location_table,
+        param_env,
+        &mut flow_inits,
+        &mdpe.move_data,
+        &borrow_set,
+    );
+    let regioncx = Rc::new(regioncx);
     let flow_inits = flow_inits; // remove mut
 
     let flow_borrows = FlowAtLocation::new(do_dataflow(
@@ -212,24 +218,24 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         id,
         &attributes,
         &dead_unwinds,
-        Borrows::new(tcx, mir, opt_regioncx.clone(), def_id, body_id),
-        |rs, i| {
-            DebugFormatted::new(&(i.kind(), rs.location(i.borrow_index())))
-        }
+        Borrows::new(tcx, mir, regioncx.clone(), def_id, body_id, &borrow_set),
+        |rs, i| DebugFormatted::new(&rs.location(i)),
     ));
 
-    let movable_generator = !match tcx.hir.get(id) {
+    let movable_generator = match tcx.hir.get(id) {
         hir::map::Node::NodeExpr(&hir::Expr {
             node: hir::ExprClosure(.., Some(hir::GeneratorMovability::Static)),
             ..
-        }) => true,
-        _ => false,
+        }) => false,
+        _ => true,
     };
+
+    let dominators = mir.dominators();
 
     let mut mbcx = MirBorrowckCtxt {
         tcx: tcx,
         mir: mir,
-        node_id: id,
+        mir_def_id: def_id,
         move_data: &mdpe.move_data,
         param_env: param_env,
         movable_generator,
@@ -239,8 +245,12 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         },
         access_place_error_reported: FxHashSet(),
         reservation_error_reported: FxHashSet(),
-        nonlexical_regioncx: opt_regioncx,
-        nonlexical_cause_info: None,
+        moved_error_reported: FxHashSet(),
+        nonlexical_regioncx: regioncx,
+        used_mut: FxHashSet(),
+        used_mut_upvars: SmallVec::new(),
+        borrow_set,
+        dominators,
     };
 
     let mut state = Flows::new(
@@ -249,18 +259,78 @@ fn do_mir_borrowck<'a, 'gcx, 'tcx>(
         flow_uninits,
         flow_move_outs,
         flow_ever_inits,
+        polonius_output,
     );
 
     mbcx.analyze_results(&mut state); // entry point for DataflowResultsConsumer
 
-    opt_closure_req
+    // For each non-user used mutable variable, check if it's been assigned from
+    // a user-declared local. If so, then put that local into the used_mut set.
+    // Note that this set is expected to be small - only upvars from closures
+    // would have a chance of erroneously adding non-user-defined mutable vars
+    // to the set.
+    let temporary_used_locals: FxHashSet<Local> =
+        mbcx.used_mut.iter()
+            .filter(|&local| !mbcx.mir.local_decls[*local].is_user_variable)
+            .cloned()
+            .collect();
+
+    for local in temporary_used_locals {
+        for location in mbcx.mir.find_assignments(local) {
+            for moi in &mbcx.move_data.loc_map[location] {
+                let mpi = &mbcx.move_data.moves[*moi].path;
+                let path = &mbcx.move_data.move_paths[*mpi];
+                debug!("assignment of {:?} to {:?}, adding {:?} to used mutable set",
+                       path.place, local, path.place);
+                if let Place::Local(user_local) = path.place {
+                    mbcx.used_mut.insert(user_local);
+                }
+            }
+        }
+    }
+
+    debug!("mbcx.used_mut: {:?}", mbcx.used_mut);
+
+    for local in mbcx.mir.mut_vars_and_args_iter().filter(|local| !mbcx.used_mut.contains(local)) {
+        if let ClearCrossCrate::Set(ref vsi) = mbcx.mir.source_scope_local_data {
+            let local_decl = &mbcx.mir.local_decls[local];
+
+            // Skip implicit `self` argument for closures
+            if local.index() == 1 && tcx.is_closure(mbcx.mir_def_id) {
+                continue;
+            }
+
+            // Skip over locals that begin with an underscore or have no name
+            match local_decl.name {
+                Some(name) => if name.as_str().starts_with("_") { continue; },
+                None => continue,
+            }
+
+            let span = local_decl.source_info.span;
+            let mut_span = tcx.sess.codemap().span_until_non_whitespace(span);
+
+            tcx.struct_span_lint_node(
+                UNUSED_MUT,
+                vsi[local_decl.source_info.scope].lint_root,
+                span,
+                "variable does not need to be mutable"
+            )
+            .span_suggestion_short(mut_span, "remove this `mut`", "".to_owned())
+            .emit();
+        }
+    }
+
+    BorrowCheckResult {
+        closure_requirements: opt_closure_req,
+        used_mut_upvars: mbcx.used_mut_upvars,
+    }
 }
 
 #[allow(dead_code)]
 pub struct MirBorrowckCtxt<'cx, 'gcx: 'tcx, 'tcx: 'cx> {
     tcx: TyCtxt<'cx, 'gcx, 'tcx>,
     mir: &'cx Mir<'tcx>,
-    node_id: ast::NodeId,
+    mir_def_id: DefId,
     move_data: &'cx MoveData<'tcx>,
     param_env: ParamEnv<'gcx>,
     movable_generator: bool,
@@ -285,11 +355,25 @@ pub struct MirBorrowckCtxt<'cx, 'gcx: 'tcx, 'tcx: 'cx> {
     /// but it is currently inconvenient to track down the BorrowIndex
     /// at the time we detect and report a reservation error.
     reservation_error_reported: FxHashSet<Place<'tcx>>,
+    /// This field keeps track of errors reported in the checking of moved variables,
+    /// so that we don't report report seemingly duplicate errors.
+    moved_error_reported: FxHashSet<Place<'tcx>>,
+    /// This field keeps track of all the local variables that are declared mut and are mutated.
+    /// Used for the warning issued by an unused mutable local variable.
+    used_mut: FxHashSet<Local>,
+    /// If the function we're checking is a closure, then we'll need to report back the list of
+    /// mutable upvars that have been used. This field keeps track of them.
+    used_mut_upvars: SmallVec<[Field; 8]>,
     /// Non-lexical region inference context, if NLL is enabled.  This
     /// contains the results from region inference and lets us e.g.
     /// find out which CFG points are contained in each borrow region.
-    nonlexical_regioncx: Option<Rc<RegionInferenceContext<'tcx>>>,
-    nonlexical_cause_info: Option<RegionCausalInfo>,
+    nonlexical_regioncx: Rc<RegionInferenceContext<'tcx>>,
+
+    /// The set of borrows extracted from the MIR
+    borrow_set: Rc<BorrowSet<'tcx>>,
+
+    /// Dominators for MIR
+    dominators: Dominators<BasicBlock>,
 }
 
 // Check that:
@@ -339,6 +423,14 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
                     flow_state,
                 );
             }
+            StatementKind::ReadForMatch(ref place) => {
+                self.access_place(ContextKind::ReadForMatch.new(location),
+                                  (place, span),
+                                  (Deep, Read(ReadKind::Borrow(BorrowKind::Shared))),
+                                  LocalMutationIsAllowed::No,
+                                  flow_state,
+                                  );
+            }
             StatementKind::SetDiscriminant {
                 ref place,
                 variant_index: _,
@@ -368,7 +460,7 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
                             LocalMutationIsAllowed::No,
                             flow_state,
                         );
-                        self.check_if_path_is_moved(
+                        self.check_if_path_or_subpath_is_moved(
                             context,
                             InitializationRequiringAction::Use,
                             (output, span),
@@ -392,11 +484,13 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
                 // ignored when consuming results (update to
                 // flow_state already handled).
             }
-            StatementKind::Nop | StatementKind::Validate(..) | StatementKind::StorageLive(..) => {
-                // `Nop`, `Validate`, and `StorageLive` are irrelevant
+            StatementKind::Nop |
+            StatementKind::UserAssertTy(..) |
+            StatementKind::Validate(..) |
+            StatementKind::StorageLive(..) => {
+                // `Nop`, `UserAssertTy`, `Validate`, and `StorageLive` are irrelevant
                 // to borrow check.
             }
-
             StatementKind::StorageDead(local) => {
                 self.access_place(
                     ContextKind::StorageDead.new(location),
@@ -504,18 +598,14 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
                 cleanup: _,
             } => {
                 self.consume_operand(ContextKind::Assert.new(loc), (cond, span), flow_state);
-                match *msg {
-                    AssertMessage::BoundsCheck { ref len, ref index } => {
-                        self.consume_operand(ContextKind::Assert.new(loc), (len, span), flow_state);
-                        self.consume_operand(
-                            ContextKind::Assert.new(loc),
-                            (index, span),
-                            flow_state,
-                        );
-                    }
-                    AssertMessage::Math(_ /*const_math_err*/) => {}
-                    AssertMessage::GeneratorResumedAfterReturn => {}
-                    AssertMessage::GeneratorResumedAfterPanic => {}
+                use rustc::mir::interpret::EvalErrorKind::BoundsCheck;
+                if let BoundsCheck { ref len, ref index } = *msg {
+                    self.consume_operand(ContextKind::Assert.new(loc), (len, span), flow_state);
+                    self.consume_operand(
+                        ContextKind::Assert.new(loc),
+                        (index, span),
+                        flow_state,
+                    );
                 }
             }
 
@@ -528,11 +618,10 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
 
                 if self.movable_generator {
                     // Look for any active borrows to locals
-                    let domain = flow_state.borrows.operator();
-                    let data = domain.borrows();
-                    flow_state.borrows.with_iter_outgoing(|borrows| {
+                    let borrow_set = self.borrow_set.clone();
+                    flow_state.with_outgoing_borrows(|borrows| {
                         for i in borrows {
-                            let borrow = &data[i.borrow_index()];
+                            let borrow = &borrow_set[i];
                             self.check_for_local_borrow(borrow, span);
                         }
                     });
@@ -544,13 +633,12 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
                 // Often, the storage will already have been killed by an explicit
                 // StorageDead, but we don't always emit those (notably on unwind paths),
                 // so this "extra check" serves as a kind of backup.
-                let domain = flow_state.borrows.operator();
-                let data = domain.borrows();
-                flow_state.borrows.with_iter_outgoing(|borrows| {
+                let borrow_set = self.borrow_set.clone();
+                flow_state.with_outgoing_borrows(|borrows| {
                     for i in borrows {
-                        let borrow = &data[i.borrow_index()];
+                        let borrow = &borrow_set[i];
                         let context = ContextKind::StorageDead.new(loc);
-                        self.check_for_invalidation_at_exit(context, borrow, span, flow_state);
+                        self.check_for_invalidation_at_exit(context, borrow, span);
                     }
                 });
             }
@@ -575,12 +663,6 @@ impl<'cx, 'gcx, 'tcx> DataflowResultsConsumer<'cx, 'tcx> for MirBorrowckCtxt<'cx
 enum MutateMode {
     JustWrite,
     WriteAndRead,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum Control {
-    Continue,
-    Break,
 }
 
 use self::ShallowOrDeep::{Deep, Shallow};
@@ -676,6 +758,11 @@ enum InitializationRequiringAction {
     Assignment,
 }
 
+struct RootPlace<'d, 'tcx: 'd> {
+    place: &'d Place<'tcx>,
+    is_local_mutation_allowed: LocalMutationIsAllowed,
+}
+
 impl InitializationRequiringAction {
     fn as_noun(self) -> &'static str {
         match self {
@@ -697,15 +784,6 @@ impl InitializationRequiringAction {
 }
 
 impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
-    /// Returns true if the borrow represented by `kind` is
-    /// allowed to be split into separate Reservation and
-    /// Activation phases.
-    fn allow_two_phase_borrow(&self, kind: BorrowKind) -> bool {
-        self.tcx.two_phase_borrows()
-            && (kind.allows_two_phase_borrow()
-                || self.tcx.sess.opts.debugging_opts.two_phase_beyond_autoref)
-    }
-
     /// Invokes `access_place` as appropriate for dropping the value
     /// at `drop_place`. Note that the *actual* `Drop` in the MIR is
     /// always for a variable (e.g., `Drop(x)`) -- but we recursively
@@ -721,6 +799,17 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         erased_drop_place_ty: ty::Ty<'gcx>,
         span: Span,
     ) {
+        let gcx = self.tcx.global_tcx();
+        let drop_field = |
+            mir: &mut MirBorrowckCtxt<'cx, 'gcx, 'tcx>,
+            (index, field): (usize, ty::Ty<'gcx>),
+        | {
+            let field_ty = gcx.normalize_erasing_regions(mir.param_env, field);
+            let place = drop_place.clone().field(Field::new(index), field_ty);
+
+            mir.visit_terminator_drop(loc, term, flow_state, &place, field_ty, span);
+        };
+
         match erased_drop_place_ty.sty {
             // When a struct is being dropped, we need to check
             // whether it has a destructor, if it does, then we can
@@ -729,14 +818,31 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
             // destructor but `bar` does not, we will only check for
             // borrows of `x.foo` and not `x.bar`. See #47703.
             ty::TyAdt(def, substs) if def.is_struct() && !def.has_dtor(self.tcx) => {
-                for (index, field) in def.all_fields().enumerate() {
-                    let gcx = self.tcx.global_tcx();
-                    let field_ty = field.ty(gcx, substs);
-                    let field_ty = gcx.normalize_erasing_regions(self.param_env, field_ty);
-                    let place = drop_place.clone().field(Field::new(index), field_ty);
-
-                    self.visit_terminator_drop(loc, term, flow_state, &place, field_ty, span);
-                }
+                def.all_fields()
+                    .map(|field| field.ty(gcx, substs))
+                    .enumerate()
+                    .for_each(|field| drop_field(self, field));
+            }
+            // Same as above, but for tuples.
+            ty::TyTuple(tys) => {
+                tys.iter().cloned().enumerate()
+                    .for_each(|field| drop_field(self, field));
+            }
+            // Closures also have disjoint fields, but they are only
+            // directly accessed in the body of the closure.
+            ty::TyClosure(def, substs)
+                if *drop_place == Place::Local(Local::new(1)) && !self.mir.upvar_decls.is_empty()
+            => {
+                substs.upvar_tys(def, self.tcx).enumerate()
+                    .for_each(|field| drop_field(self, field));
+            }
+            // Generators also have disjoint fields, but they are only
+            // directly accessed in the body of the generator.
+            ty::TyGenerator(def, substs, _)
+                if *drop_place == Place::Local(Local::new(1)) && !self.mir.upvar_decls.is_empty()
+            => {
+                substs.upvar_tys(def, self.tcx).enumerate()
+                    .for_each(|field| drop_field(self, field));
             }
             _ => {
                 // We have now refined the type of the value being
@@ -744,7 +850,6 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 // subfield; so check whether that field's type still
                 // "needs drop". If so, we assume that the destructor
                 // may access any data it likes (i.e., a Deep Write).
-                let gcx = self.tcx.global_tcx();
                 if erased_drop_place_ty.needs_drop(gcx, self.param_env) {
                     self.access_place(
                         ContextKind::Drop.new(loc),
@@ -802,7 +907,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         }
 
         let mutability_error =
-            self.check_access_permissions(place_span, rw, is_local_mutation_allowed);
+            self.check_access_permissions(place_span, rw, is_local_mutation_allowed, flow_state);
         let conflict_error =
             self.check_access_for_conflict(context, place_span, sd, rw, flow_state);
 
@@ -829,27 +934,44 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         rw: ReadOrWrite,
         flow_state: &Flows<'cx, 'gcx, 'tcx>,
     ) -> bool {
+        debug!(
+            "check_access_for_conflict(context={:?}, place_span={:?}, sd={:?}, rw={:?})",
+            context,
+            place_span,
+            sd,
+            rw,
+        );
+
         let mut error_reported = false;
-        self.each_borrow_involving_path(
+        let tcx = self.tcx;
+        let mir = self.mir;
+        let location_table = &LocationTable::new(mir);
+        let location = location_table.start_index(context.loc);
+        let borrow_set = self.borrow_set.clone();
+        each_borrow_involving_path(
+            self,
+            tcx,
+            mir,
             context,
             (sd, place_span.0),
-            flow_state,
-            |this, index, borrow| match (rw, borrow.kind) {
+            &borrow_set,
+            flow_state.borrows_in_scope(location),
+            |this, borrow_index, borrow|
+            match (rw, borrow.kind) {
                 // Obviously an activation is compatible with its own
                 // reservation (or even prior activating uses of same
                 // borrow); so don't check if they interfere.
                 //
                 // NOTE: *reservations* do conflict with themselves;
                 // thus aren't injecting unsoundenss w/ this check.)
-                (Activation(_, activating), _) if activating == index.borrow_index() => {
+                (Activation(_, activating), _) if activating == borrow_index => {
                     debug!(
                         "check_access_for_conflict place_span: {:?} sd: {:?} rw: {:?} \
-                         skipping {:?} b/c activation of same borrow_index: {:?}",
+                         skipping {:?} b/c activation of same borrow_index",
                         place_span,
                         sd,
                         rw,
-                        (index, borrow),
-                        index.borrow_index()
+                        (borrow_index, borrow),
                     );
                     Control::Continue
                 }
@@ -860,7 +982,8 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
 
                 (Read(kind), BorrowKind::Unique) | (Read(kind), BorrowKind::Mut { .. }) => {
                     // Reading from mere reservations of mutable-borrows is OK.
-                    if this.allow_two_phase_borrow(borrow.kind) && index.is_reservation() {
+                    if !is_active(&this.dominators, borrow, context.loc) {
+                        assert!(allow_two_phase_borrow(&this.tcx, borrow.kind));
                         return Control::Continue;
                     }
 
@@ -870,17 +993,12 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                             this.report_use_while_mutably_borrowed(context, place_span, borrow)
                         }
                         ReadKind::Borrow(bk) => {
-                            let end_issued_loan_span = flow_state
-                                .borrows
-                                .operator()
-                                .opt_region_end_span(&borrow.region);
                             error_reported = true;
                             this.report_conflicting_borrow(
                                 context,
                                 place_span,
                                 bk,
                                 &borrow,
-                                end_issued_loan_span,
                             )
                         }
                     }
@@ -912,18 +1030,12 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
 
                     match kind {
                         WriteKind::MutableBorrow(bk) => {
-                            let end_issued_loan_span = flow_state
-                                .borrows
-                                .operator()
-                                .opt_region_end_span(&borrow.region);
-
                             error_reported = true;
                             this.report_conflicting_borrow(
                                 context,
                                 place_span,
                                 bk,
                                 &borrow,
-                                end_issued_loan_span,
                             )
                         }
                         WriteKind::StorageDeadOrDrop => {
@@ -932,7 +1044,6 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                                 context,
                                 borrow,
                                 place_span.1,
-                                flow_state.borrows.operator(),
                             );
                         }
                         WriteKind::Mutate => {
@@ -963,7 +1074,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         // Write of P[i] or *P, or WriteAndRead of any P, requires P init'd.
         match mode {
             MutateMode::WriteAndRead => {
-                self.check_if_path_is_moved(
+                self.check_if_path_or_subpath_is_moved(
                     context,
                     InitializationRequiringAction::Update,
                     place_span,
@@ -1007,7 +1118,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     BorrowKind::Shared => (Deep, Read(ReadKind::Borrow(bk))),
                     BorrowKind::Unique | BorrowKind::Mut { .. } => {
                         let wk = WriteKind::MutableBorrow(bk);
-                        if self.allow_two_phase_borrow(bk) {
+                        if allow_two_phase_borrow(&self.tcx, bk) {
                             (Deep, Reservation(wk))
                         } else {
                             (Deep, Write(wk))
@@ -1023,7 +1134,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     flow_state,
                 );
 
-                self.check_if_path_is_moved(
+                self.check_if_path_or_subpath_is_moved(
                     context,
                     InitializationRequiringAction::Borrow,
                     (place, span),
@@ -1051,7 +1162,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     LocalMutationIsAllowed::No,
                     flow_state,
                 );
-                self.check_if_path_is_moved(
+                self.check_if_path_or_subpath_is_moved(
                     context,
                     InitializationRequiringAction::Use,
                     (place, span),
@@ -1073,9 +1184,34 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 // `NullOp::Box`?
             }
 
-            Rvalue::Aggregate(ref _aggregate_kind, ref operands) => for operand in operands {
-                self.consume_operand(context, (operand, span), flow_state);
-            },
+            Rvalue::Aggregate(ref aggregate_kind, ref operands) => {
+                // We need to report back the list of mutable upvars that were
+                // moved into the closure and subsequently used by the closure,
+                // in order to populate our used_mut set.
+                if let AggregateKind::Closure(def_id, _) = &**aggregate_kind {
+                    let BorrowCheckResult { used_mut_upvars, .. } = self.tcx.mir_borrowck(*def_id);
+                    debug!("{:?} used_mut_upvars={:?}", def_id, used_mut_upvars);
+                    for field in used_mut_upvars {
+                        match operands[field.index()] {
+                            Operand::Move(Place::Local(local)) => {
+                                self.used_mut.insert(local);
+                            }
+                            Operand::Move(ref place @ Place::Projection(_)) => {
+                                if let Some(field) = self.is_upvar_field_projection(place) {
+                                    self.used_mut_upvars.push(field);
+                                }
+                            }
+                            Operand::Move(Place::Static(..)) |
+                            Operand::Copy(..) |
+                            Operand::Constant(..) => {}
+                        }
+                    }
+                }
+
+                for operand in operands {
+                    self.consume_operand(context, (operand, span), flow_state);
+                }
+            }
         }
     }
 
@@ -1098,7 +1234,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 );
 
                 // Finally, check if path was already moved.
-                self.check_if_path_is_moved(
+                self.check_if_path_or_subpath_is_moved(
                     context,
                     InitializationRequiringAction::Use,
                     (place, span),
@@ -1116,7 +1252,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 );
 
                 // Finally, check if path was already moved.
-                self.check_if_path_is_moved(
+                self.check_if_path_or_subpath_is_moved(
                     context,
                     InitializationRequiringAction::Use,
                     (place, span),
@@ -1134,7 +1270,6 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         context: Context,
         borrow: &BorrowData<'tcx>,
         span: Span,
-        flow_state: &Flows<'cx, 'gcx, 'tcx>,
     ) {
         debug!("check_for_invalidation_at_exit({:?})", borrow);
         let place = &borrow.borrowed_place;
@@ -1178,7 +1313,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         // that is merged.
         let sd = if might_be_alive { Deep } else { Shallow(None) };
 
-        if self.places_conflict(place, root_place, sd) {
+        if places_conflict(self.tcx, self.mir, place, root_place, sd) {
             debug!("check_for_invalidation_at_exit({:?}): INVALID", place);
             // FIXME: should be talking about the region lifetime instead
             // of just a span here.
@@ -1187,7 +1322,6 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 context,
                 borrow,
                 span,
-                flow_state.borrows.operator(),
             )
         }
     }
@@ -1195,27 +1329,6 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
     /// Reports an error if this is a borrow of local data.
     /// This is called for all Yield statements on movable generators
     fn check_for_local_borrow(&mut self, borrow: &BorrowData<'tcx>, yield_span: Span) {
-        fn borrow_of_local_data<'tcx>(place: &Place<'tcx>) -> bool {
-            match place {
-                Place::Static(..) => false,
-                Place::Local(..) => true,
-                Place::Projection(box proj) => {
-                    match proj.elem {
-                        // Reborrow of already borrowed data is ignored
-                        // Any errors will be caught on the initial borrow
-                        ProjectionElem::Deref => false,
-
-                        // For interior references and downcasts, find out if the base is local
-                        ProjectionElem::Field(..)
-                        | ProjectionElem::Index(..)
-                        | ProjectionElem::ConstantIndex { .. }
-                        | ProjectionElem::Subslice { .. }
-                        | ProjectionElem::Downcast(..) => borrow_of_local_data(&proj.base),
-                    }
-                }
-            }
-        }
-
         debug!("check_for_local_borrow({:?})", borrow);
 
         if borrow_of_local_data(&borrow.borrowed_place) {
@@ -1242,36 +1355,30 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         // Two-phase borrow support: For each activation that is newly
         // generated at this statement, check if it interferes with
         // another borrow.
-        let domain = flow_state.borrows.operator();
-        let data = domain.borrows();
-        flow_state.borrows.each_gen_bit(|gen| {
-            if gen.is_activation() {
-                let borrow_index = gen.borrow_index();
-                let borrow = &data[borrow_index];
-                // currently the flow analysis registers
-                // activations for both mutable and immutable
-                // borrows. So make sure we are talking about a
-                // mutable borrow before we check it.
-                match borrow.kind {
-                    BorrowKind::Shared => return,
-                    BorrowKind::Unique | BorrowKind::Mut { .. } => {}
-                }
+        let borrow_set = self.borrow_set.clone();
+        for &borrow_index in borrow_set.activations_at_location(location) {
+            let borrow = &borrow_set[borrow_index];
 
-                self.access_place(
-                    ContextKind::Activation.new(location),
-                    (&borrow.borrowed_place, span),
-                    (
-                        Deep,
-                        Activation(WriteKind::MutableBorrow(borrow.kind), borrow_index),
-                    ),
-                    LocalMutationIsAllowed::No,
-                    flow_state,
-                );
-                // We do not need to call `check_if_path_is_moved`
-                // again, as we already called it when we made the
-                // initial reservation.
-            }
-        });
+            // only mutable borrows should be 2-phase
+            assert!(match borrow.kind {
+                BorrowKind::Shared => false,
+                BorrowKind::Unique | BorrowKind::Mut { .. } => true,
+            });
+
+            self.access_place(
+                ContextKind::Activation.new(location),
+                (&borrow.borrowed_place, span),
+                (
+                    Deep,
+                    Activation(WriteKind::MutableBorrow(borrow.kind), borrow_index),
+                ),
+                LocalMutationIsAllowed::No,
+                flow_state,
+            );
+            // We do not need to call `check_if_path_or_subpath_is_moved`
+            // again, as we already called it when we made the
+            // initial reservation.
+        }
     }
 }
 
@@ -1284,7 +1391,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
     ) {
         debug!("check_if_reassignment_to_immutable_state({:?})", place);
         // determine if this path has a non-mut owner (and thus needs checking).
-        if let Ok(()) = self.is_mutable(place, LocalMutationIsAllowed::No) {
+        if let Ok(..) = self.is_mutable(place, LocalMutationIsAllowed::No) {
             return;
         }
         debug!(
@@ -1295,14 +1402,14 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         for i in flow_state.ever_inits.iter_incoming() {
             let init = self.move_data.inits[i];
             let init_place = &self.move_data.move_paths[init.path].place;
-            if self.places_conflict(&init_place, place, Deep) {
+            if places_conflict(self.tcx, self.mir, &init_place, place, Deep) {
                 self.report_illegal_reassignment(context, (place, span), init.span);
                 break;
             }
         }
     }
 
-    fn check_if_path_is_moved(
+    fn check_if_full_path_is_moved(
         &mut self,
         context: Context,
         desired_action: InitializationRequiringAction,
@@ -1320,18 +1427,17 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         //
         // 1. Move of `a.b.c`, use of `a.b.c`
         // 2. Move of `a.b.c`, use of `a.b.c.d` (without first reinitializing `a.b.c.d`)
-        // 3. Move of `a.b.c`, use of `a` or `a.b`
-        // 4. Uninitialized `(a.b.c: &_)`, use of `*a.b.c`; note that with
+        // 3. Uninitialized `(a.b.c: &_)`, use of `*a.b.c`; note that with
         //    partial initialization support, one might have `a.x`
         //    initialized but not `a.b`.
         //
         // OK scenarios:
         //
-        // 5. Move of `a.b.c`, use of `a.b.d`
-        // 6. Uninitialized `a.x`, initialized `a.b`, use of `a.b`
-        // 7. Copied `(a.b: &_)`, use of `*(a.b).c`; note that `a.b`
+        // 4. Move of `a.b.c`, use of `a.b.d`
+        // 5. Uninitialized `a.x`, initialized `a.b`, use of `a.b`
+        // 6. Copied `(a.b: &_)`, use of `*(a.b).c`; note that `a.b`
         //    must have been initialized for the use to be sound.
-        // 8. Move of `a.b.c` then reinit of `a.b.c.d`, use of `a.b.c.d`
+        // 7. Move of `a.b.c` then reinit of `a.b.c.d`, use of `a.b.c.d`
 
         // The dataflow tracks shallow prefixes distinctly (that is,
         // field-accesses on P distinctly from P itself), in order to
@@ -1350,9 +1456,9 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         // have a MovePath, that should capture the initialization
         // state for the place scenario.
         //
-        // This code covers scenarios 1, 2, and 4.
+        // This code covers scenarios 1, 2, and 3.
 
-        debug!("check_if_path_is_moved part1 place: {:?}", place);
+        debug!("check_if_full_path_is_moved place: {:?}", place);
         match self.move_path_closest_to(place) {
             Ok(mpi) => {
                 if maybe_uninits.contains(&mpi) {
@@ -1372,9 +1478,41 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
               // ancestors; dataflow recurs on children when parents
               // move (to support partial (re)inits).
               //
-              // (I.e. querying parents breaks scenario 8; but may want
+              // (I.e. querying parents breaks scenario 7; but may want
               // to do such a query based on partial-init feature-gate.)
         }
+    }
+
+    fn check_if_path_or_subpath_is_moved(
+        &mut self,
+        context: Context,
+        desired_action: InitializationRequiringAction,
+        place_span: (&Place<'tcx>, Span),
+        flow_state: &Flows<'cx, 'gcx, 'tcx>,
+    ) {
+        // FIXME: analogous code in check_loans first maps `place` to
+        // its base_path ... but is that what we want here?
+        let place = self.base_path(place_span.0);
+
+        let maybe_uninits = &flow_state.uninits;
+        let curr_move_outs = &flow_state.move_outs;
+
+        // Bad scenarios:
+        //
+        // 1. Move of `a.b.c`, use of `a` or `a.b`
+        //    partial initialization support, one might have `a.x`
+        //    initialized but not `a.b`.
+        // 2. All bad scenarios from `check_if_full_path_is_moved`
+        //
+        // OK scenarios:
+        //
+        // 3. Move of `a.b.c`, use of `a.b.d`
+        // 4. Uninitialized `a.x`, initialized `a.b`, use of `a.b`
+        // 5. Copied `(a.b: &_)`, use of `*(a.b).c`; note that `a.b`
+        //    must have been initialized for the use to be sound.
+        // 6. Move of `a.b.c` then reinit of `a.b.c.d`, use of `a.b.c.d`
+
+        self.check_if_full_path_is_moved(context, desired_action, place_span, flow_state);
 
         // A move of any shallow suffix of `place` also interferes
         // with an attempt to use `place`. This is scenario 3 above.
@@ -1382,8 +1520,10 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         // (Distinct from handling of scenarios 1+2+4 above because
         // `place` does not interfere with suffixes of its prefixes,
         // e.g. `a.b.c` does not interfere with `a.b.d`)
+        //
+        // This code covers scenario 1.
 
-        debug!("check_if_path_is_moved part2 place: {:?}", place);
+        debug!("check_if_path_or_subpath_is_moved place: {:?}", place);
         if let Some(mpi) = self.move_path_for_place(place) {
             if let Some(child_mpi) = maybe_uninits.has_any_child_of(mpi) {
                 self.report_use_of_moved_or_uninitialized(
@@ -1443,7 +1583,8 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         (place, span): (&Place<'tcx>, Span),
         flow_state: &Flows<'cx, 'gcx, 'tcx>,
     ) {
-        // recur down place; dispatch to check_if_path_is_moved when necessary
+        debug!("check_if_assigned_path_is_moved place: {:?}", place);
+        // recur down place; dispatch to external checks when necessary
         let mut place = place;
         loop {
             match *place {
@@ -1454,16 +1595,24 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                 Place::Projection(ref proj) => {
                     let Projection { ref base, ref elem } = **proj;
                     match *elem {
-                        ProjectionElem::Deref |
-                        // assigning to *P requires `P` initialized.
                         ProjectionElem::Index(_/*operand*/) |
                         ProjectionElem::ConstantIndex { .. } |
-                        // assigning to P[i] requires `P` initialized.
+                        // assigning to P[i] requires P to be valid.
                         ProjectionElem::Downcast(_/*adt_def*/, _/*variant_idx*/) =>
                         // assigning to (P->variant) is okay if assigning to `P` is okay
                         //
                         // FIXME: is this true even if P is a adt with a dtor?
                         { }
+
+                        // assigning to (*P) requires P to be initialized
+                        ProjectionElem::Deref => {
+                            self.check_if_full_path_is_moved(
+                                context, InitializationRequiringAction::Use,
+                                (base, span), flow_state);
+                            // (base initialized; no need to
+                            // recur further)
+                            break;
+                        }
 
                         ProjectionElem::Subslice { .. } => {
                             panic!("we don't allow assignments to subslices, context: {:?}",
@@ -1482,7 +1631,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                                     // check_loans.rs first maps
                                     // `base` to its base_path.
 
-                                    self.check_if_path_is_moved(
+                                    self.check_if_path_or_subpath_is_moved(
                                         context, InitializationRequiringAction::Assignment,
                                         (base, span), flow_state);
 
@@ -1502,14 +1651,45 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         }
     }
 
+    fn specialized_description(&self, place:&Place<'tcx>) -> Option<String>{
+        if let Some(_name) = self.describe_place(place) {
+            Some(format!("data in a `&` reference"))
+        } else {
+            None
+        }
+    }
+
+    fn get_default_err_msg(&self, place:&Place<'tcx>) -> String{
+        match self.describe_place(place) {
+            Some(name) => format!("immutable item `{}`", name),
+            None => "immutable item".to_owned(),
+        }
+    }
+
+    fn get_secondary_err_msg(&self, place:&Place<'tcx>) -> String{
+        match self.specialized_description(place) {
+            Some(_) => format!("data in a `&` reference"),
+            None => self.get_default_err_msg(place)
+        }
+    }
+
+    fn get_primary_err_msg(&self, place:&Place<'tcx>) -> String{
+        if let Some(name) = self.describe_place(place) {
+            format!("`{}` is a `&` reference, so the data it refers to cannot be written", name)
+        } else {
+            format!("cannot assign through `&`-reference")
+        }
+    }
+
     /// Check the permissions for the given place and read or write kind
     ///
     /// Returns true if an error is reported, false otherwise.
     fn check_access_permissions(
-        &self,
+        &mut self,
         (place, span): (&Place<'tcx>, Span),
         kind: ReadOrWrite,
         is_local_mutation_allowed: LocalMutationIsAllowed,
+        flow_state: &Flows<'cx, 'gcx, 'tcx>,
     ) -> bool {
         debug!(
             "check_access_permissions({:?}, {:?}, {:?})",
@@ -1517,60 +1697,106 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         );
         let mut error_reported = false;
         match kind {
-            Reservation(WriteKind::MutableBorrow(BorrowKind::Unique))
-            | Write(WriteKind::MutableBorrow(BorrowKind::Unique)) => {
-                if let Err(_place_err) = self.is_mutable(place, LocalMutationIsAllowed::Yes) {
-                    span_bug!(span, "&unique borrow for {:?} should not fail", place);
+            Reservation(WriteKind::MutableBorrow(borrow_kind @ BorrowKind::Unique))
+            | Reservation(WriteKind::MutableBorrow(borrow_kind @ BorrowKind::Mut { .. }))
+            | Write(WriteKind::MutableBorrow(borrow_kind @ BorrowKind::Unique))
+            | Write(WriteKind::MutableBorrow(borrow_kind @ BorrowKind::Mut { .. })) =>
+            {
+                let is_local_mutation_allowed = match borrow_kind {
+                    BorrowKind::Unique => LocalMutationIsAllowed::Yes,
+                    BorrowKind::Mut { .. } => is_local_mutation_allowed,
+                    BorrowKind::Shared => unreachable!(),
+                };
+                match self.is_mutable(place, is_local_mutation_allowed) {
+                    Ok(root_place) => self.add_used_mut(root_place, flow_state),
+                    Err(place_err) => {
+                        error_reported = true;
+                        let item_msg = self.get_default_err_msg(place);
+                        let mut err = self.tcx
+                            .cannot_borrow_path_as_mutable(span, &item_msg, Origin::Mir);
+                        err.span_label(span, "cannot borrow as mutable");
+
+                        if place != place_err {
+                            if let Some(name) = self.describe_place(place_err) {
+                                err.note(&format!("the value which is causing this path not to be \
+                                    mutable is...: `{}`", name));
+                            }
+                        }
+
+                        err.emit();
+                    }
                 }
             }
-            Reservation(WriteKind::MutableBorrow(BorrowKind::Mut { .. }))
-            | Write(WriteKind::MutableBorrow(BorrowKind::Mut { .. })) => if let Err(place_err) =
-                self.is_mutable(place, is_local_mutation_allowed)
-            {
-                error_reported = true;
-
-                let item_msg = match self.describe_place(place) {
-                    Some(name) => format!("immutable item `{}`", name),
-                    None => "immutable item".to_owned(),
-                };
-
-                let mut err = self.tcx
-                    .cannot_borrow_path_as_mutable(span, &item_msg, Origin::Mir);
-                err.span_label(span, "cannot borrow as mutable");
-
-                if place != place_err {
-                    if let Some(name) = self.describe_place(place_err) {
-                        err.note(&format!("Value not mutable causing this error: `{}`", name));
-                    }
-                }
-
-                err.emit();
-            },
             Reservation(WriteKind::Mutate) | Write(WriteKind::Mutate) => {
-                if let Err(place_err) = self.is_mutable(place, is_local_mutation_allowed) {
-                    error_reported = true;
+                match self.is_mutable(place, is_local_mutation_allowed) {
+                    Ok(root_place) => self.add_used_mut(root_place, flow_state),
+                    Err(place_err) => {
+                        error_reported = true;
 
-                    let item_msg = match self.describe_place(place) {
-                        Some(name) => format!("immutable item `{}`", name),
-                        None => "immutable item".to_owned(),
-                    };
+                        let err_info = if let Place::Projection(
+                            box Projection {
+                                base: Place::Local(local),
+                                elem: ProjectionElem::Deref
+                            }
+                        ) = *place_err {
+                            let locations = self.mir.find_assignments(local);
+                            if locations.len() > 0 {
+                                let item_msg = if error_reported {
+                                    self.get_secondary_err_msg(&Place::Local(local))
+                                } else {
+                                    self.get_default_err_msg(place)
+                                };
+                                let sp = self.mir.source_info(locations[0]).span;
+                                let mut to_suggest_span = String::new();
+                                if let Ok(src) =
+                                    self.tcx.sess.codemap().span_to_snippet(sp) {
+                                        to_suggest_span = src[1..].to_string();
+                                };
+                                Some((sp,
+                                      "consider changing this to be a \
+                                      mutable reference",
+                                      to_suggest_span,
+                                      item_msg,
+                                      self.get_primary_err_msg(&Place::Local(local))))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
 
-                    let mut err = self.tcx.cannot_assign(span, &item_msg, Origin::Mir);
-                    err.span_label(span, "cannot mutate");
-
-                    if place != place_err {
-                        if let Some(name) = self.describe_place(place_err) {
-                            err.note(&format!("Value not mutable causing this error: `{}`", name));
+                        if let Some((err_help_span,
+                                     err_help_stmt,
+                                     to_suggest_span,
+                                     item_msg,
+                                     sec_span)) = err_info {
+                            let mut err = self.tcx.cannot_assign(span, &item_msg, Origin::Mir);
+                            err.span_suggestion(err_help_span,
+                                                err_help_stmt,
+                                                format!("&mut {}", to_suggest_span));
+                            if place != place_err {
+                                err.span_label(span, sec_span);
+                            }
+                            err.emit()
+                        } else {
+                            let item_msg = self.get_default_err_msg(place);
+                            let mut err = self.tcx.cannot_assign(span, &item_msg, Origin::Mir);
+                            err.span_label(span, "cannot mutate");
+                            if place != place_err {
+                                if let Some(name) = self.describe_place(place_err) {
+                                    err.note(&format!("the value which is causing this path not \
+                                                       to be mutable is...: `{}`", name));
+                                }
+                            }
+                            err.emit();
                         }
                     }
-
-                    err.emit();
                 }
             }
             Reservation(WriteKind::Move)
+            | Write(WriteKind::Move)
             | Reservation(WriteKind::StorageDeadOrDrop)
             | Reservation(WriteKind::MutableBorrow(BorrowKind::Shared))
-            | Write(WriteKind::Move)
             | Write(WriteKind::StorageDeadOrDrop)
             | Write(WriteKind::MutableBorrow(BorrowKind::Shared)) => {
                 if let Err(_place_err) = self.is_mutable(place, is_local_mutation_allowed) {
@@ -1583,9 +1809,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     );
                 }
             }
-
             Activation(..) => {} // permission checks are done at Reservation point.
-
             Read(ReadKind::Borrow(BorrowKind::Unique))
             | Read(ReadKind::Borrow(BorrowKind::Mut { .. }))
             | Read(ReadKind::Borrow(BorrowKind::Shared))
@@ -1595,30 +1819,80 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
         error_reported
     }
 
-    /// Can this value be written or borrowed mutably
+    /// Adds the place into the used mutable variables set
+    fn add_used_mut<'d>(
+        &mut self,
+        root_place: RootPlace<'d, 'tcx>,
+        flow_state: &Flows<'cx, 'gcx, 'tcx>
+    ) {
+        match root_place {
+            RootPlace {
+                place: Place::Local(local),
+                is_local_mutation_allowed,
+            } => {
+                if is_local_mutation_allowed != LocalMutationIsAllowed::Yes {
+                    // If the local may be initialized, and it is now currently being
+                    // mutated, then it is justified to be annotated with the `mut`
+                    // keyword, since the mutation may be a possible reassignment.
+                    let mpi = self.move_data.rev_lookup.find_local(*local);
+                    let ii = &self.move_data.init_path_map[mpi];
+                    for index in ii {
+                        if flow_state.ever_inits.contains(index) {
+                            self.used_mut.insert(*local);
+                            break;
+                        }
+                    }
+                }
+            }
+            RootPlace {
+                place: place @ Place::Projection(_),
+                is_local_mutation_allowed: _,
+            } => {
+                if let Some(field) = self.is_upvar_field_projection(&place) {
+                    self.used_mut_upvars.push(field);
+                }
+            }
+            RootPlace {
+                place: Place::Static(..),
+                is_local_mutation_allowed: _,
+            } => {}
+        }
+    }
+
+    /// Whether this value be written or borrowed mutably.
+    /// Returns the root place if the place passed in is a projection.
     fn is_mutable<'d>(
         &self,
         place: &'d Place<'tcx>,
         is_local_mutation_allowed: LocalMutationIsAllowed,
-    ) -> Result<(), &'d Place<'tcx>> {
+    ) -> Result<RootPlace<'d, 'tcx>, &'d Place<'tcx>> {
         match *place {
             Place::Local(local) => {
                 let local = &self.mir.local_decls[local];
                 match local.mutability {
                     Mutability::Not => match is_local_mutation_allowed {
-                        LocalMutationIsAllowed::Yes | LocalMutationIsAllowed::ExceptUpvars => {
-                            Ok(())
+                        LocalMutationIsAllowed::Yes => {
+                            Ok(RootPlace {
+                                place,
+                                is_local_mutation_allowed: LocalMutationIsAllowed::Yes
+                            })
+                        }
+                        LocalMutationIsAllowed::ExceptUpvars => {
+                            Ok(RootPlace {
+                                place,
+                                is_local_mutation_allowed: LocalMutationIsAllowed::ExceptUpvars
+                            })
                         }
                         LocalMutationIsAllowed::No => Err(place),
                     },
-                    Mutability::Mut => Ok(()),
+                    Mutability::Mut => Ok(RootPlace { place, is_local_mutation_allowed }),
                 }
             }
             Place::Static(ref static_) =>
                 if self.tcx.is_static(static_.def_id) != Some(hir::Mutability::MutMutable) {
                     Err(place)
                 } else {
-                    Ok(())
+                    Ok(RootPlace { place, is_local_mutation_allowed })
                 },
             Place::Projection(ref proj) => {
                 match proj.elem {
@@ -1627,8 +1901,8 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
 
                         // Check the kind of deref to decide
                         match base_ty.sty {
-                            ty::TyRef(_, tnm) => {
-                                match tnm.mutbl {
+                            ty::TyRef(_, _, mutbl) => {
+                                match mutbl {
                                     // Shared borrowed data is never mutable
                                     hir::MutImmutable => Err(place),
                                     // Mutably borrowed data is mutable, but only if we have a
@@ -1654,9 +1928,11 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                                 match tnm.mutbl {
                                     // `*const` raw pointers are not mutable
                                     hir::MutImmutable => return Err(place),
-                                    // `*mut` raw pointers are always mutable, regardless of context
-                                    // The users have to check by themselve.
-                                    hir::MutMutable => return Ok(()),
+                                    // `*mut` raw pointers are always mutable, regardless of
+                                    // context. The users have to check by themselves.
+                                    hir::MutMutable => {
+                                        return Ok(RootPlace { place, is_local_mutation_allowed });
+                                    }
                                 }
                             }
                             // `Box<T>` owns its content, so mutable if its location is mutable
@@ -1687,7 +1963,34 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                                 }
                                 (Mutability::Not, LocalMutationIsAllowed::Yes)
                                 | (Mutability::Mut, _) => {
-                                    self.is_mutable(&proj.base, is_local_mutation_allowed)
+                                    // Subtle: this is an upvar
+                                    // reference, so it looks like
+                                    // `self.foo` -- we want to double
+                                    // check that the context `*self`
+                                    // is mutable (i.e., this is not a
+                                    // `Fn` closure).  But if that
+                                    // check succeeds, we want to
+                                    // *blame* the mutability on
+                                    // `place` (that is,
+                                    // `self.foo`). This is used to
+                                    // propagate the info about
+                                    // whether mutability declarations
+                                    // are used outwards, so that we register
+                                    // the outer variable as mutable. Otherwise a
+                                    // test like this fails to record the `mut`
+                                    // as needed:
+                                    //
+                                    // ```
+                                    // fn foo<F: FnOnce()>(_f: F) { }
+                                    // fn main() {
+                                    //     let var = Vec::new();
+                                    //     foo(move || {
+                                    //         var.push(1);
+                                    //     });
+                                    // }
+                                    // ```
+                                    let _ = self.is_mutable(&proj.base, is_local_mutation_allowed)?;
+                                    Ok(RootPlace { place, is_local_mutation_allowed })
                                 }
                             }
                         } else {
@@ -1749,405 +2052,6 @@ enum Overlap {
 }
 
 impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
-    // Given that the bases of `elem1` and `elem2` are always either equal
-    // or disjoint (and have the same type!), return the overlap situation
-    // between `elem1` and `elem2`.
-    fn place_element_conflict(&self, elem1: &Place<'tcx>, elem2: &Place<'tcx>) -> Overlap {
-        match (elem1, elem2) {
-            (Place::Local(l1), Place::Local(l2)) => {
-                if l1 == l2 {
-                    // the same local - base case, equal
-                    debug!("place_element_conflict: DISJOINT-OR-EQ-LOCAL");
-                    Overlap::EqualOrDisjoint
-                } else {
-                    // different locals - base case, disjoint
-                    debug!("place_element_conflict: DISJOINT-LOCAL");
-                    Overlap::Disjoint
-                }
-            }
-            (Place::Static(static1), Place::Static(static2)) => {
-                if static1.def_id != static2.def_id {
-                    debug!("place_element_conflict: DISJOINT-STATIC");
-                    Overlap::Disjoint
-                } else if self.tcx.is_static(static1.def_id) == Some(hir::Mutability::MutMutable) {
-                    // We ignore mutable statics - they can only be unsafe code.
-                    debug!("place_element_conflict: IGNORE-STATIC-MUT");
-                    Overlap::Disjoint
-                } else {
-                    debug!("place_element_conflict: DISJOINT-OR-EQ-STATIC");
-                    Overlap::EqualOrDisjoint
-                }
-            }
-            (Place::Local(_), Place::Static(_)) | (Place::Static(_), Place::Local(_)) => {
-                debug!("place_element_conflict: DISJOINT-STATIC-LOCAL");
-                Overlap::Disjoint
-            }
-            (Place::Projection(pi1), Place::Projection(pi2)) => {
-                match (&pi1.elem, &pi2.elem) {
-                    (ProjectionElem::Deref, ProjectionElem::Deref) => {
-                        // derefs (e.g. `*x` vs. `*x`) - recur.
-                        debug!("place_element_conflict: DISJOINT-OR-EQ-DEREF");
-                        Overlap::EqualOrDisjoint
-                    }
-                    (ProjectionElem::Field(f1, _), ProjectionElem::Field(f2, _)) => {
-                        if f1 == f2 {
-                            // same field (e.g. `a.y` vs. `a.y`) - recur.
-                            debug!("place_element_conflict: DISJOINT-OR-EQ-FIELD");
-                            Overlap::EqualOrDisjoint
-                        } else {
-                            let ty = pi1.base.ty(self.mir, self.tcx).to_ty(self.tcx);
-                            match ty.sty {
-                                ty::TyAdt(def, _) if def.is_union() => {
-                                    // Different fields of a union, we are basically stuck.
-                                    debug!("place_element_conflict: STUCK-UNION");
-                                    Overlap::Arbitrary
-                                }
-                                _ => {
-                                    // Different fields of a struct (`a.x` vs. `a.y`). Disjoint!
-                                    debug!("place_element_conflict: DISJOINT-FIELD");
-                                    Overlap::Disjoint
-                                }
-                            }
-                        }
-                    }
-                    (ProjectionElem::Downcast(_, v1), ProjectionElem::Downcast(_, v2)) => {
-                        // different variants are treated as having disjoint fields,
-                        // even if they occupy the same "space", because it's
-                        // impossible for 2 variants of the same enum to exist
-                        // (and therefore, to be borrowed) at the same time.
-                        //
-                        // Note that this is different from unions - we *do* allow
-                        // this code to compile:
-                        //
-                        // ```
-                        // fn foo(x: &mut Result<i32, i32>) {
-                        //     let mut v = None;
-                        //     if let Ok(ref mut a) = *x {
-                        //         v = Some(a);
-                        //     }
-                        //     // here, you would *think* that the
-                        //     // *entirety* of `x` would be borrowed,
-                        //     // but in fact only the `Ok` variant is,
-                        //     // so the `Err` variant is *entirely free*:
-                        //     if let Err(ref mut a) = *x {
-                        //         v = Some(a);
-                        //     }
-                        //     drop(v);
-                        // }
-                        // ```
-                        if v1 == v2 {
-                            debug!("place_element_conflict: DISJOINT-OR-EQ-FIELD");
-                            Overlap::EqualOrDisjoint
-                        } else {
-                            debug!("place_element_conflict: DISJOINT-FIELD");
-                            Overlap::Disjoint
-                        }
-                    }
-                    (ProjectionElem::Index(..), ProjectionElem::Index(..))
-                    | (ProjectionElem::Index(..), ProjectionElem::ConstantIndex { .. })
-                    | (ProjectionElem::Index(..), ProjectionElem::Subslice { .. })
-                    | (ProjectionElem::ConstantIndex { .. }, ProjectionElem::Index(..))
-                    | (
-                        ProjectionElem::ConstantIndex { .. },
-                        ProjectionElem::ConstantIndex { .. },
-                    )
-                    | (ProjectionElem::ConstantIndex { .. }, ProjectionElem::Subslice { .. })
-                    | (ProjectionElem::Subslice { .. }, ProjectionElem::Index(..))
-                    | (ProjectionElem::Subslice { .. }, ProjectionElem::ConstantIndex { .. })
-                    | (ProjectionElem::Subslice { .. }, ProjectionElem::Subslice { .. }) => {
-                        // Array indexes (`a[0]` vs. `a[i]`). These can either be disjoint
-                        // (if the indexes differ) or equal (if they are the same), so this
-                        // is the recursive case that gives "equal *or* disjoint" its meaning.
-                        //
-                        // Note that by construction, MIR at borrowck can't subdivide
-                        // `Subslice` accesses (e.g. `a[2..3][i]` will never be present) - they
-                        // are only present in slice patterns, and we "merge together" nested
-                        // slice patterns. That means we don't have to think about these. It's
-                        // probably a good idea to assert this somewhere, but I'm too lazy.
-                        //
-                        // FIXME(#8636) we might want to return Disjoint if
-                        // both projections are constant and disjoint.
-                        debug!("place_element_conflict: DISJOINT-OR-EQ-ARRAY");
-                        Overlap::EqualOrDisjoint
-                    }
-
-                    (ProjectionElem::Deref, _)
-                    | (ProjectionElem::Field(..), _)
-                    | (ProjectionElem::Index(..), _)
-                    | (ProjectionElem::ConstantIndex { .. }, _)
-                    | (ProjectionElem::Subslice { .. }, _)
-                    | (ProjectionElem::Downcast(..), _) => bug!(
-                        "mismatched projections in place_element_conflict: {:?} and {:?}",
-                        elem1,
-                        elem2
-                    ),
-                }
-            }
-            (Place::Projection(_), _) | (_, Place::Projection(_)) => bug!(
-                "unexpected elements in place_element_conflict: {:?} and {:?}",
-                elem1,
-                elem2
-            ),
-        }
-    }
-
-    /// Returns whether an access of kind `access` to `access_place` conflicts with
-    /// a borrow/full access to `borrow_place` (for deep accesses to mutable
-    /// locations, this function is symmetric between `borrow_place` & `access_place`).
-    fn places_conflict(
-        &mut self,
-        borrow_place: &Place<'tcx>,
-        access_place: &Place<'tcx>,
-        access: ShallowOrDeep,
-    ) -> bool {
-        debug!(
-            "places_conflict({:?},{:?},{:?})",
-            borrow_place, access_place, access
-        );
-
-        // Return all the prefixes of `place` in reverse order, including
-        // downcasts.
-        fn place_elements<'a, 'tcx>(place: &'a Place<'tcx>) -> Vec<&'a Place<'tcx>> {
-            let mut result = vec![];
-            let mut place = place;
-            loop {
-                result.push(place);
-                match place {
-                    Place::Projection(interior) => {
-                        place = &interior.base;
-                    }
-                    Place::Local(_) | Place::Static(_) => {
-                        result.reverse();
-                        return result;
-                    }
-                }
-            }
-        }
-
-        let borrow_components = place_elements(borrow_place);
-        let access_components = place_elements(access_place);
-        debug!(
-            "places_conflict: components {:?} / {:?}",
-            borrow_components, access_components
-        );
-
-        let borrow_components = borrow_components
-            .into_iter()
-            .map(Some)
-            .chain(iter::repeat(None));
-        let access_components = access_components
-            .into_iter()
-            .map(Some)
-            .chain(iter::repeat(None));
-        // The borrowck rules for proving disjointness are applied from the "root" of the
-        // borrow forwards, iterating over "similar" projections in lockstep until
-        // we can prove overlap one way or another. Essentially, we treat `Overlap` as
-        // a monoid and report a conflict if the product ends up not being `Disjoint`.
-        //
-        // At each step, if we didn't run out of borrow or place, we know that our elements
-        // have the same type, and that they only overlap if they are the identical.
-        //
-        // For example, if we are comparing these:
-        // BORROW:  (*x1[2].y).z.a
-        // ACCESS:  (*x1[i].y).w.b
-        //
-        // Then our steps are:
-        //       x1         |   x1          -- places are the same
-        //       x1[2]      |   x1[i]       -- equal or disjoint (disjoint if indexes differ)
-        //       x1[2].y    |   x1[i].y     -- equal or disjoint
-        //      *x1[2].y    |  *x1[i].y     -- equal or disjoint
-        //     (*x1[2].y).z | (*x1[i].y).w  -- we are disjoint and don't need to check more!
-        //
-        // Because `zip` does potentially bad things to the iterator inside, this loop
-        // also handles the case where the access might be a *prefix* of the borrow, e.g.
-        //
-        // BORROW:  (*x1[2].y).z.a
-        // ACCESS:  x1[i].y
-        //
-        // Then our steps are:
-        //       x1         |   x1          -- places are the same
-        //       x1[2]      |   x1[i]       -- equal or disjoint (disjoint if indexes differ)
-        //       x1[2].y    |   x1[i].y     -- equal or disjoint
-        //
-        // -- here we run out of access - the borrow can access a part of it. If this
-        // is a full deep access, then we *know* the borrow conflicts with it. However,
-        // if the access is shallow, then we can proceed:
-        //
-        //       x1[2].y    | (*x1[i].y)    -- a deref! the access can't get past this, so we
-        //                                     are disjoint
-        //
-        // Our invariant is, that at each step of the iteration:
-        //  - If we didn't run out of access to match, our borrow and access are comparable
-        //    and either equal or disjoint.
-        //  - If we did run out of accesss, the borrow can access a part of it.
-        for (borrow_c, access_c) in borrow_components.zip(access_components) {
-            // loop invariant: borrow_c is always either equal to access_c or disjoint from it.
-            debug!("places_conflict: {:?} vs. {:?}", borrow_c, access_c);
-            match (borrow_c, access_c) {
-                (None, _) => {
-                    // If we didn't run out of access, the borrow can access all of our
-                    // place (e.g. a borrow of `a.b` with an access to `a.b.c`),
-                    // so we have a conflict.
-                    //
-                    // If we did, then we still know that the borrow can access a *part*
-                    // of our place that our access cares about (a borrow of `a.b.c`
-                    // with an access to `a.b`), so we still have a conflict.
-                    //
-                    // FIXME: Differs from AST-borrowck; includes drive-by fix
-                    // to #38899. Will probably need back-compat mode flag.
-                    debug!("places_conflict: full borrow, CONFLICT");
-                    return true;
-                }
-                (Some(borrow_c), None) => {
-                    // We know that the borrow can access a part of our place. This
-                    // is a conflict if that is a part our access cares about.
-
-                    let (base, elem) = match borrow_c {
-                        Place::Projection(box Projection { base, elem }) => (base, elem),
-                        _ => bug!("place has no base?"),
-                    };
-                    let base_ty = base.ty(self.mir, self.tcx).to_ty(self.tcx);
-
-                    match (elem, &base_ty.sty, access) {
-                        (_, _, Shallow(Some(ArtificialField::Discriminant)))
-                        | (_, _, Shallow(Some(ArtificialField::ArrayLength))) => {
-                            // The discriminant and array length are like
-                            // additional fields on the type; they do not
-                            // overlap any existing data there. Furthermore,
-                            // they cannot actually be a prefix of any
-                            // borrowed place (at least in MIR as it is
-                            // currently.)
-                            //
-                            // e.g. a (mutable) borrow of `a[5]` while we read the
-                            // array length of `a`.
-                            debug!("places_conflict: implicit field");
-                            return false;
-                        }
-
-                        (ProjectionElem::Deref, _, Shallow(None)) => {
-                            // e.g. a borrow of `*x.y` while we shallowly access `x.y` or some
-                            // prefix thereof - the shallow access can't touch anything behind
-                            // the pointer.
-                            debug!("places_conflict: shallow access behind ptr");
-                            return false;
-                        }
-                        (
-                            ProjectionElem::Deref,
-                            ty::TyRef(
-                                _,
-                                ty::TypeAndMut {
-                                    ty: _,
-                                    mutbl: hir::MutImmutable,
-                                },
-                            ),
-                            _,
-                        ) => {
-                            // the borrow goes through a dereference of a shared reference.
-                            //
-                            // I'm not sure why we are tracking these borrows - shared
-                            // references can *always* be aliased, which means the
-                            // permission check already account for this borrow.
-                            debug!("places_conflict: behind a shared ref");
-                            return false;
-                        }
-
-                        (ProjectionElem::Deref, _, Deep)
-                        | (ProjectionElem::Field { .. }, _, _)
-                        | (ProjectionElem::Index { .. }, _, _)
-                        | (ProjectionElem::ConstantIndex { .. }, _, _)
-                        | (ProjectionElem::Subslice { .. }, _, _)
-                        | (ProjectionElem::Downcast { .. }, _, _) => {
-                            // Recursive case. This can still be disjoint on a
-                            // further iteration if this a shallow access and
-                            // there's a deref later on, e.g. a borrow
-                            // of `*x.y` while accessing `x`.
-                        }
-                    }
-                }
-                (Some(borrow_c), Some(access_c)) => {
-                    match self.place_element_conflict(&borrow_c, access_c) {
-                        Overlap::Arbitrary => {
-                            // We have encountered different fields of potentially
-                            // the same union - the borrow now partially overlaps.
-                            //
-                            // There is no *easy* way of comparing the fields
-                            // further on, because they might have different types
-                            // (e.g. borrows of `u.a.0` and `u.b.y` where `.0` and
-                            // `.y` come from different structs).
-                            //
-                            // We could try to do some things here - e.g. count
-                            // dereferences - but that's probably not a good
-                            // idea, at least for now, so just give up and
-                            // report a conflict. This is unsafe code anyway so
-                            // the user could always use raw pointers.
-                            debug!("places_conflict: arbitrary -> conflict");
-                            return true;
-                        }
-                        Overlap::EqualOrDisjoint => {
-                            // This is the recursive case - proceed to the next element.
-                        }
-                        Overlap::Disjoint => {
-                            // We have proven the borrow disjoint - further
-                            // projections will remain disjoint.
-                            debug!("places_conflict: disjoint");
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-        unreachable!("iter::repeat returned None")
-    }
-
-    /// This function iterates over all of the current borrows
-    /// (represented by 1-bits in `flow_state.borrows`) that conflict
-    /// with an access to a place, invoking the `op` callback for each
-    /// one.
-    ///
-    /// "Current borrow" here means a borrow that reaches the point in
-    /// the control-flow where the access occurs.
-    ///
-    /// The borrow's phase is represented by the ReserveOrActivateIndex
-    /// passed to the callback: one can call `is_reservation()` and
-    /// `is_activation()` to determine what phase the borrow is
-    /// currently in, when such distinction matters.
-    fn each_borrow_involving_path<F>(
-        &mut self,
-        _context: Context,
-        access_place: (ShallowOrDeep, &Place<'tcx>),
-        flow_state: &Flows<'cx, 'gcx, 'tcx>,
-        mut op: F,
-    ) where
-        F: FnMut(&mut Self, ReserveOrActivateIndex, &BorrowData<'tcx>) -> Control,
-    {
-        let (access, place) = access_place;
-
-        // FIXME: analogous code in check_loans first maps `place` to
-        // its base_path.
-
-        let data = flow_state.borrows.operator().borrows();
-
-        // check for loan restricting path P being used. Accounts for
-        // borrows of P, P.a.b, etc.
-        let mut iter_incoming = flow_state.borrows.iter_incoming();
-        while let Some(i) = iter_incoming.next() {
-            let borrowed = &data[i.borrow_index()];
-
-            if self.places_conflict(&borrowed.borrowed_place, place, access) {
-                debug!(
-                    "each_borrow_involving_path: {:?} @ {:?} vs. {:?}/{:?}",
-                    i, borrowed, place, access
-                );
-                let ctrl = op(self, i, borrowed);
-                if ctrl == Control::Break {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
     // FIXME (#16118): function intended to allow the borrow checker
     // to be less precise in its handling of Box while still allowing
     // moves out of a Box. They should be removed when/if we stop
@@ -2196,6 +2100,7 @@ enum ContextKind {
     CallDest,
     Assert,
     Yield,
+    ReadForMatch,
     StorageDead,
 }
 
@@ -2207,3 +2112,4 @@ impl ContextKind {
         }
     }
 }
+

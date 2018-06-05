@@ -28,10 +28,10 @@ use rustc_metadata::cstore::CStore;
 use rustc::hir::map as hir_map;
 use rustc::session::{self, config};
 use rustc::session::config::{OutputFilenames, OutputTypes};
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{self, Lrc};
 use syntax;
 use syntax::ast;
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::codemap::{CodeMap, FilePathMapping, FileName};
 use errors;
 use errors::emitter::Emitter;
@@ -88,36 +88,41 @@ impl Emitter for ExpectErrorEmitter {
     }
 }
 
-fn errors(msgs: &[&str]) -> (Box<Emitter + Send>, usize) {
+fn errors(msgs: &[&str]) -> (Box<Emitter + sync::Send>, usize) {
     let v = msgs.iter().map(|m| m.to_string()).collect();
-    (box ExpectErrorEmitter { messages: v } as Box<Emitter + Send>, msgs.len())
+    (box ExpectErrorEmitter { messages: v } as Box<Emitter + sync::Send>, msgs.len())
 }
 
 fn test_env<F>(source_string: &str,
-               args: (Box<Emitter + Send>, usize),
+               args: (Box<Emitter + sync::Send>, usize),
                body: F)
     where F: FnOnce(Env)
 {
     syntax::with_globals(|| {
-        test_env_impl(source_string, args, body)
+        let mut options = config::basic_options();
+        options.debugging_opts.verbose = true;
+        options.unstable_features = UnstableFeatures::Allow;
+
+        driver::spawn_thread_pool(options, |options| {
+            test_env_with_pool(options, source_string, args, body)
+        })
     });
 }
 
-fn test_env_impl<F>(source_string: &str,
-                    (emitter, expected_err_count): (Box<Emitter + Send>, usize),
-                    body: F)
+fn test_env_with_pool<F>(
+    options: config::Options,
+    source_string: &str,
+    (emitter, expected_err_count): (Box<Emitter + sync::Send>, usize),
+    body: F
+)
     where F: FnOnce(Env)
 {
-    let mut options = config::basic_options();
-    options.debugging_opts.verbose = true;
-    options.unstable_features = UnstableFeatures::Allow;
     let diagnostic_handler = errors::Handler::with_emitter(true, false, emitter);
-
     let sess = session::build_session_(options,
                                        None,
                                        diagnostic_handler,
                                        Lrc::new(CodeMap::new(FilePathMapping::empty())));
-    let cstore = CStore::new(::get_trans(&sess).metadata_loader());
+    let cstore = CStore::new(::get_codegen_backend(&sess).metadata_loader());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     let input = config::Input::Str {
         name: FileName::Anon,
@@ -177,6 +182,9 @@ fn test_env_impl<F>(source_string: &str,
         });
     });
 }
+
+const D1: ty::DebruijnIndex = ty::DebruijnIndex::INNERMOST;
+const D2: ty::DebruijnIndex = D1.shifted_in(1);
 
 impl<'a, 'gcx, 'tcx> Env<'a, 'gcx, 'tcx> {
     pub fn tcx(&self) -> TyCtxt<'a, 'gcx, 'tcx> {
@@ -284,7 +292,7 @@ impl<'a, 'gcx, 'tcx> Env<'a, 'gcx, 'tcx> {
     }
 
     pub fn t_fn(&self, input_tys: &[Ty<'tcx>], output_ty: Ty<'tcx>) -> Ty<'tcx> {
-        self.infcx.tcx.mk_fn_ptr(ty::Binder(self.infcx.tcx.mk_fn_sig(
+        self.infcx.tcx.mk_fn_ptr(ty::Binder::bind(self.infcx.tcx.mk_fn_sig(
             input_tys.iter().cloned(),
             output_ty,
             false,
@@ -303,11 +311,11 @@ impl<'a, 'gcx, 'tcx> Env<'a, 'gcx, 'tcx> {
 
     pub fn t_param(&self, index: u32) -> Ty<'tcx> {
         let name = format!("T{}", index);
-        self.infcx.tcx.mk_param(index, Symbol::intern(&name))
+        self.infcx.tcx.mk_ty_param(index, Symbol::intern(&name).as_interned_str())
     }
 
     pub fn re_early_bound(&self, index: u32, name: &'static str) -> ty::Region<'tcx> {
-        let name = Symbol::intern(name);
+        let name = Symbol::intern(name).as_interned_str();
         self.infcx.tcx.mk_region(ty::ReEarlyBound(ty::EarlyBoundRegion {
             def_id: self.infcx.tcx.hir.local_def_id(ast::CRATE_NODE_ID),
             index,
@@ -327,7 +335,7 @@ impl<'a, 'gcx, 'tcx> Env<'a, 'gcx, 'tcx> {
     }
 
     pub fn t_rptr_late_bound(&self, id: u32) -> Ty<'tcx> {
-        let r = self.re_late_bound_with_debruijn(id, ty::DebruijnIndex::new(1));
+        let r = self.re_late_bound_with_debruijn(id, D1);
         self.infcx.tcx.mk_imm_ref(r, self.tcx().types.isize)
     }
 
@@ -455,8 +463,7 @@ fn sub_free_bound_false_infer() {
     //! does NOT hold for any instantiation of `_#1`.
 
     test_env(EMPTY_SOURCE_STR, errors(&[]), |env| {
-        let t_infer1 = env.infcx.next_ty_var(ty::UniverseIndex::ROOT,
-                                             TypeVariableOrigin::MiscVariable(DUMMY_SP));
+        let t_infer1 = env.infcx.next_ty_var(TypeVariableOrigin::MiscVariable(DUMMY_SP));
         let t_rptr_bound1 = env.t_rptr_late_bound(1);
         env.check_not_sub(env.t_fn(&[t_infer1], env.tcx().types.isize),
                           env.t_fn(&[t_rptr_bound1], env.tcx().types.isize));
@@ -485,7 +492,7 @@ fn subst_ty_renumber_bound() {
 
         // t_expected = fn(&'a isize)
         let t_expected = {
-            let t_ptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, ty::DebruijnIndex::new(2));
+            let t_ptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, D2);
             env.t_fn(&[t_ptr_bound2], env.t_nil())
         };
 
@@ -522,7 +529,7 @@ fn subst_ty_renumber_some_bounds() {
         //
         // but not that the Debruijn index is different in the different cases.
         let t_expected = {
-            let t_rptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, ty::DebruijnIndex::new(2));
+            let t_rptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, D2);
             env.t_pair(t_rptr_bound1, env.t_fn(&[t_rptr_bound2], env.t_nil()))
         };
 
@@ -550,10 +557,10 @@ fn escaping() {
         let t_rptr_free1 = env.t_rptr_free(1);
         assert!(!t_rptr_free1.has_escaping_regions());
 
-        let t_rptr_bound1 = env.t_rptr_late_bound_with_debruijn(1, ty::DebruijnIndex::new(1));
+        let t_rptr_bound1 = env.t_rptr_late_bound_with_debruijn(1, D1);
         assert!(t_rptr_bound1.has_escaping_regions());
 
-        let t_rptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, ty::DebruijnIndex::new(2));
+        let t_rptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, D2);
         assert!(t_rptr_bound2.has_escaping_regions());
 
         // t_fn = fn(A)
@@ -569,7 +576,7 @@ fn escaping() {
 #[test]
 fn subst_region_renumber_region() {
     test_env(EMPTY_SOURCE_STR, errors(&[]), |env| {
-        let re_bound1 = env.re_late_bound_with_debruijn(1, ty::DebruijnIndex::new(1));
+        let re_bound1 = env.re_late_bound_with_debruijn(1, D1);
 
         // type t_source<'a> = fn(&'a isize)
         let t_source = {
@@ -584,7 +591,7 @@ fn subst_region_renumber_region() {
         //
         // but not that the Debruijn index is different in the different cases.
         let t_expected = {
-            let t_rptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, ty::DebruijnIndex::new(2));
+            let t_rptr_bound2 = env.t_rptr_late_bound_with_debruijn(1, D2);
             env.t_fn(&[t_rptr_bound2], env.t_nil())
         };
 

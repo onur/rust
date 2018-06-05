@@ -17,7 +17,7 @@ use super::{Pattern, PatternContext, PatternError, PatternKind};
 use rustc::middle::expr_use_visitor::{ConsumeMode, Delegate, ExprUseVisitor};
 use rustc::middle::expr_use_visitor::{LoanCause, MutateMode};
 use rustc::middle::expr_use_visitor as euv;
-use rustc::middle::mem_categorization::{cmt};
+use rustc::middle::mem_categorization::cmt_;
 use rustc::middle::region;
 use rustc::session::Session;
 use rustc::ty::{self, Ty, TyCtxt};
@@ -181,7 +181,9 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
             // Second, if there is a guard on each arm, make sure it isn't
             // assigning or borrowing anything mutably.
             if let Some(ref guard) = arm.guard {
-                check_for_mutation_in_guard(self, &guard);
+                if self.tcx.check_for_mutation_in_guard_via_ast_walk() {
+                    check_for_mutation_in_guard(self, &guard);
+                }
             }
 
             // Third, perform some lints.
@@ -499,8 +501,7 @@ fn check_legality_of_move_bindings(cx: &MatchVisitor,
                                    pats: &[P<Pat>]) {
     let mut by_ref_span = None;
     for pat in pats {
-        pat.each_binding(|_, id, span, _path| {
-            let hir_id = cx.tcx.hir.node_to_hir_id(id);
+        pat.each_binding(|_, hir_id, span, _path| {
             let bm = *cx.tables
                         .pat_binding_modes()
                         .get(hir_id)
@@ -573,13 +574,13 @@ struct MutationChecker<'a, 'tcx: 'a> {
 }
 
 impl<'a, 'tcx> Delegate<'tcx> for MutationChecker<'a, 'tcx> {
-    fn matched_pat(&mut self, _: &Pat, _: cmt, _: euv::MatchMode) {}
-    fn consume(&mut self, _: ast::NodeId, _: Span, _: cmt, _: ConsumeMode) {}
-    fn consume_pat(&mut self, _: &Pat, _: cmt, _: ConsumeMode) {}
+    fn matched_pat(&mut self, _: &Pat, _: &cmt_, _: euv::MatchMode) {}
+    fn consume(&mut self, _: ast::NodeId, _: Span, _: &cmt_, _: ConsumeMode) {}
+    fn consume_pat(&mut self, _: &Pat, _: &cmt_, _: ConsumeMode) {}
     fn borrow(&mut self,
               _: ast::NodeId,
               span: Span,
-              _: cmt,
+              _: &cmt_,
               _: ty::Region<'tcx>,
               kind:ty:: BorrowKind,
               _: LoanCause) {
@@ -594,7 +595,7 @@ impl<'a, 'tcx> Delegate<'tcx> for MutationChecker<'a, 'tcx> {
         }
     }
     fn decl_without_init(&mut self, _: ast::NodeId, _: Span) {}
-    fn mutate(&mut self, _: ast::NodeId, span: Span, _: cmt, mode: MutateMode) {
+    fn mutate(&mut self, _: ast::NodeId, span: Span, _: &cmt_, mode: MutateMode) {
         match mode {
             MutateMode::JustWrite | MutateMode::WriteAndRead => {
                 struct_span_err!(self.cx.tcx.sess, span, E0302, "cannot assign in a pattern guard")
